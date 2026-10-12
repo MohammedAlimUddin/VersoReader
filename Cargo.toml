@@ -1,0 +1,29 @@
+[package]
+name = "pdfview"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = { version = "0.31", default-features = false, features = [
+    "glow",
+    "x11",
+    "wayland",
+    "default_fonts",
+] }
+egui = "0.31"
+pdfium-render = "=0.9.4"
+crossbeam-channel = "0.5.17"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+directories = "5.0"
+blake3 = "1.5"
+lru = "0.12"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
