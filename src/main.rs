@@ -9,10 +9,13 @@ mod ui;
 use app::PdfViewApp;
 
 fn main() -> eframe::Result<()> {
+    // Accept optional CLI argument: "pdfview path/to/file.pdf" opens that file on start
+    let initial_path = std::env::args().nth(1);
+
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("pdfview")
-            .with_inner_size([900.0, 650.0])
+            .with_inner_size([960.0, 720.0])
             .with_min_inner_size([400.0, 300.0]),
         ..Default::default()
     };
@@ -20,6 +23,6 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "pdfview",
         native_options,
-        Box::new(|cc| Ok(Box::new(PdfViewApp::new(cc)))),
+        Box::new(move |cc| Ok(Box::new(PdfViewApp::new(cc, initial_path)))),
     )
 }
