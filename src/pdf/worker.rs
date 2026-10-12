@@ -92,6 +92,7 @@ fn worker_main(ctx: egui::Context, rx_cmd: Receiver<Command>, tx_evt: Sender<Eve
     };
 
     let mut documents: HashMap<DocId, PdfDocument<'static>> = HashMap::new();
+    let mut latest_generations: HashMap<DocId, u64> = HashMap::new();
 
     // Command loop: processes incoming UI requests sequentially on the worker thread
     while let Ok(cmd) = rx_cmd.recv() {
@@ -143,6 +144,17 @@ fn worker_main(ctx: egui::Context, rx_cmd: Receiver<Command>, tx_evt: Sender<Eve
                 }
             }
             Command::Render(render_cmd) => {
+                // Skip request if a newer generation has already been seen for this document
+                let latest = latest_generations
+                    .entry(render_cmd.doc_id)
+                    .or_insert(render_cmd.generation);
+                if render_cmd.generation < *latest {
+                    continue;
+                }
+                if render_cmd.generation > *latest {
+                    *latest = render_cmd.generation;
+                }
+
                 if let Some(doc) = documents.get(&render_cmd.doc_id) {
                     let page_count = doc.pages().len() as usize;
                     if render_cmd.page < page_count {
@@ -200,6 +212,7 @@ fn worker_main(ctx: egui::Context, rx_cmd: Receiver<Command>, tx_evt: Sender<Eve
             }
             Command::Close { doc_id } => {
                 documents.remove(&doc_id);
+                latest_generations.remove(&doc_id);
             }
             Command::Shutdown => break,
         }
