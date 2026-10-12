@@ -78,6 +78,7 @@ impl Toolbar {
             // Zoom controls
             if ui
                 .button("➖")
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
                 .on_hover_text("Zoom out (Ctrl + -)")
                 .clicked()
             {
@@ -89,6 +90,7 @@ impl Toolbar {
 
             if ui
                 .button("➕")
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
                 .on_hover_text("Zoom in (Ctrl + =)")
                 .clicked()
             {
@@ -97,6 +99,7 @@ impl Toolbar {
 
             if ui
                 .button("Fit Width")
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
                 .on_hover_text("Fit page width to window (Ctrl + 0)")
                 .clicked()
             {
@@ -105,6 +108,7 @@ impl Toolbar {
 
             if ui
                 .button("Fit Page")
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
                 .on_hover_text("Fit entire page to window")
                 .clicked()
             {
@@ -116,6 +120,7 @@ impl Toolbar {
             // Rotate button
             if ui
                 .button("⟳ Rotate")
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
                 .on_hover_text("Rotate all pages 90° clockwise")
                 .clicked()
             {
@@ -132,6 +137,7 @@ impl Toolbar {
             };
             if ui
                 .button(fs_label)
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
                 .on_hover_text("Toggle fullscreen (F11)")
                 .clicked()
             {

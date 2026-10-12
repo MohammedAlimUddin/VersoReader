@@ -87,7 +87,7 @@ If all fail, the worker sends `Event::PdfiumError` with the exact searched paths
 * **Virtualization**: Layout is calculated upfront using page sizes returned at open. Only pages intersecting the viewport plus 1 page of prefetch above/below are rendered and drawn.
 * **Progressive Rendering**: Low-resolution (~35% scale) render requested first for responsive feedback, swapped with full-resolution render once ready.
 * **Texture Limits**: Maximum texture side is capped at 4096 px.
-* **LRU Cache (`cache.rs`)**: Keyed by `(doc_id, page, width_px, rotation)` with a hard **150 MB** memory cap, actively freeing textures upon eviction or tab closure.
+* **LRU Cache (`cache.rs`)**: Keyed by `(doc_id, page, width_px, rotation)` with a hard **150 MB** memory cap, actively freeing textures upon eviction or tab closure. Switching tabs drops the inactive tab's textures from the cache while retaining the worker's document handle; closing a tab sends `Command::Close` and immediately purges all associated textures.
 
 ---
 

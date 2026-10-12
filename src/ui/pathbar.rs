@@ -71,6 +71,8 @@ pub fn parse_pdf_path(input: &str) -> Result<PathBuf, String> {
 pub struct PathBar {
     pub text: String,
     pub inline_error: Option<String>,
+    pub is_collapsed: bool,
+    pub request_focus: bool,
 }
 
 impl PathBar {
@@ -78,6 +80,8 @@ impl PathBar {
         Self {
             text: String::new(),
             inline_error: None,
+            is_collapsed: false,
+            request_focus: false,
         }
     }
 
@@ -89,11 +93,33 @@ impl PathBar {
         self.inline_error = err;
     }
 
+    pub fn expand_and_focus(&mut self) {
+        self.is_collapsed = false;
+        self.request_focus = true;
+    }
+
     /// Renders the path bar. Returns `Some(PathBuf)` if Enter was pressed or Open was clicked with a valid path.
     pub fn ui(&mut self, ui: &mut egui::Ui) -> Option<PathBuf> {
+        if self.is_collapsed {
+            return None;
+        }
+
         let mut triggered_path = None;
 
         ui.horizontal(|ui| {
+            // Chevron button to collapse the bar
+            let chevron_btn = ui
+                .add(
+                    egui::Button::new(egui::RichText::new("⏶").size(12.0))
+                        .frame(false)
+                        .min_size(egui::vec2(18.0, 18.0)),
+                )
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
+            if chevron_btn.clicked() {
+                self.is_collapsed = true;
+            }
+            chevron_btn.on_hover_text("Collapse path bar");
+
             ui.label(egui::RichText::new("PDF Path:").strong());
 
             let text_edit = egui::TextEdit::singleline(&mut self.text)
@@ -101,9 +127,17 @@ impl PathBar {
                 .hint_text("Enter path to PDF (e.g. ~/book.pdf, /path/to/doc.pdf)...");
             let response = ui.add(text_edit);
 
+            if self.request_focus {
+                response.request_focus();
+                self.request_focus = false;
+            }
+
             let enter_pressed =
                 response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            let open_clicked = ui.button("Open").clicked();
+            let open_clicked = ui
+                .button("Open")
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .clicked();
 
             if enter_pressed || open_clicked {
                 match parse_pdf_path(&self.text) {
@@ -179,5 +213,19 @@ mod tests {
             let res = parse_pdf_path(&uri);
             assert!(res.is_ok());
         }
+    }
+
+    #[test]
+    fn test_pathbar_collapse_expand() {
+        let mut pb = PathBar::new();
+        assert!(!pb.is_collapsed);
+        assert!(!pb.request_focus);
+
+        pb.is_collapsed = true;
+        assert!(pb.is_collapsed);
+
+        pb.expand_and_focus();
+        assert!(!pb.is_collapsed);
+        assert!(pb.request_focus);
     }
 }

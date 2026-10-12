@@ -247,4 +247,40 @@ mod tests {
         assert!(cache.get_best_for_page(1, 5, 90).is_none());
         assert!(cache.get_best_for_page(1, 6, 0).is_none());
     }
+
+    #[test]
+    fn test_cache_clear_doc() {
+        let ctx = egui::Context::default();
+        let mut cache = TextureCache::new(10_000_000);
+
+        let img = egui::ColorImage::example();
+        let tex1 = ctx.load_texture("tex1", img.clone(), egui::TextureOptions::LINEAR);
+        let tex2 = ctx.load_texture("tex2", img, egui::TextureOptions::LINEAR);
+
+        let key1 = TextureKey {
+            doc_id: 1,
+            page: 0,
+            width_px: 200,
+            rotation: 0,
+        };
+        let key2 = TextureKey {
+            doc_id: 2,
+            page: 0,
+            width_px: 200,
+            rotation: 0,
+        };
+
+        cache.insert(key1.clone(), tex1, 200, 200, 10_000);
+        cache.insert(key2.clone(), tex2, 200, 200, 15_000);
+
+        assert_eq!(cache.current_bytes(), 25_000);
+        assert!(cache.contains(&key1));
+        assert!(cache.contains(&key2));
+
+        // Clear doc 1
+        cache.clear_doc(1);
+        assert_eq!(cache.current_bytes(), 15_000);
+        assert!(!cache.contains(&key1));
+        assert!(cache.contains(&key2));
+    }
 }

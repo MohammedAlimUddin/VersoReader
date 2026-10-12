@@ -17,7 +17,8 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_title("pdfview")
             .with_inner_size([960.0, 720.0])
-            .with_min_inner_size([400.0, 300.0]),
+            .with_min_inner_size([400.0, 300.0])
+            .with_decorations(false),
         ..Default::default()
     };
 

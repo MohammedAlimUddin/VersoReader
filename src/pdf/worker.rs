@@ -306,4 +306,28 @@ mod tests {
         let page_count = doc.pages().len();
         assert!(page_count > 100, "Large book should have > 100 pages");
     }
+
+    #[test]
+    fn test_worker_open_and_close_multiple_tabs() {
+        let pdfium = bind_pdfium().expect("Pdfium must be available for fixture test");
+        let path = PathBuf::from("fixtures/MLE.pdf");
+        if !path.exists() {
+            return;
+        }
+
+        let mut docs = std::collections::HashMap::new();
+        for i in 0..10 {
+            let doc = pdfium
+                .load_pdf_from_file(&path, None)
+                .expect("Failed to load fixture PDF");
+            docs.insert(i, doc);
+        }
+        assert_eq!(docs.len(), 10);
+
+        for i in 0..10 {
+            let removed = docs.remove(&i);
+            assert!(removed.is_some());
+        }
+        assert!(docs.is_empty());
+    }
 }

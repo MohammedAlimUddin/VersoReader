@@ -114,3 +114,42 @@
   - [x] When zoomed in beyond window width, horizontal scrollbars appear and horizontal scrolling/panning is enabled.
   - [x] Rotate 4 times returns to the original orientation; scroll position remains on the current page.
   - [x] `F11` toggles fullscreen and hides chrome; `Esc` exits fullscreen.
+
+---
+
+## Milestone 4 — Tabs and collapsible path bar
+- **Status:** Completed
+- **Done:**
+  - Integrated tab bar into the window title bar (`with_decorations(false)` in `src/main.rs`), reclaiming vertical screen space with Client-Side Decorations (CSD):
+    - Tabs and `+` button aligned to the left of the title bar.
+    - Draggable window header in the center: drag with left click moves the window via `ViewportCommand::StartDrag`; double-click toggles maximize.
+    - Right-aligned window controls: Minimize (`—`), Maximize/Restore (`🗖`/`❐`), Close window (`✕`), and path bar collapse toggle (`⏶`/`⏷`).
+    - Added borderless window edge drag resizing for top, bottom, left, right, and all four corners.
+  - Defined `PdfTab` in `src/app.rs` storing isolated per-tab document state: `doc_id`, `path`, `title`, `page_sizes`, `page_count`, `current_page`, `scroll_offset_y`, `zoom`, `rotation`, and pending navigation commands.
+  - Instant New Tab workflow:
+    - Clicking the `+` button or pressing `Ctrl+T` immediately creates and focuses a new tab ("New Tab").
+    - Displays a clean landing screen in the center ("Enter a PDF path in the bar above or press Ctrl+L to open a document").
+    - Automatically expands and focuses the path bar input with blinking cursor.
+    - Entering a path in an empty tab reuses it instead of opening redundant tabs.
+  - Reliable close button (`×`) on each tab with middle-click support and `Ctrl+W` shortcut.
+  - Interactive cursor parity: all buttons, tabs, close icons, chevrons, and toolbar controls display a pointing hand cursor (`PointingHand`) when hovered.
+  - Fixed scroll offset lock bug: pending scroll signals (`scroll_to_page`, `scroll_delta_y`, `set_scroll_offset_y`) are consumed via `.take()` directly from `self.tabs.get_mut(active_idx)`, restoring full mouse wheel, touchpad, scrollbar dragging, and arrow key scrolling.
+  - Tab navigation shortcuts: `Ctrl+Tab` cycles tabs forwards, `Ctrl+Shift+Tab` cycles backwards.
+  - Strict bounded memory and leak prevention:
+    - Closing a tab sends `Command::Close { doc_id }` (worker frees `PdfDocument` handle) and executes `self.cache.clear_doc(doc_id)` (UI purges texture handles and decrements byte counts).
+    - Switching tabs drops the inactive tab's textures from the LRU cache while retaining the worker's document handle for instant re-navigation.
+  - Added comprehensive automated unit tests:
+    - File name truncation with ellipsis and extension preservation (`test_truncate_short_filename`, `test_truncate_long_filename_preserves_ext`, `test_truncate_no_extension`).
+    - Cache document cleanup and memory reclamation (`test_cache_clear_doc`).
+    - Path bar expand and focus state transitions (`test_pathbar_collapse_expand`).
+    - Multi-tab document open/close cycle in worker (`test_worker_open_and_close_multiple_tabs`).
+- **Known-broken / Deferred:**
+  - Table of Contents sidebar is scheduled for Milestone 5.
+- **Manual Verification Checklist:**
+  - [ ] Open 3 different PDFs; each tab remembers its own scroll, zoom, and rotation when switching back.
+  - [ ] Tabs are integrated into the top title bar with window minimize, maximize, and close controls.
+  - [ ] Clicking `+` or pressing `Ctrl+T` immediately opens a clean "New Tab" and focuses the path bar.
+  - [ ] Mouse wheel, touchpad, and scrollbar dragging scroll freely up and down.
+  - [ ] Hovering over tabs, buttons, and tools shows the pointing hand cursor.
+  - [ ] Tab close `×` button closes the tab immediately.
+  - [ ] Closing tabs reduces RSS; open/close the same book 10 times: RSS doesn't keep climbing.
