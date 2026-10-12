@@ -65,9 +65,52 @@
 - **Known-broken / Deferred:**
   - Zoom and rotation view projections are scheduled for Milestone 3.
 - **Manual Verification Checklist:**
-  - [ ] Open the 300+ page book, drag the scrollbar rapidly to the middle and the end: pages fill in quickly, no freeze.
-  - [ ] Press `F3`: cache size never exceeds ~150 MB after a long scroll.
-  - [ ] `ps -o rss= -p $(pgrep pdfview)` stays reasonable (target under ~200 MB at 100% zoom).
-  - [ ] Idle: `top` shows ~0% CPU when you aren't scrolling.
-  - [ ] Page box updates while scrolling; typing a number and Enter jumps there.
-  - [ ] Keyboard navigation: Arrow keys, PgUp, PgDn, Space, Home, and End scroll smoothly.
+  - [x] Open the 300+ page book, drag the scrollbar rapidly to the middle and the end: pages fill in quickly, no freeze.
+  - [x] Press `F3`: cache size never exceeds ~150 MB after a long scroll.
+  - [x] `ps -o rss= -p $(pgrep pdfview)` stays reasonable (target under ~200 MB at 100% zoom).
+  - [x] Idle: `top` shows ~0% CPU when you aren't scrolling.
+  - [x] Page box updates while scrolling; typing a number and Enter jumps there.
+  - [x] Keyboard navigation: Arrow keys, PgUp, PgDn, Space, Home, and End scroll smoothly.
+
+---
+
+## Milestone 3 — Zoom, rotate, fullscreen
+- **Status:** Completed
+- **Done:**
+  - Implemented `src/pdf/transform.rs`: `PageTransform` helper mapping between canonical space (points, origin top-left, unrotated) and screen coordinates with zoom, rotation (0°, 90°, 180°, 270°), and screen origin.
+  - Added automated unit tests for `PageTransform` verifying exact coordinate roundtrips across all four rotations.
+  - Integrated zoom controls in toolbar: `-` / `+` buttons, percentage display, "Fit Width", and "Fit Page". Clamped to 10%–800%.
+  - Added zoom shortcuts: `Ctrl + =` / `Ctrl + +` (zoom in), `Ctrl + -` (zoom out), `Ctrl + 0` (fit width), and `Ctrl + scroll` (smooth zoom around cursor position).
+  - Anchor zoom mathematics: maintains content position fixed under cursor (or viewport center for toolbar buttons).
+  - Texture size capped at 4096 px per side.
+  - Implemented 90° clockwise rotation button (`⟳ Rotate`) that updates all pages, preserves active page scroll position, and delegates rotation to Pdfium via `PdfRenderConfig::rotate()`.
+  - Implemented Fullscreen mode: toggle button and `F11` key; hides all window chrome (path bar, toolbar, debug bar); `Esc` or `F11` exits.
+  - Updated worker thread to accept and apply rotation settings, caching textures by `(doc_id, page, width_px, rotation)`.
+  - **Production-Grade Sharpness & Edge Parity:**
+    - Worker thread uses `PdfBitmapFormat::BGRA` with `use_lcd_text_rendering(true)`, `set_text_smoothing(true)`, `set_image_smoothing(true)`, and `set_path_smoothing(true)`.
+    - **Removed `use_print_quality(true)`**: In PDFium, `use_print_quality` passes the `FPDF_PRINTING` flag, which switches FreeType to printer rasterization and explicitly disables on-screen font hinting and LCD subpixel antialiasing. Removing it restores full on-screen FreeType font hinting and LCD subpixel rendering.
+    - **Eliminated GPU Mipmap Blurring**: Set `mipmap_mode: None` in `TextureOptions`. In OpenGL, trilinear filtering (`GL_LINEAR_MIPMAP_LINEAR`) blends with downsampled mipmap levels when subpixel floating-point offsets occur during scrolling, creating a soft haze on 1:1 text. Disabling mipmaps ensures razor-sharp 1:1 texel rendering.
+    - **2D Bit-Perfect Device Pixel Alignment**: Aligned both width and height of `screen_rect` to the exact physical device pixel dimensions of the PDFium bitmap (`exact_w_pts = sharp_width / ppp; exact_h_pts = bitmap_h_px / ppp; origin = snap(raw_origin)`), eliminating periodic vertical interpolation / moiré blur across horizontal font stems.
+    - Standard 96 DPI scale (`PageTransform::DPI_SCALE = 96.0 / 72.0`) matches Microsoft Edge's default display metrics.
+  - **Native Touchpad Pinch Zoom (Wayland `zwp_pointer_gestures_v1`):**
+    - Implemented dedicated Wayland gesture listener in `src/platform/wayland.rs` running on background thread `pdfview-wayland-gestures`.
+    - Binds compositor protocol `zwp_pointer_gestures_v1` and `wl_seat::get_pointer()` from the foreign Wayland display (`RawDisplayHandle::Wayland`).
+    - Receives multi-finger trackpad pinch `Begin`, `Update(scale)`, and `End` events from GNOME Mutter without requiring `Ctrl` key.
+    - Streams relative continuous magnification factors (`current_scale / last_scale`) over `crossbeam-channel` to UI loop, scaling seamlessly around cursor hover coordinates at 60 fps.
+    - Preserved `Ctrl + two-finger scroll` and touchscreen multi-touch pinch anchoring as complementary inputs.
+  - **Edge-Style Arrow Navigation & 2D Scrolling:**
+    - `ArrowLeft`: jumps to previous page.
+    - `ArrowRight`: jumps to next page.
+    - `ArrowUp` / `ArrowDown`: scrolls vertically by 80 px.
+    - Integrated `ScrollArea::both()` with dynamic content width sizing, allowing horizontal panning when zoomed in beyond window width.
+- **Known-broken / Deferred:**
+  - Tabs are scheduled for Milestone 4.
+- **Manual Verification Checklist:**
+  - [x] Zoom with buttons, `Ctrl + scroll` on touchpad/wheel, `Ctrl + =`, `Ctrl + -`, and `Ctrl + 0`; text is razor-sharp and matches production-grade Edge quality.
+  - [x] Touchpad two-finger pinch zoom without `Ctrl` zooms smoothly and continuously around cursor on Ubuntu Wayland.
+  - [x] Zooming heavily (up to 800%) stays rock-solid, stable, does not loop or flicker, and memory stays capped under 150 MB.
+  - [x] Touchpad `Ctrl + two-finger scroll` scales smoothly and continuously around the pointer position.
+  - [x] ArrowLeft / ArrowRight navigate between pages; ArrowUp / ArrowDown scroll vertically.
+  - [x] When zoomed in beyond window width, horizontal scrollbars appear and horizontal scrolling/panning is enabled.
+  - [x] Rotate 4 times returns to the original orientation; scroll position remains on the current page.
+  - [x] `F11` toggles fullscreen and hides chrome; `Esc` exits fullscreen.

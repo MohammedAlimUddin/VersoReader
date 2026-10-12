@@ -49,6 +49,27 @@ impl TextureCache {
         self.cache.get(key).map(|c| &c.texture)
     }
 
+    /// Finds the best available cached texture for a given page and rotation,
+    /// prioritizing higher resolution textures to serve as smooth fallbacks while
+    /// a sharp render is pending.
+    pub fn get_best_for_page(
+        &self,
+        doc_id: DocId,
+        page: usize,
+        rotation: u16,
+    ) -> Option<&TextureHandle> {
+        let mut best: Option<(&TextureHandle, u32)> = None;
+        for (key, entry) in self.cache.iter() {
+            if key.doc_id == doc_id && key.page == page && key.rotation == rotation {
+                match best {
+                    Some((_, best_w)) if entry.width_px <= best_w => {}
+                    _ => best = Some((&entry.texture, entry.width_px)),
+                }
+            }
+        }
+        best.map(|(tex, _)| tex)
+    }
+
     /// Checks if a texture exists in cache without changing LRU recency.
     pub fn contains(&self, key: &TextureKey) -> bool {
         self.cache.contains(key)
@@ -178,5 +199,52 @@ mod tests {
         // Since cache was empty, stays 1100 without entries, but with entries:
         assert!(cache.max_bytes() == 1000);
         assert!(key1 != key2 && key2 != key3);
+    }
+
+    #[test]
+    fn test_cache_get_best_for_page() {
+        let ctx = egui::Context::default();
+        let mut cache = TextureCache::new(10_000_000);
+
+        let img_small = egui::ColorImage::example();
+        let tex_small = ctx.load_texture("small", img_small, egui::TextureOptions::LINEAR);
+
+        let img_large = egui::ColorImage::example();
+        let tex_large = ctx.load_texture("large", img_large, egui::TextureOptions::LINEAR);
+
+        let key_small = TextureKey {
+            doc_id: 1,
+            page: 5,
+            width_px: 300,
+            rotation: 0,
+        };
+        let key_large = TextureKey {
+            doc_id: 1,
+            page: 5,
+            width_px: 1200,
+            rotation: 0,
+        };
+
+        // Initially empty
+        assert!(cache.get_best_for_page(1, 5, 0).is_none());
+
+        // Insert small texture
+        cache.insert(key_small, tex_small.clone(), 300, 400, 300 * 400 * 4);
+        assert_eq!(
+            cache.get_best_for_page(1, 5, 0).map(|t| t.id()),
+            Some(tex_small.id())
+        );
+
+        // Insert large texture
+        cache.insert(key_large, tex_large.clone(), 1200, 1600, 1200 * 1600 * 4);
+        // Best should now prefer the higher resolution one (1200 > 300)
+        assert_eq!(
+            cache.get_best_for_page(1, 5, 0).map(|t| t.id()),
+            Some(tex_large.id())
+        );
+
+        // Different rotation or page should still be None
+        assert!(cache.get_best_for_page(1, 5, 90).is_none());
+        assert!(cache.get_best_for_page(1, 6, 0).is_none());
     }
 }

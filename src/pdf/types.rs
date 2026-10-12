@@ -29,6 +29,8 @@ pub struct RenderResult {
     pub page: usize,
     pub width_px: u32,
     pub height_px: u32,
+    pub bitmap_width_px: u32,
+    pub rotation: u16,
     pub generation: u64,
     pub rgba: Vec<u8>,
 }

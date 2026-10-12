@@ -161,8 +161,22 @@ fn worker_main(ctx: egui::Context, rx_cmd: Receiver<Command>, tx_evt: Sender<Eve
                         match doc.pages().get(render_cmd.page as i32) {
                             Ok(page) => {
                                 let target_w = render_cmd.width_px.clamp(32, 4096) as i32;
-                                let render_config =
-                                    PdfRenderConfig::new().set_target_width(target_w);
+                                let rotation_setting = match render_cmd.rotation % 360 {
+                                    90 => PdfPageRenderRotation::Degrees90,
+                                    180 => PdfPageRenderRotation::Degrees180,
+                                    270 => PdfPageRenderRotation::Degrees270,
+                                    _ => PdfPageRenderRotation::None,
+                                };
+                                let render_config = PdfRenderConfig::new()
+                                    .set_target_width(target_w)
+                                    .set_maximum_width(4096)
+                                    .set_maximum_height(4096)
+                                    .set_format(PdfBitmapFormat::BGRA)
+                                    .rotate(rotation_setting, true)
+                                    .use_lcd_text_rendering(true)
+                                    .set_text_smoothing(true)
+                                    .set_image_smoothing(true)
+                                    .set_path_smoothing(true);
 
                                 match page.render_with_config(&render_config) {
                                     Ok(bitmap) => {
@@ -173,8 +187,10 @@ fn worker_main(ctx: egui::Context, rx_cmd: Receiver<Command>, tx_evt: Sender<Eve
                                         let _ = tx_evt.send(Event::Rendered(RenderResult {
                                             doc_id: render_cmd.doc_id,
                                             page: render_cmd.page,
-                                            width_px: w,
+                                            width_px: render_cmd.width_px,
                                             height_px: h,
+                                            bitmap_width_px: w,
+                                            rotation: render_cmd.rotation,
                                             generation: render_cmd.generation,
                                             rgba,
                                         }));

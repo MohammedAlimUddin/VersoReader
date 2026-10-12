@@ -105,6 +105,10 @@ src/
     mod.rs         PDF module exports
     worker.rs      Dedicated background Pdfium worker thread
     types.rs       Command and Event definitions
+    transform.rs   Canonical <-> screen coordinate transforms (PageTransform)
+  platform/
+    mod.rs         Platform-specific abstractions
+    wayland.rs     Native Wayland touchpad pinch gesture listener (zwp_pointer_gestures_v1)
   ui/
     mod.rs         UI components export
     tabbar.rs      Document tabs and Settings tab navigation

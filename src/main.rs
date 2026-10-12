@@ -3,6 +3,7 @@ mod app;
 mod cache;
 mod export;
 mod pdf;
+mod platform;
 mod settings;
 mod ui;
 
