@@ -13,8 +13,15 @@ use wayland_protocols::wp::pointer_gestures::zv1::client::{
     zwp_pointer_gestures_v1::{self, ZwpPointerGesturesV1},
 };
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum WaylandPinchEvent {
+    Begin,
+    Update(f64),
+    End,
+}
+
 pub struct PinchGestureState {
-    pub tx: Sender<f64>,
+    pub tx: Sender<WaylandPinchEvent>,
     pub ctx: Context,
     pub last_scale: f64,
 }
@@ -79,18 +86,22 @@ impl Dispatch<ZwpPointerGesturePinchV1, ()> for PinchGestureState {
         match event {
             zwp_pointer_gesture_pinch_v1::Event::Begin { .. } => {
                 state.last_scale = 1.0;
+                let _ = state.tx.send(WaylandPinchEvent::Begin);
+                state.ctx.request_repaint();
             }
             zwp_pointer_gesture_pinch_v1::Event::Update { scale, .. } => {
                 let current_scale = scale;
                 if state.last_scale > 0.0 && current_scale > 0.0 {
                     let delta = current_scale / state.last_scale;
                     state.last_scale = current_scale;
-                    let _ = state.tx.send(delta);
+                    let _ = state.tx.send(WaylandPinchEvent::Update(delta));
                     state.ctx.request_repaint();
                 }
             }
             zwp_pointer_gesture_pinch_v1::Event::End { .. } => {
                 state.last_scale = 1.0;
+                let _ = state.tx.send(WaylandPinchEvent::End);
+                state.ctx.request_repaint();
             }
             _ => {}
         }
@@ -102,7 +113,7 @@ impl Dispatch<ZwpPointerGesturePinchV1, ()> for PinchGestureState {
 pub fn init_wayland_pinch_listener(
     display_ptr: *mut c_void,
     ctx: Context,
-) -> Option<Receiver<f64>> {
+) -> Option<Receiver<WaylandPinchEvent>> {
     if display_ptr.is_null() {
         return None;
     }

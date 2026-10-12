@@ -4,7 +4,7 @@ use egui::{pos2, vec2, Color32, Rect, Stroke, StrokeKind};
 
 use crate::cache::{TextureCache, TextureKey};
 use crate::pdf::transform::PageTransform;
-use crate::pdf::types::{DocId, PageSize};
+use crate::pdf::types::{DocId, PageSize, SearchMatch};
 
 /// A render request emitted by the virtualized viewer.
 #[derive(Debug, Clone)]
@@ -21,6 +21,7 @@ pub struct ViewerOutput {
     pub requests: Vec<PageRenderRequest>,
     pub visible_viewport_height: f32,
     pub current_scroll_offset_y: f32,
+    pub viewport_top: f32,
 }
 
 /// Computes virtualized layout and paints intersecting pages (+1 prefetch).
@@ -36,6 +37,9 @@ pub fn render_viewer(
     scroll_to_page: Option<usize>,
     scroll_delta_y: Option<f32>,
     set_scroll_offset_y: Option<f32>,
+    search_matches: &[SearchMatch],
+    active_match_idx: Option<usize>,
+    is_pinching: bool,
 ) -> ViewerOutput {
     let mut render_requests = Vec::new();
     let gap_y = 16.0;
@@ -47,6 +51,7 @@ pub fn render_viewer(
             requests: render_requests,
             visible_viewport_height: 600.0,
             current_scroll_offset_y: 0.0,
+            viewport_top: 0.0,
         };
     }
 
@@ -81,7 +86,9 @@ pub fn render_viewer(
     let total_height = cursor_y;
     let mut current_page = 1;
 
-    let mut scroll_area = egui::ScrollArea::both().auto_shrink([false, false]);
+    let mut scroll_area = egui::ScrollArea::both()
+        .auto_shrink([false, false])
+        .enable_scrolling(!is_pinching);
 
     // Jump to specific page
     if let Some(target_p) = scroll_to_page {
@@ -256,6 +263,41 @@ pub fn render_viewer(
                         });
                     }
                 }
+
+                // Draw search match highlights on the visible page through PageTransform
+                if !search_matches.is_empty() {
+                    let page_num = idx + 1;
+                    for (m_idx, match_item) in search_matches.iter().enumerate() {
+                        if match_item.page == page_num {
+                            let is_active = active_match_idx == Some(m_idx);
+                            for rect in &match_item.rects {
+                                let match_screen_rect =
+                                    transform.canonical_to_screen_rect(rect.to_egui_rect());
+                                if is_active {
+                                    // Current active match: stronger orange color with stroke
+                                    painter.rect_filled(
+                                        match_screen_rect,
+                                        2.0,
+                                        Color32::from_rgba_unmultiplied(255, 140, 0, 180),
+                                    );
+                                    painter.rect_stroke(
+                                        match_screen_rect,
+                                        2.0,
+                                        Stroke::new(1.5_f32, Color32::from_rgb(220, 90, 0)),
+                                        StrokeKind::Outside,
+                                    );
+                                } else {
+                                    // Other matches: soft translucent yellow
+                                    painter.rect_filled(
+                                        match_screen_rect,
+                                        2.0,
+                                        Color32::from_rgba_unmultiplied(255, 235, 0, 110),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
             } else {
                 // Prefetch page outside viewport: request so texture is cached before user scrolls
                 if !cache.contains(&sharp_key)
@@ -272,11 +314,28 @@ pub fn render_viewer(
         }
     });
 
+    // If user clicked inside the viewer area, surrender focus from text inputs so arrow navigation immediately controls document scrolling
+    if ui.input(|i| i.pointer.primary_clicked()) {
+        if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
+            if scroll_output.inner_rect.contains(pos) {
+                ui.ctx().memory_mut(|m| {
+                    if let Some(id) = m.focused() {
+                        m.surrender_focus(id);
+                    }
+                });
+            }
+        }
+    }
+
+    let viewport_top = scroll_output.inner_rect.top();
+
     // If keyboard delta scrolling was requested
     if let Some(delta) = scroll_delta_y {
-        let mut state = scroll_output.state;
-        state.offset.y = (state.offset.y + delta).clamp(0.0, total_height);
-        state.store(ui.ctx(), scroll_output.id);
+        if !is_pinching {
+            let mut state = scroll_output.state;
+            state.offset.y = (state.offset.y + delta).clamp(0.0, total_height);
+            state.store(ui.ctx(), scroll_output.id);
+        }
     }
 
     ViewerOutput {
@@ -284,5 +343,117 @@ pub fn render_viewer(
         requests: render_requests,
         visible_viewport_height,
         current_scroll_offset_y,
+        viewport_top,
+    }
+}
+
+/// Computes the vertical scroll offset needed to center a search match in the viewport.
+pub fn compute_match_scroll_offset(
+    match_item: &SearchMatch,
+    page_sizes: &[PageSize],
+    zoom: f32,
+    rotation: u16,
+    viewport_height: f32,
+    available_width: f32,
+) -> Option<f32> {
+    if match_item.page == 0 || match_item.page > page_sizes.len() || match_item.rects.is_empty() {
+        return None;
+    }
+
+    let gap_y = 16.0;
+    let page_count = page_sizes.len();
+    let mut max_page_w: f32 = 0.0;
+    let mut page_dims = Vec::with_capacity(page_count);
+
+    for size in page_sizes {
+        let dummy_transform = PageTransform::new(*size, zoom, rotation, pos2(0.0, 0.0));
+        let screen_size = dummy_transform.screen_size();
+        let w = screen_size.x;
+        let h = screen_size.y;
+        if w > max_page_w {
+            max_page_w = w;
+        }
+        page_dims.push((w, h));
+    }
+
+    let content_width = available_width.max(max_page_w + 20.0);
+    let mut cursor_y = gap_y;
+    let target_idx = match_item.page - 1;
+
+    let mut target_page_rect = Rect::ZERO;
+    for (idx, (w, h)) in page_dims.into_iter().enumerate() {
+        let x = ((content_width - w) / 2.0).max(10.0);
+        let rect = Rect::from_min_size(pos2(x, cursor_y), vec2(w, h));
+        if idx == target_idx {
+            target_page_rect = rect;
+            break;
+        }
+        cursor_y += h + gap_y;
+    }
+
+    let transform =
+        PageTransform::new(page_sizes[target_idx], zoom, rotation, target_page_rect.min);
+    let first_rect = match_item.rects[0];
+    let screen_r = transform.canonical_to_screen_rect(first_rect.to_egui_rect());
+
+    // Center match vertically in viewport
+    let target_y = (screen_r.center().y - viewport_height / 2.0).max(0.0);
+    Some(target_y)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pdf::types::CanonicalRect;
+
+    #[test]
+    fn test_compute_match_scroll_offset() {
+        let page_sizes = vec![
+            PageSize {
+                width: 600.0,
+                height: 800.0,
+            },
+            PageSize {
+                width: 600.0,
+                height: 800.0,
+            },
+        ];
+
+        let m = SearchMatch {
+            page: 1,
+            rects: vec![CanonicalRect::new(100.0, 100.0, 200.0, 120.0)],
+        };
+
+        let offset = compute_match_scroll_offset(&m, &page_sizes, 1.0, 0, 600.0, 800.0);
+        assert!(offset.is_some());
+
+        // Invalid page
+        let m_invalid = SearchMatch {
+            page: 99,
+            rects: vec![CanonicalRect::new(10.0, 10.0, 20.0, 20.0)],
+        };
+        assert!(
+            compute_match_scroll_offset(&m_invalid, &page_sizes, 1.0, 0, 600.0, 800.0).is_none()
+        );
+    }
+
+    #[test]
+    fn test_zoom_anchor_scroll_calculation() {
+        let last_scroll_offset_y: f32 = 200.0;
+        let anchor_viewport_y: f32 = 150.0;
+        let old_zoom: f32 = 1.0;
+        let new_zoom: f32 = 1.5;
+
+        let content_before: f32 = last_scroll_offset_y + anchor_viewport_y;
+        let ratio: f32 = new_zoom / old_zoom;
+        let content_after: f32 = content_before * ratio;
+        let new_offset: f32 = (content_after - anchor_viewport_y).max(0.0);
+
+        assert!((content_before - 350.0).abs() < 1e-4);
+        assert!((content_after - 525.0).abs() < 1e-4);
+        assert!((new_offset - 375.0).abs() < 1e-4);
+
+        // Verify content under cursor stays exactly under cursor
+        assert!((content_after - new_offset - anchor_viewport_y).abs() < 1e-4);
     }
 }

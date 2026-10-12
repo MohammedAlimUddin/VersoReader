@@ -44,6 +44,42 @@ pub struct OutlineItem {
     pub children: Vec<OutlineItem>,
 }
 
+/// An axis-aligned rectangle in canonical page space (points, origin top-left, unrotated).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CanonicalRect {
+    pub min_x: f32,
+    pub min_y: f32,
+    pub max_x: f32,
+    pub max_y: f32,
+}
+
+impl CanonicalRect {
+    pub fn new(min_x: f32, min_y: f32, max_x: f32, max_y: f32) -> Self {
+        Self {
+            min_x,
+            min_y,
+            max_x,
+            max_y,
+        }
+    }
+
+    pub fn to_egui_rect(self) -> egui::Rect {
+        egui::Rect::from_min_max(
+            egui::pos2(self.min_x, self.min_y),
+            egui::pos2(self.max_x, self.max_y),
+        )
+    }
+}
+
+/// A search match occurrence, spanning one or more text rectangles in canonical points.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchMatch {
+    /// 1-based page number.
+    pub page: usize,
+    /// Bounding rectangles in canonical space.
+    pub rects: Vec<CanonicalRect>,
+}
+
 /// Commands sent from the UI thread to the worker thread.
 #[derive(Debug, Clone)]
 pub enum Command {
@@ -56,6 +92,12 @@ pub enum Command {
     Render(RenderCommand),
     /// Request document outline / bookmarks tree.
     Outline { doc_id: DocId },
+    /// Search document text page-by-page.
+    Search {
+        doc_id: DocId,
+        query_id: u64,
+        query: String,
+    },
     /// Terminate the worker thread.
     #[allow(dead_code)]
     Shutdown,
@@ -90,5 +132,14 @@ pub enum Event {
     OutlineResult {
         doc_id: DocId,
         items: Vec<OutlineItem>,
+    },
+    /// Search results streamed per page.
+    SearchResults {
+        doc_id: DocId,
+        query_id: u64,
+        #[allow(dead_code)]
+        page: usize,
+        matches: Vec<SearchMatch>,
+        done: bool,
     },
 }

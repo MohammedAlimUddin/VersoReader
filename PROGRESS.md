@@ -187,8 +187,71 @@
     - Worker outline extraction against `fixtures/Modern Operating Systems 4th Edition--Andrew Tanenbaum.pdf` (`test_worker_extract_outline_large_book`).
     - Chapter active interval detection logic (`test_is_chapter_active`).
 - **Known-broken / Deferred:**
-  - Find / search feature is scheduled for Milestone 6.
+  - Find / search feature is completed in Milestone 6.
 - **Manual Verification Checklist:**
-  - [ ] Large book: chapter tree matches Edge's sidebar; clicking jumps to the correct page.
-  - [ ] A PDF without bookmarks shows the "No table of contents" empty message.
-  - [ ] Sidebar state (open/closed and width) is remembered per tab.
+  - [x] Large book: chapter tree matches Edge's sidebar; clicking jumps to the correct page.
+  - [x] A PDF without bookmarks shows the "No table of contents" empty message.
+  - [x] Sidebar state (open/closed and width) is remembered per tab.
+
+---
+
+## Milestone 6 — Find
+- **Status:** Completed
+- **Done:**
+  - Defined `CanonicalRect` and `SearchMatch` structs in `src/pdf/types.rs`.
+  - Added `Command::Search { doc_id, query_id, query }` and `Event::SearchResults { doc_id, query_id, page, matches, done }` to channel protocol.
+  - Worker thread background search implementation (`src/pdf/worker.rs`):
+    - Chunked page-by-page text search using `pdfium-render` `PdfPageTextSearch` with case-insensitive matching (`PdfSearchOptions::new().match_case(false)`).
+    - **Fixed coordinate conversion (`user_rect_to_canonical`)**: PDFium text search returns coordinates in PDF user coordinates (MediaBox-relative with origin at bottom-left). Accounted for `CropBox` origins (`crop_box.left`, `crop_box.top`) and intrinsic page rotation so that search rectangles map with 100% precision to canonical coordinates (origin top-left of the visible rendered page).
+    - **Collinear segment merging (`merge_line_rects`)**: Merges adjacent horizontal text segments on the same line into a single unified rectangle covering words or phrases, avoiding disjoint split fragments while preserving multi-line match wrapping.
+    - Interleaves `try_recv()` before every page: gives top priority to incoming `Render` commands, guaranteeing that fast scrolling and rendering never freeze during search.
+    - Subsequent `Search` commands cancel existing searches on that document immediately.
+  - Toolbar Find toggle integration (`src/ui/toolbar.rs`):
+    - Added dedicated `🔍` Find button in the main toolbar beside the Table of Contents button with `on_hover_cursor(PointingHand)` and active selection state.
+    - Emits `ToolbarAction::ToggleFind` to open/focus or close the Find bar.
+  - FindBar UI component (`src/ui/findbar.rs`):
+    - Docked top panel directly below the main toolbar.
+    - Focused singleline search text input with `🔍` icon.
+    - Live match count indicator: `"N of M"`, `"N of M (searching...)"`, `"Searching..."`, or `"No matches"`.
+    - Next (`▼`) and Previous (`▲`) match buttons with pointing hand cursor and tooltips.
+    - Keyboard navigation:
+      - `Enter` / `ArrowDown` / `F3`: moves to next match.
+      - `Shift+Enter` / `ArrowUp` / `Shift+F3`: moves to previous match.
+      - `Esc`: closes Find bar, cancels search, and surrenders focus.
+    - Close button (`×`) on the right.
+    - Keystroke debouncing (~150 ms) before initiating worker search, scheduling non-busy frame wakeups via `request_repaint_after`.
+  - Focus and Arrow key document navigation (`src/app.rs`, `src/ui/viewer.rs`):
+    - When clicking anywhere inside the PDF document/viewer, text input focus is surrendered immediately, enabling smooth keyboard document navigation with `ArrowUp`, `ArrowDown`, `ArrowLeft`, `ArrowRight`, `PageUp`, `PageDown`, `Home`, `End`.
+    - Surrenders focus when `Enter` is pressed in the page number jump input or path bar.
+    - Surrenders focus when Find bar is closed via `Esc` or the close button.
+  - In-viewer highlight rendering (`src/ui/viewer.rs`):
+    - Search hit rectangles rendered on visible pages via `PageTransform`.
+    - All matches highlighted in soft translucent yellow (`rgba(255, 235, 0, 110)`).
+    - Active match highlighted with prominent orange overlay (`rgba(255, 140, 0, 180)`) and accent stroke.
+    - Exact word alignment preserved across all zoom levels (10%–800%) and all four rotations (0°, 90°, 180°, 270°).
+    - Implemented `compute_match_scroll_offset` to center the active match vertically in the viewport upon navigation.
+  - Per-tab lifecycle and state management (`src/app.rs`):
+    - Each `PdfTab` maintains its own `FindState` (search query, match list, current match index, searching status).
+    - `Ctrl+F` shortcut opens and focuses the find bar for the active tab.
+  - **Touchpad Pinch-to-Zoom & Scroll Isolation (`src/platform/wayland.rs`, `src/app.rs`, `src/ui/viewer.rs`)**:
+    - Dispatched `WaylandPinchEvent` lifecycle (`Begin`, `Update`, `End`) from the native Wayland gesture thread.
+    - Added gesture tracking and cooldown window (~150 ms) during which `ScrollArea::enable_scrolling(false)` is enforced on the document viewer and egui scroll deltas (`raw_scroll_delta` and `smooth_scroll_delta`) are cleared.
+    - Suppresses simultaneous vertical scrolling during pinch gestures so that touchpad pinch zoom strictly magnifies/shrinks the document at the pointer anchor without drifting or scrolling.
+    - Fixed exact viewport cursor anchor calculation using real `inner_rect.top()` instead of a hardcoded offset.
+    - Synchronized consecutive zoom offsets immediately in `apply_zoom` to eliminate jitter during continuous trackpad pinches.
+  - Added automated unit and integration tests:
+    - Worker search against `fixtures/MLE.pdf` and large book `fixtures/Modern Operating Systems 4th Edition--Andrew Tanenbaum.pdf` verifying exact pixel/point match coordinates (`test_worker_search_page_fixture`).
+    - FindState next/prev navigation and cyclic wraparound (`test_find_state_navigation`, `test_find_state_clear`).
+    - Match scroll offset viewport centering calculation (`test_compute_match_scroll_offset`).
+    - Zoom anchor scroll calculation test (`test_zoom_anchor_scroll_calculation`).
+- **Known-broken / Deferred:**
+  - Text layer and mouse drag selection are scheduled for Milestone 7.
+- **Manual Verification Checklist:**
+  - [x] Click the `🔍` button in the toolbar (or press `Ctrl+F`): Find bar opens and focuses the text box.
+  - [x] Search a word (e.g. "operating" or "systems"): highlights appear exactly on the text characters without any offset or random placements.
+  - [x] Press `ArrowDown` or `Enter`: moves to next match and centers it in the viewport.
+  - [x] Press `ArrowUp` or `Shift+Enter`: moves to previous match.
+  - [x] Click anywhere on the document: Up and Down arrow keys immediately scroll the document smoothly.
+  - [x] Press `Esc` or click `×`: closes the Find bar and clears highlights.
+  - [x] Test zoomed in and rotated: highlights rotate and scale exactly with the page text.
+  - [x] Touchpad pinch-to-zoom: zooming smoothly scales in and out centered on the cursor without any simultaneous vertical scrolling.

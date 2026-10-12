@@ -1,17 +1,18 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender};
 
 use crate::cache::{TextureCache, TextureKey};
-use crate::pdf::types::{DocId, OutlineItem, PageSize, RenderCommand};
+use crate::pdf::types::{DocId, OutlineItem, PageSize, RenderCommand, SearchMatch};
 use crate::pdf::{start_worker, Command, Event, PageTransform};
+use crate::ui::findbar::{render_find_bar, FindBarAction, FindState};
 use crate::ui::pathbar::{parse_pdf_path, PathBar};
 use crate::ui::sidebar_toc::render_sidebar_toc;
 use crate::ui::tabbar::{render_tab_bar, TabBarAction, TabItem};
 use crate::ui::toolbar::{Toolbar, ToolbarAction};
-use crate::ui::viewer::{render_viewer, PageRenderRequest};
+use crate::ui::viewer::{compute_match_scroll_offset, render_viewer, PageRenderRequest};
 
 /// State of an open PDF document tab.
 #[derive(Debug, Clone)]
@@ -29,6 +30,7 @@ pub struct PdfTab {
     pub pending_scroll_delta_y: Option<f32>,
     pub pending_set_scroll_offset_y: Option<f32>,
     pub last_viewport_height: f32,
+    pub last_viewport_top: f32,
     pub last_scroll_offset_y: f32,
     pub is_loading: bool,
     pub loading_message: String,
@@ -36,6 +38,7 @@ pub struct PdfTab {
     pub outline_loading: bool,
     pub sidebar_open: bool,
     pub sidebar_width: f32,
+    pub find_state: FindState,
 }
 
 /// Top-level tabs in the reader.
@@ -85,9 +88,12 @@ pub struct PdfViewApp {
     pub frame_time_ms: f32,
 
     #[cfg(target_os = "linux")]
-    pub rx_pinch_gesture: Option<crossbeam_channel::Receiver<f64>>,
+    pub rx_pinch_gesture:
+        Option<crossbeam_channel::Receiver<crate::platform::wayland::WaylandPinchEvent>>,
     #[cfg(target_os = "linux")]
     pub wayland_gesture_init_attempted: bool,
+    pub pinch_active: bool,
+    pub pinch_last_active: Option<Instant>,
 }
 
 impl PdfViewApp {
@@ -132,6 +138,8 @@ impl PdfViewApp {
             rx_pinch_gesture: None,
             #[cfg(target_os = "linux")]
             wayland_gesture_init_attempted: false,
+            pinch_active: false,
+            pinch_last_active: None,
         };
 
         if app.pending_open_path.is_none() {
@@ -186,6 +194,7 @@ impl PdfViewApp {
             pending_scroll_delta_y: None,
             pending_set_scroll_offset_y: None,
             last_viewport_height: 600.0,
+            last_viewport_top: 0.0,
             last_scroll_offset_y: 0.0,
             is_loading: false,
             loading_message: String::new(),
@@ -193,6 +202,7 @@ impl PdfViewApp {
             outline_loading: false,
             sidebar_open: false,
             sidebar_width: 280.0,
+            find_state: FindState::default(),
         };
 
         self.tabs.push(Tab::Pdf(tab));
@@ -231,6 +241,7 @@ impl PdfViewApp {
                 tab.loading_message = format!("Opening {}...", path.display());
                 tab.outline = None;
                 tab.outline_loading = false;
+                tab.find_state = FindState::default();
                 let doc_id = tab.doc_id;
                 self.render_generation += 1;
                 self.pending_render_requests.clear();
@@ -257,6 +268,7 @@ impl PdfViewApp {
             pending_scroll_delta_y: None,
             pending_set_scroll_offset_y: None,
             last_viewport_height: 600.0,
+            last_viewport_top: 0.0,
             last_scroll_offset_y: 0.0,
             is_loading: true,
             loading_message: format!("Opening {}...", path.display()),
@@ -264,6 +276,7 @@ impl PdfViewApp {
             outline_loading: false,
             sidebar_open: false,
             sidebar_width: 280.0,
+            find_state: FindState::default(),
         };
 
         // If switching from an existing tab, drop its textures from cache
@@ -346,6 +359,8 @@ impl PdfViewApp {
             let ratio = tab.zoom / old_zoom;
             let content_after = content_before * ratio;
             let new_offset = (content_after - anchor_y).max(0.0);
+            tab.last_scroll_offset_y = new_offset;
+            tab.scroll_offset_y = new_offset;
             tab.pending_set_scroll_offset_y = Some(new_offset);
 
             self.render_generation += 1;
@@ -454,20 +469,86 @@ impl eframe::App for PdfViewApp {
         // Native Wayland touchpad pinch gestures (no Ctrl key required)
         #[cfg(target_os = "linux")]
         {
-            let mut wayland_scales = Vec::new();
+            let mut wayland_events = Vec::new();
             if let Some(ref rx) = self.rx_pinch_gesture {
-                while let Ok(scale_factor) = rx.try_recv() {
-                    wayland_scales.push(scale_factor);
+                while let Ok(evt) = rx.try_recv() {
+                    wayland_events.push(evt);
                 }
             }
-            for scale_factor in wayland_scales {
-                if (scale_factor - 1.0).abs() > 0.0001 {
-                    let hover_pos = ctx.input(|i| i.pointer.hover_pos());
-                    let anchor_y = hover_pos.map(|p| p.y - 70.0);
-                    let current_zoom = self.active_pdf_tab().map(|t| t.zoom).unwrap_or(1.0);
-                    self.apply_zoom(current_zoom * scale_factor as f32, anchor_y);
+            for evt in wayland_events {
+                match evt {
+                    crate::platform::wayland::WaylandPinchEvent::Begin => {
+                        self.pinch_active = true;
+                        self.pinch_last_active = Some(Instant::now());
+                    }
+                    crate::platform::wayland::WaylandPinchEvent::Update(scale_factor) => {
+                        self.pinch_active = true;
+                        self.pinch_last_active = Some(Instant::now());
+                        if (scale_factor - 1.0).abs() > 0.0001 {
+                            let anchor_y = self.active_pdf_tab().and_then(|tab| {
+                                ctx.input(|i| i.pointer.hover_pos()).map(|p| {
+                                    if p.y >= tab.last_viewport_top
+                                        && p.y <= tab.last_viewport_top + tab.last_viewport_height
+                                    {
+                                        p.y - tab.last_viewport_top
+                                    } else {
+                                        tab.last_viewport_height * 0.5
+                                    }
+                                })
+                            });
+                            let current_zoom = self.active_pdf_tab().map(|t| t.zoom).unwrap_or(1.0);
+                            self.apply_zoom(current_zoom * scale_factor as f32, anchor_y);
+                        }
+                    }
+                    crate::platform::wayland::WaylandPinchEvent::End => {
+                        self.pinch_active = false;
+                        self.pinch_last_active = Some(Instant::now());
+                    }
                 }
             }
+        }
+
+        // Multitouch trackpad / touchscreen pinch gesture fallback
+        let egui_pinch_delta = ctx.input(|i| i.zoom_delta());
+        let has_multitouch = ctx.input(|i| i.multi_touch().is_some());
+        if (egui_pinch_delta - 1.0).abs() > 0.001 || has_multitouch {
+            self.pinch_active = true;
+            self.pinch_last_active = Some(Instant::now());
+            if (egui_pinch_delta - 1.0).abs() > 0.001 {
+                let anchor_y = self.active_pdf_tab().and_then(|tab| {
+                    ctx.input(|i| {
+                        i.multi_touch()
+                            .map(|t| t.center_pos.y)
+                            .or_else(|| i.pointer.hover_pos().map(|p| p.y))
+                    })
+                    .map(|py| {
+                        if py >= tab.last_viewport_top
+                            && py <= tab.last_viewport_top + tab.last_viewport_height
+                        {
+                            py - tab.last_viewport_top
+                        } else {
+                            tab.last_viewport_height * 0.5
+                        }
+                    })
+                });
+                let current_zoom = self.active_pdf_tab().map(|t| t.zoom).unwrap_or(1.0);
+                self.apply_zoom(current_zoom * egui_pinch_delta, anchor_y);
+            }
+        }
+
+        // Determine if pinch zoom is actively occurring or in cooldown
+        let is_pinching = self.pinch_active
+            || self
+                .pinch_last_active
+                .is_some_and(|t| t.elapsed() < Duration::from_millis(150));
+
+        if is_pinching {
+            // Suppress accidental scroll deltas generated by touchpad pinch movements
+            ctx.input_mut(|i| {
+                i.raw_scroll_delta = egui::Vec2::ZERO;
+                i.smooth_scroll_delta = egui::Vec2::ZERO;
+            });
+            ctx.request_repaint();
         }
 
         // Measure frame time for F3 debug stats
@@ -569,25 +650,58 @@ impl eframe::App for PdfViewApp {
             self.switch_to_tab(prev_idx);
         }
 
-        // Touchpad pinch-to-zoom (multitouch fallback)
-        let pinch_delta = ctx.input(|i| i.zoom_delta());
-        let ctrl_pressed = ctx.input(|i| i.modifiers.ctrl);
+        // Find in document shortcut: Ctrl+F opens and focuses Find bar
+        if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::F)) {
+            if let Some(tab) = self.active_pdf_tab_mut() {
+                tab.find_state.is_open = true;
+                tab.find_state.focus_requested = true;
+            }
+        }
 
-        if (pinch_delta - 1.0).abs() > 0.001 {
-            let anchor_y = ctx.input(|i| {
-                i.multi_touch()
-                    .map(|t| t.center_pos.y - 70.0)
-                    .or_else(|| i.pointer.hover_pos().map(|p| p.y - 70.0))
-            });
-            let current_zoom = self.active_pdf_tab().map(|t| t.zoom).unwrap_or(1.0);
-            self.apply_zoom(current_zoom * pinch_delta, anchor_y);
-        } else if ctrl_pressed {
+        // Close Find bar shortcut: Esc (when not in fullscreen)
+        if !self.is_fullscreen && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            if let Some(tab) = self.active_pdf_tab_mut() {
+                if tab.find_state.is_open {
+                    tab.find_state.is_open = false;
+                    tab.find_state.clear_matches();
+                    let doc_id = tab.doc_id;
+                    let query_id = tab.find_state.active_query_id;
+                    let _ = self.tx_cmd.send(Command::Search {
+                        doc_id,
+                        query_id,
+                        query: String::new(),
+                    });
+                    ctx.memory_mut(|m| {
+                        if let Some(id) = m.focused() {
+                            m.surrender_focus(id);
+                        }
+                    });
+                }
+            }
+        }
+
+        let ctrl_pressed = ctx.input(|i| i.modifiers.ctrl);
+        if ctrl_pressed {
             // Zoom shortcuts: Ctrl + scroll, Ctrl + =, Ctrl + -, Ctrl + 0
             let scroll_delta = ctx.input(|i| i.raw_scroll_delta.y);
             if scroll_delta.abs() > 0.0 {
+                // Clear scroll delta so ScrollArea does not scroll vertically while zooming
+                ctx.input_mut(|i| {
+                    i.raw_scroll_delta = egui::Vec2::ZERO;
+                    i.smooth_scroll_delta = egui::Vec2::ZERO;
+                });
                 let factor = (scroll_delta * 0.003).clamp(-0.25, 0.25).exp();
-                let hover_pos = ctx.input(|i| i.pointer.hover_pos());
-                let anchor_y = hover_pos.map(|p| p.y - 70.0);
+                let anchor_y = self.active_pdf_tab().and_then(|tab| {
+                    ctx.input(|i| i.pointer.hover_pos()).map(|p| {
+                        if p.y >= tab.last_viewport_top
+                            && p.y <= tab.last_viewport_top + tab.last_viewport_height
+                        {
+                            p.y - tab.last_viewport_top
+                        } else {
+                            tab.last_viewport_height * 0.5
+                        }
+                    })
+                });
                 let current_zoom = self.active_pdf_tab().map(|t| t.zoom).unwrap_or(1.0);
                 self.apply_zoom(current_zoom * factor, anchor_y);
             }
@@ -606,9 +720,9 @@ impl eframe::App for PdfViewApp {
             }
         }
 
-        // Keyboard navigation when no text input has focus
+        // Keyboard navigation when no text input has focus and not pinching
         let any_focus = ctx.memory(|m| m.focused().is_some());
-        if !any_focus && !ctrl_pressed {
+        if !any_focus && !ctrl_pressed && !is_pinching {
             if let Some(tab) = self.active_pdf_tab_mut() {
                 if ctx.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
                     tab.pending_scroll_delta_y = Some(-80.0);
@@ -749,7 +863,76 @@ impl eframe::App for PdfViewApp {
                         }
                     }
                 }
+                Event::SearchResults {
+                    doc_id,
+                    query_id,
+                    page: _,
+                    matches,
+                    done,
+                } => {
+                    for tab_item in &mut self.tabs {
+                        if let Tab::Pdf(ref mut tab) = tab_item {
+                            if tab.doc_id == doc_id && tab.find_state.active_query_id == query_id {
+                                let was_empty = tab.find_state.matches.is_empty();
+                                tab.find_state.matches.extend(matches);
+
+                                if was_empty && !tab.find_state.matches.is_empty() {
+                                    tab.find_state.current_match_idx = Some(0);
+                                    let first_match = &tab.find_state.matches[0];
+                                    let offset = compute_match_scroll_offset(
+                                        first_match,
+                                        &tab.page_sizes,
+                                        tab.zoom,
+                                        tab.rotation,
+                                        tab.last_viewport_height,
+                                        800.0,
+                                    );
+                                    tab.pending_set_scroll_offset_y = offset;
+                                }
+
+                                if done {
+                                    tab.find_state.is_searching = false;
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
             }
+        }
+
+        // Debounce typing (~150 ms) for active tab's find query
+        let search_dispatch = if let Some(tab) = self.active_pdf_tab_mut() {
+            if let Some(last_time) = tab.find_state.last_edit_time {
+                if last_time.elapsed().as_millis() >= 150 {
+                    tab.find_state.last_edit_time = None;
+                    tab.find_state.active_query_id += 1;
+                    let query_id = tab.find_state.active_query_id;
+                    let query = tab.find_state.query.clone();
+                    let doc_id = tab.doc_id;
+                    tab.find_state.clear_matches();
+                    let is_non_empty = !query.trim().is_empty();
+                    if is_non_empty {
+                        tab.find_state.is_searching = true;
+                    }
+                    Some((doc_id, query_id, query))
+                } else {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(25));
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Some((doc_id, query_id, query)) = search_dispatch {
+            let _ = self.tx_cmd.send(Command::Search {
+                doc_id,
+                query_id,
+                query,
+            });
         }
 
         // In fullscreen mode, all window chrome is hidden
@@ -825,11 +1008,19 @@ impl eframe::App for PdfViewApp {
                     t.is_loading,
                     t.page_count > 0,
                     t.sidebar_open,
+                    t.find_state.is_open,
                 )
             });
 
-            if let Some((current_p, total_pages, zoom, is_loading, has_pages, sidebar_open)) =
-                active_tab_info
+            if let Some((
+                current_p,
+                total_pages,
+                zoom,
+                is_loading,
+                has_pages,
+                sidebar_open,
+                find_open,
+            )) = active_tab_info
             {
                 if has_pages || is_loading {
                     let mut toolbar_action = None;
@@ -847,11 +1038,14 @@ impl eframe::App for PdfViewApp {
                             avail_h = ctx.screen_rect().height();
                             toolbar_action = self.toolbar.ui(
                                 ui,
-                                current_p,
-                                total_pages,
-                                zoom,
-                                is_fullscreen,
-                                sidebar_open,
+                                crate::ui::toolbar::ToolbarProps {
+                                    current_page: current_p,
+                                    total_pages,
+                                    zoom,
+                                    is_fullscreen,
+                                    sidebar_open,
+                                    find_open,
+                                },
                             );
                         });
 
@@ -860,6 +1054,21 @@ impl eframe::App for PdfViewApp {
                             ToolbarAction::ToggleOutlineSidebar => {
                                 if let Some(tab) = self.active_pdf_tab_mut() {
                                     tab.sidebar_open = !tab.sidebar_open;
+                                }
+                            }
+                            ToolbarAction::ToggleFind => {
+                                if let Some(tab) = self.active_pdf_tab_mut() {
+                                    tab.find_state.is_open = !tab.find_state.is_open;
+                                    if tab.find_state.is_open {
+                                        tab.find_state.focus_requested = true;
+                                    } else {
+                                        tab.find_state.clear_matches();
+                                        ctx.memory_mut(|m| {
+                                            if let Some(id) = m.focused() {
+                                                m.surrender_focus(id);
+                                            }
+                                        });
+                                    }
                                 }
                             }
                             ToolbarAction::JumpToPage(target) => {
@@ -888,6 +1097,114 @@ impl eframe::App for PdfViewApp {
                             }
                             ToolbarAction::ToggleFullscreen => {
                                 self.toggle_fullscreen(ctx);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 4. Find Bar (Below toolbar)
+            let find_open = self
+                .active_pdf_tab()
+                .map(|t| t.find_state.is_open && (t.page_count > 0 || t.is_loading))
+                .unwrap_or(false);
+
+            if find_open {
+                let mut find_action = None;
+                let mut avail_w = 0.0;
+                egui::TopBottomPanel::top("main_findbar")
+                    .frame(
+                        egui::Frame::side_top_panel(&ctx.style())
+                            .fill(egui::Color32::from_rgb(24, 24, 26))
+                            .inner_margin(egui::Margin::symmetric(10, 4)),
+                    )
+                    .show(ctx, |ui| {
+                        avail_w = ui.available_width();
+                        if let Some(tab) = self.active_pdf_tab_mut() {
+                            let match_count = tab.find_state.matches.len();
+                            let current_match_idx = tab.find_state.current_match_idx;
+                            let is_searching = tab.find_state.is_searching;
+                            find_action = render_find_bar(
+                                ui,
+                                &mut tab.find_state.query,
+                                match_count,
+                                current_match_idx,
+                                is_searching,
+                                &mut tab.find_state.focus_requested,
+                            );
+                        }
+                    });
+
+                if let Some(action) = find_action {
+                    match action {
+                        FindBarAction::QueryChanged(new_query) => {
+                            if let Some(tab) = self.active_pdf_tab_mut() {
+                                tab.find_state.query = new_query.clone();
+                                if new_query.trim().is_empty() {
+                                    tab.find_state.clear_matches();
+                                    tab.find_state.active_query_id += 1;
+                                    let doc_id = tab.doc_id;
+                                    let query_id = tab.find_state.active_query_id;
+                                    let _ = self.tx_cmd.send(Command::Search {
+                                        doc_id,
+                                        query_id,
+                                        query: String::new(),
+                                    });
+                                } else {
+                                    tab.find_state.last_edit_time = Some(Instant::now());
+                                }
+                            }
+                        }
+                        FindBarAction::NextMatch => {
+                            if let Some(tab) = self.active_pdf_tab_mut() {
+                                if let Some(idx) = tab.find_state.next_match() {
+                                    if let Some(m) = tab.find_state.matches.get(idx) {
+                                        let offset = compute_match_scroll_offset(
+                                            m,
+                                            &tab.page_sizes,
+                                            tab.zoom,
+                                            tab.rotation,
+                                            tab.last_viewport_height,
+                                            avail_w,
+                                        );
+                                        tab.pending_set_scroll_offset_y = offset;
+                                    }
+                                }
+                            }
+                        }
+                        FindBarAction::PrevMatch => {
+                            if let Some(tab) = self.active_pdf_tab_mut() {
+                                if let Some(idx) = tab.find_state.prev_match() {
+                                    if let Some(m) = tab.find_state.matches.get(idx) {
+                                        let offset = compute_match_scroll_offset(
+                                            m,
+                                            &tab.page_sizes,
+                                            tab.zoom,
+                                            tab.rotation,
+                                            tab.last_viewport_height,
+                                            avail_w,
+                                        );
+                                        tab.pending_set_scroll_offset_y = offset;
+                                    }
+                                }
+                            }
+                        }
+                        FindBarAction::Close => {
+                            if let Some(tab) = self.active_pdf_tab_mut() {
+                                tab.find_state.is_open = false;
+                                tab.find_state.clear_matches();
+                                let doc_id = tab.doc_id;
+                                let query_id = tab.find_state.active_query_id;
+                                let _ = self.tx_cmd.send(Command::Search {
+                                    doc_id,
+                                    query_id,
+                                    query: String::new(),
+                                });
+                                ctx.memory_mut(|m| {
+                                    if let Some(id) = m.focused() {
+                                        m.surrender_focus(id);
+                                    }
+                                });
                             }
                         }
                     }
@@ -1024,6 +1341,8 @@ impl eframe::App for PdfViewApp {
                         scroll_to_page: Option<usize>,
                         scroll_delta: Option<f32>,
                         set_scroll: Option<f32>,
+                        search_matches: Vec<SearchMatch>,
+                        active_match_idx: Option<usize>,
                     },
                     Error(String),
                     Settings,
@@ -1049,6 +1368,8 @@ impl eframe::App for PdfViewApp {
                                 scroll_to_page: tab.pending_scroll_to_page.take(),
                                 scroll_delta: tab.pending_scroll_delta_y.take(),
                                 set_scroll: tab.pending_set_scroll_offset_y.take(),
+                                search_matches: tab.find_state.matches.clone(),
+                                active_match_idx: tab.find_state.current_match_idx,
                             }
                         }
                     }
@@ -1095,6 +1416,8 @@ impl eframe::App for PdfViewApp {
                         scroll_to_page,
                         scroll_delta,
                         set_scroll,
+                        search_matches,
+                        active_match_idx,
                     } => {
                         let output = render_viewer(
                             ui,
@@ -1107,11 +1430,15 @@ impl eframe::App for PdfViewApp {
                             scroll_to_page,
                             scroll_delta,
                             set_scroll,
+                            &search_matches,
+                            active_match_idx,
+                            is_pinching,
                         );
 
                         if let Some(Tab::Pdf(tab)) = self.tabs.get_mut(self.active_tab_idx) {
                             tab.current_page = output.current_page;
                             tab.last_viewport_height = output.visible_viewport_height;
+                            tab.last_viewport_top = output.viewport_top;
                             tab.last_scroll_offset_y = output.current_scroll_offset_y;
                             tab.scroll_offset_y = output.current_scroll_offset_y;
                         }

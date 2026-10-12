@@ -2,6 +2,7 @@
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ToolbarAction {
     ToggleOutlineSidebar,
+    ToggleFind,
     JumpToPage(usize),
     ZoomIn,
     ZoomOut,
@@ -9,6 +10,17 @@ pub enum ToolbarAction {
     FitPage,
     RotateClockwise,
     ToggleFullscreen,
+}
+
+/// Properties passed to the toolbar for rendering.
+#[derive(Debug, Clone, Copy)]
+pub struct ToolbarProps {
+    pub current_page: usize,
+    pub total_pages: usize,
+    pub zoom: f32,
+    pub is_fullscreen: bool,
+    pub sidebar_open: bool,
+    pub find_open: bool,
 }
 
 /// Main top toolbar component containing page navigation, zoom, rotation, and fullscreen controls.
@@ -26,36 +38,38 @@ impl Toolbar {
     }
 
     /// Renders the toolbar and returns any user-triggered action.
-    ///
-    /// - `current_page`: 1-indexed current page.
-    /// - `total_pages`: total pages in document.
-    /// - `zoom`: current zoom multiplier (e.g. 1.0 = 100%).
-    /// - `is_fullscreen`: whether fullscreen mode is currently active.
-    /// - `sidebar_open`: whether the table of contents sidebar is currently open.
-    pub fn ui(
-        &mut self,
-        ui: &mut egui::Ui,
-        current_page: usize,
-        total_pages: usize,
-        zoom: f32,
-        is_fullscreen: bool,
-        sidebar_open: bool,
-    ) -> Option<ToolbarAction> {
+    pub fn ui(&mut self, ui: &mut egui::Ui, props: ToolbarProps) -> Option<ToolbarAction> {
         let mut action = None;
 
         if !self.is_editing_page {
-            self.page_input_text = current_page.to_string();
+            self.page_input_text = props.current_page.to_string();
         }
 
         ui.horizontal(|ui| {
             // TOC sidebar toggle button at the far left
             let sidebar_btn = ui
-                .add(egui::Button::new(egui::RichText::new("☰").size(14.0)).selected(sidebar_open))
+                .add(
+                    egui::Button::new(egui::RichText::new("☰").size(14.0))
+                        .selected(props.sidebar_open),
+                )
                 .on_hover_cursor(egui::CursorIcon::PointingHand)
                 .on_hover_text("Table of contents (outline)");
 
             if sidebar_btn.clicked() {
                 action = Some(ToolbarAction::ToggleOutlineSidebar);
+            }
+
+            // Find in document toggle button
+            let find_btn = ui
+                .add(
+                    egui::Button::new(egui::RichText::new("🔍").size(13.0))
+                        .selected(props.find_open),
+                )
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text("Find in document (Ctrl+F)");
+
+            if find_btn.clicked() {
+                action = Some(ToolbarAction::ToggleFind);
             }
 
             ui.separator();
@@ -77,16 +91,19 @@ impl Toolbar {
                 response.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
 
             if enter_pressed || (response.lost_focus() && self.is_editing_page) {
+                if enter_pressed {
+                    response.surrender_focus();
+                }
                 if let Ok(num) = self.page_input_text.trim().parse::<usize>() {
-                    if num >= 1 && num <= total_pages {
+                    if num >= 1 && num <= props.total_pages {
                         action = Some(ToolbarAction::JumpToPage(num));
                     }
                 }
                 self.is_editing_page = false;
-                self.page_input_text = current_page.to_string();
+                self.page_input_text = props.current_page.to_string();
             }
 
-            ui.label(format!("of {total_pages}"));
+            ui.label(format!("of {}", props.total_pages));
 
             ui.separator();
 
@@ -100,7 +117,7 @@ impl Toolbar {
                 action = Some(ToolbarAction::ZoomOut);
             }
 
-            let zoom_percent = (zoom * 100.0).round();
+            let zoom_percent = (props.zoom * 100.0).round();
             ui.label(format!("{zoom_percent:.0}%"));
 
             if ui
@@ -145,7 +162,7 @@ impl Toolbar {
             ui.separator();
 
             // Fullscreen toggle button
-            let fs_label = if is_fullscreen {
+            let fs_label = if props.is_fullscreen {
                 "🗗 Exit Fullscreen"
             } else {
                 "⛶ Fullscreen"
