@@ -35,6 +35,15 @@ pub struct RenderResult {
     pub rgba: Vec<u8>,
 }
 
+/// An item in the document table of contents / bookmarks outline tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutlineItem {
+    pub title: String,
+    /// 1-based destination page number, if resolvable.
+    pub page_number: Option<usize>,
+    pub children: Vec<OutlineItem>,
+}
+
 /// Commands sent from the UI thread to the worker thread.
 #[derive(Debug, Clone)]
 pub enum Command {
@@ -45,6 +54,8 @@ pub enum Command {
     Close { doc_id: DocId },
     /// Render a requested page.
     Render(RenderCommand),
+    /// Request document outline / bookmarks tree.
+    Outline { doc_id: DocId },
     /// Terminate the worker thread.
     #[allow(dead_code)]
     Shutdown,
@@ -74,5 +85,10 @@ pub enum Event {
         page: usize,
         generation: u64,
         error: String,
+    },
+    /// Document outline / bookmarks result.
+    OutlineResult {
+        doc_id: DocId,
+        items: Vec<OutlineItem>,
     },
 }

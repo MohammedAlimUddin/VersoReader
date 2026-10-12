@@ -5,9 +5,10 @@ use std::time::Instant;
 use crossbeam_channel::{Receiver, Sender};
 
 use crate::cache::{TextureCache, TextureKey};
-use crate::pdf::types::{DocId, PageSize, RenderCommand};
+use crate::pdf::types::{DocId, OutlineItem, PageSize, RenderCommand};
 use crate::pdf::{start_worker, Command, Event, PageTransform};
 use crate::ui::pathbar::{parse_pdf_path, PathBar};
+use crate::ui::sidebar_toc::render_sidebar_toc;
 use crate::ui::tabbar::{render_tab_bar, TabBarAction, TabItem};
 use crate::ui::toolbar::{Toolbar, ToolbarAction};
 use crate::ui::viewer::{render_viewer, PageRenderRequest};
@@ -31,10 +32,15 @@ pub struct PdfTab {
     pub last_scroll_offset_y: f32,
     pub is_loading: bool,
     pub loading_message: String,
+    pub outline: Option<Vec<OutlineItem>>,
+    pub outline_loading: bool,
+    pub sidebar_open: bool,
+    pub sidebar_width: f32,
 }
 
 /// Top-level tabs in the reader.
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum Tab {
     Pdf(PdfTab),
     #[allow(dead_code)]
@@ -183,6 +189,10 @@ impl PdfViewApp {
             last_scroll_offset_y: 0.0,
             is_loading: false,
             loading_message: String::new(),
+            outline: None,
+            outline_loading: false,
+            sidebar_open: false,
+            sidebar_width: 280.0,
         };
 
         self.tabs.push(Tab::Pdf(tab));
@@ -219,6 +229,8 @@ impl PdfViewApp {
                 tab.pending_set_scroll_offset_y = None;
                 tab.is_loading = true;
                 tab.loading_message = format!("Opening {}...", path.display());
+                tab.outline = None;
+                tab.outline_loading = false;
                 let doc_id = tab.doc_id;
                 self.render_generation += 1;
                 self.pending_render_requests.clear();
@@ -248,6 +260,10 @@ impl PdfViewApp {
             last_scroll_offset_y: 0.0,
             is_loading: true,
             loading_message: format!("Opening {}...", path.display()),
+            outline: None,
+            outline_loading: false,
+            sidebar_open: false,
+            sidebar_width: 280.0,
         };
 
         // If switching from an existing tab, drop its textures from cache
@@ -643,6 +659,8 @@ impl eframe::App for PdfViewApp {
                                 tab.page_count = page_count;
                                 tab.page_sizes = page_sizes;
                                 tab.is_loading = false;
+                                tab.outline_loading = true;
+                                let _ = self.tx_cmd.send(Command::Outline { doc_id });
                                 break;
                             }
                         }
@@ -720,6 +738,17 @@ impl eframe::App for PdfViewApp {
                         self.pending_render_requests.retain(|&(p, _, _)| p != page);
                     }
                 }
+                Event::OutlineResult { doc_id, items } => {
+                    for tab_item in &mut self.tabs {
+                        if let Tab::Pdf(ref mut tab) = tab_item {
+                            if tab.doc_id == doc_id {
+                                tab.outline = Some(items);
+                                tab.outline_loading = false;
+                                break;
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -795,10 +824,13 @@ impl eframe::App for PdfViewApp {
                     t.zoom,
                     t.is_loading,
                     t.page_count > 0,
+                    t.sidebar_open,
                 )
             });
 
-            if let Some((current_p, total_pages, zoom, is_loading, has_pages)) = active_tab_info {
+            if let Some((current_p, total_pages, zoom, is_loading, has_pages, sidebar_open)) =
+                active_tab_info
+            {
                 if has_pages || is_loading {
                     let mut toolbar_action = None;
                     let is_fullscreen = self.is_fullscreen;
@@ -813,13 +845,23 @@ impl eframe::App for PdfViewApp {
                         .show(ctx, |ui| {
                             avail_w = ui.available_width();
                             avail_h = ctx.screen_rect().height();
-                            toolbar_action =
-                                self.toolbar
-                                    .ui(ui, current_p, total_pages, zoom, is_fullscreen);
+                            toolbar_action = self.toolbar.ui(
+                                ui,
+                                current_p,
+                                total_pages,
+                                zoom,
+                                is_fullscreen,
+                                sidebar_open,
+                            );
                         });
 
                     if let Some(action) = toolbar_action {
                         match action {
+                            ToolbarAction::ToggleOutlineSidebar => {
+                                if let Some(tab) = self.active_pdf_tab_mut() {
+                                    tab.sidebar_open = !tab.sidebar_open;
+                                }
+                            }
                             ToolbarAction::JumpToPage(target) => {
                                 if let Some(tab) = self.active_pdf_tab_mut() {
                                     tab.pending_scroll_to_page = Some(target);
@@ -891,6 +933,57 @@ impl eframe::App for PdfViewApp {
                             );
                         });
                     });
+            }
+        }
+
+        // TOC Sidebar (Left panel in document body)
+        if !self.is_fullscreen {
+            let sidebar_state = self.active_pdf_tab().and_then(|t| {
+                if t.sidebar_open && (t.page_count > 0 || t.is_loading) {
+                    Some((
+                        t.sidebar_width,
+                        t.outline.clone(),
+                        t.outline_loading,
+                        t.current_page,
+                    ))
+                } else {
+                    None
+                }
+            });
+
+            if let Some((sidebar_width, outline, outline_loading, current_page)) = sidebar_state {
+                let mut sidebar_out = None;
+                let panel_res = egui::SidePanel::left("toc_sidebar")
+                    .resizable(true)
+                    .default_width(sidebar_width)
+                    .min_width(180.0)
+                    .max_width(600.0)
+                    .frame(
+                        egui::Frame::side_top_panel(&ctx.style())
+                            .fill(egui::Color32::from_rgb(26, 26, 28))
+                            .inner_margin(egui::Margin::symmetric(10, 8)),
+                    )
+                    .show(ctx, |ui| {
+                        sidebar_out = Some(render_sidebar_toc(
+                            ui,
+                            outline.as_deref(),
+                            outline_loading,
+                            current_page,
+                        ));
+                    });
+
+                let actual_width = panel_res.response.rect.width();
+                if let Some(tab) = self.active_pdf_tab_mut() {
+                    tab.sidebar_width = actual_width;
+                    if let Some(out) = sidebar_out {
+                        if out.close_requested {
+                            tab.sidebar_open = false;
+                        }
+                        if let Some(target) = out.target_page {
+                            tab.pending_scroll_to_page = Some(target);
+                        }
+                    }
+                }
             }
         }
 

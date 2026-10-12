@@ -1,6 +1,7 @@
 /// Actions emitted by user interactions in the toolbar.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ToolbarAction {
+    ToggleOutlineSidebar,
     JumpToPage(usize),
     ZoomIn,
     ZoomOut,
@@ -30,6 +31,7 @@ impl Toolbar {
     /// - `total_pages`: total pages in document.
     /// - `zoom`: current zoom multiplier (e.g. 1.0 = 100%).
     /// - `is_fullscreen`: whether fullscreen mode is currently active.
+    /// - `sidebar_open`: whether the table of contents sidebar is currently open.
     pub fn ui(
         &mut self,
         ui: &mut egui::Ui,
@@ -37,6 +39,7 @@ impl Toolbar {
         total_pages: usize,
         zoom: f32,
         is_fullscreen: bool,
+        sidebar_open: bool,
     ) -> Option<ToolbarAction> {
         let mut action = None;
 
@@ -45,8 +48,20 @@ impl Toolbar {
         }
 
         ui.horizontal(|ui| {
+            // TOC sidebar toggle button at the far left
+            let sidebar_btn = ui
+                .add(egui::Button::new(egui::RichText::new("☰").size(14.0)).selected(sidebar_open))
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text("Table of contents (outline)");
+
+            if sidebar_btn.clicked() {
+                action = Some(ToolbarAction::ToggleOutlineSidebar);
+            }
+
+            ui.separator();
+
             // Page navigation
-            ui.add_space(4.0);
+            ui.add_space(2.0);
             ui.label(egui::RichText::new("Page").strong());
 
             let text_edit = egui::TextEdit::singleline(&mut self.page_input_text)

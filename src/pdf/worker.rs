@@ -1,11 +1,11 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::thread;
 
 use crossbeam_channel::{Receiver, Sender};
 use pdfium_render::prelude::*;
 
-use crate::pdf::types::{Command, DocId, Event, PageSize, RenderResult};
+use crate::pdf::types::{Command, DocId, Event, OutlineItem, PageSize, RenderResult};
 
 /// Computes candidate file paths to search for `libpdfium.so`, in priority order:
 /// 1. Directory of the executable
@@ -230,9 +230,76 @@ fn worker_main(ctx: egui::Context, rx_cmd: Receiver<Command>, tx_evt: Sender<Eve
                 documents.remove(&doc_id);
                 latest_generations.remove(&doc_id);
             }
+            Command::Outline { doc_id } => {
+                if let Some(doc) = documents.get(&doc_id) {
+                    let items = extract_outline(doc);
+                    let _ = tx_evt.send(Event::OutlineResult { doc_id, items });
+                    ctx.request_repaint();
+                }
+            }
             Command::Shutdown => break,
         }
     }
+}
+
+/// Resolves a bookmark's target destination to a 1-based page number.
+fn resolve_bookmark_page(bookmark: &PdfBookmark) -> Option<usize> {
+    if let Some(dest) = bookmark.destination() {
+        if let Ok(idx) = dest.page_index() {
+            return Some((idx as usize) + 1);
+        }
+    }
+    if let Some(PdfAction::LocalDestination(local_dest)) = bookmark.action() {
+        if let Ok(dest) = local_dest.destination() {
+            if let Ok(idx) = dest.page_index() {
+                return Some((idx as usize) + 1);
+            }
+        }
+    }
+    None
+}
+
+/// Recursively traverses a bookmark node and its children.
+fn extract_bookmark_node<'a>(
+    bookmark: &PdfBookmark<'a>,
+    visited: &mut HashSet<PdfBookmark<'a>>,
+    depth: usize,
+) -> OutlineItem {
+    let title = bookmark.title().unwrap_or_else(|| "Untitled".to_string());
+    let page_number = resolve_bookmark_page(bookmark);
+
+    let mut children = Vec::new();
+    if depth < 32 {
+        let mut curr_child = bookmark.first_child();
+        while let Some(child) = curr_child {
+            if visited.insert(child.clone()) {
+                children.push(extract_bookmark_node(&child, visited, depth + 1));
+            }
+            curr_child = child.next_sibling();
+        }
+    }
+
+    OutlineItem {
+        title,
+        page_number,
+        children,
+    }
+}
+
+/// Extracts the full outline (table of contents) tree for a document.
+pub fn extract_outline(doc: &PdfDocument) -> Vec<OutlineItem> {
+    let mut items = Vec::new();
+    let mut visited = HashSet::new();
+
+    let mut curr_root = doc.bookmarks().root();
+    while let Some(root_bm) = curr_root {
+        if visited.insert(root_bm.clone()) {
+            items.push(extract_bookmark_node(&root_bm, &mut visited, 0));
+        }
+        curr_root = root_bm.next_sibling();
+    }
+
+    items
 }
 
 #[cfg(test)]
@@ -329,5 +396,25 @@ mod tests {
             assert!(removed.is_some());
         }
         assert!(docs.is_empty());
+    }
+
+    #[test]
+    fn test_worker_extract_outline_large_book() {
+        let pdfium = bind_pdfium().expect("Pdfium must be available for fixture test");
+        let path =
+            PathBuf::from("fixtures/Modern Operating Systems 4th Edition--Andrew Tanenbaum.pdf");
+        if !path.exists() {
+            return;
+        }
+
+        let doc = pdfium
+            .load_pdf_from_file(&path, None)
+            .expect("Failed to load large book PDF");
+        let outline = extract_outline(&doc);
+        assert!(
+            !outline.is_empty(),
+            "Large book should have bookmarks outline"
+        );
+        assert!(outline.iter().any(|item| item.page_number.is_some()));
     }
 }

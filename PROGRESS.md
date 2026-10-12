@@ -144,12 +144,51 @@
     - Path bar expand and focus state transitions (`test_pathbar_collapse_expand`).
     - Multi-tab document open/close cycle in worker (`test_worker_open_and_close_multiple_tabs`).
 - **Known-broken / Deferred:**
-  - Table of Contents sidebar is scheduled for Milestone 5.
+  - Table of Contents sidebar is completed in Milestone 5.
 - **Manual Verification Checklist:**
-  - [ ] Open 3 different PDFs; each tab remembers its own scroll, zoom, and rotation when switching back.
-  - [ ] Tabs are integrated into the top title bar with window minimize, maximize, and close controls.
-  - [ ] Clicking `+` or pressing `Ctrl+T` immediately opens a clean "New Tab" and focuses the path bar.
-  - [ ] Mouse wheel, touchpad, and scrollbar dragging scroll freely up and down.
-  - [ ] Hovering over tabs, buttons, and tools shows the pointing hand cursor.
-  - [ ] Tab close `×` button closes the tab immediately.
-  - [ ] Closing tabs reduces RSS; open/close the same book 10 times: RSS doesn't keep climbing.
+  - [x] Open 3 different PDFs; each tab remembers its own scroll, zoom, and rotation when switching back.
+  - [x] Tabs are integrated into the top title bar with window minimize, maximize, and close controls.
+  - [x] Clicking `+` or pressing `Ctrl+T` immediately opens a clean "New Tab" and focuses the path bar.
+  - [x] Mouse wheel, touchpad, and scrollbar dragging scroll freely up and down.
+  - [x] Hovering over tabs, buttons, and tools shows the pointing hand cursor.
+  - [x] Tab close `×` button closes the tab immediately.
+  - [x] Closing tabs reduces RSS; open/close the same book 10 times: RSS doesn't keep climbing.
+
+---
+
+## Milestone 5 — Table of contents sidebar
+- **Status:** Completed
+- **Done:**
+  - Implemented `OutlineItem` struct (`title`, `page_number: Option<usize>`, `children: Vec<OutlineItem>`) in `src/pdf/types.rs`.
+  - Added `Command::Outline { doc_id }` and `Event::OutlineResult { doc_id, items }` channels.
+  - Implemented recursive outline extraction in `src/pdf/worker.rs`:
+    - Traverses `doc.bookmarks().root()` recursively via `first_child()` and `next_sibling()`.
+    - Handles cycle detection with a `HashSet` of visited bookmarks and capped recursion depth (32).
+    - Destination resolution handles direct `bookmark.destination()` and fallback `bookmark.action()` with `PdfAction::LocalDestination`.
+    - Converts zero-based page indexes to canonical 1-based page numbers.
+    - Gracefully handles bookmarks without a resolvable destination (kept in tree with `page_number: None`).
+  - Implemented `src/ui/sidebar_toc.rs`:
+    - Collapsible tree rendering using `egui::CollapsingHeader` with automatic root expansion.
+    - Indented leaf bookmark buttons with hover cursor (`PointingHand`) and page destination tooltips (`"Page N"`).
+    - Active chapter highlighting: `is_chapter_active` detects current chapter by interval `[start, next_sibling_start)`, highlighted with bold accent blue.
+    - Displays `"No table of contents"` when a document has no bookmarks.
+    - Displays loading spinner and label while outline is being fetched from the background worker.
+    - Close button (`×`) in sidebar title bar.
+  - Toolbar integration (`src/ui/toolbar.rs`):
+    - Added outline toggle button (`☰`) at the far left of the toolbar.
+    - Displays active/selected state when sidebar is open and has `PointingHand` cursor.
+  - Per-tab lifecycle and state management (`src/app.rs`):
+    - Each `PdfTab` maintains its own `outline: Option<Vec<OutlineItem>>`, `outline_loading: bool`, `sidebar_open: bool`, and `sidebar_width: f32`.
+    - Automatically dispatches `Command::Outline { doc_id }` upon document open.
+    - Docked left sidebar (`egui::SidePanel::left("toc_sidebar")`) resizable between 180 px and 600 px (default 280 px).
+    - Automatically hides sidebar during fullscreen mode (`F11`), restoring it when exiting fullscreen.
+    - Clicking any bookmark immediately scrolls the viewer to the exact target page (`tab.pending_scroll_to_page`).
+  - Added automated unit and integration tests:
+    - Worker outline extraction against `fixtures/Modern Operating Systems 4th Edition--Andrew Tanenbaum.pdf` (`test_worker_extract_outline_large_book`).
+    - Chapter active interval detection logic (`test_is_chapter_active`).
+- **Known-broken / Deferred:**
+  - Find / search feature is scheduled for Milestone 6.
+- **Manual Verification Checklist:**
+  - [ ] Large book: chapter tree matches Edge's sidebar; clicking jumps to the correct page.
+  - [ ] A PDF without bookmarks shows the "No table of contents" empty message.
+  - [ ] Sidebar state (open/closed and width) is remembered per tab.
