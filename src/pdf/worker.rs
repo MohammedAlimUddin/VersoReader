@@ -6,6 +6,7 @@ use std::thread;
 use crossbeam_channel::{Receiver, Sender};
 use pdfium_render::prelude::*;
 
+use crate::annotations::{AnnotationColor, Highlight};
 use crate::pdf::types::{
     CanonicalRect, CharBox, Command, DocId, Event, LineBox, OutlineItem, PageSize, PageTextData,
     RenderResult, SearchMatch,
@@ -161,8 +162,21 @@ fn worker_main(ctx: egui::Context, rx_cmd: Receiver<Command>, tx_evt: Sender<Eve
             true
         });
 
-        // Pick next command: prioritize visible page renders (priority 1) over prefetch
-        let cmd = if let Some(pos) = cmd_queue
+        // Pick next command:
+        // 1. Critical doc mutations (Shutdown, Open, Close, SyncAnnotations, SaveDoc) must run first in FIFO order
+        // 2. Otherwise prioritize visible page renders (priority 1) over prefetch and background search/text
+        let cmd = if let Some(pos) = cmd_queue.iter().position(|c| {
+            matches!(
+                c,
+                Command::Shutdown
+                    | Command::Open { .. }
+                    | Command::Close { .. }
+                    | Command::SyncAnnotations { .. }
+                    | Command::SaveDoc { .. }
+            )
+        }) {
+            cmd_queue.remove(pos)
+        } else if let Some(pos) = cmd_queue
             .iter()
             .position(|c| matches!(c, Command::Render(rc) if rc.priority == 1))
         {
@@ -195,11 +209,13 @@ fn worker_main(ctx: egui::Context, rx_cmd: Receiver<Command>, tx_evt: Sender<Eve
                                     }
                                 }
 
+                                let annotations = extract_annotations_from_doc(&doc);
                                 documents.insert(doc_id, doc);
                                 let _ = tx_evt.send(Event::Opened {
                                     doc_id,
                                     page_count,
                                     page_sizes,
+                                    annotations,
                                 });
                                 ctx.request_repaint();
                             }
@@ -458,6 +474,77 @@ fn worker_main(ctx: egui::Context, rx_cmd: Receiver<Command>, tx_evt: Sender<Eve
                         }
                     }
                 }
+                Command::SyncAnnotations { doc_id, highlights } => {
+                    if let Some(doc) = documents.get(&doc_id) {
+                        let _ = apply_highlights_to_doc(doc, &highlights);
+                    }
+                }
+                Command::SaveDoc {
+                    doc_id,
+                    path,
+                    highlights,
+                } => {
+                    if let Some(doc) = documents.get(&doc_id) {
+                        match apply_highlights_to_doc(doc, &highlights) {
+                            Ok(_) => match doc.save_to_bytes() {
+                                Ok(bytes) => {
+                                    let tmp_path = path.with_extension("pdf.tmp_pdfview");
+                                    match std::fs::write(&tmp_path, &bytes) {
+                                        Ok(_) => match std::fs::rename(&tmp_path, &path) {
+                                            Ok(_) => {
+                                                let _ = tx_evt.send(Event::Saved {
+                                                    doc_id,
+                                                    success: true,
+                                                    error: None,
+                                                });
+                                            }
+                                            Err(err) => {
+                                                let _ = std::fs::remove_file(&tmp_path);
+                                                let _ = tx_evt.send(Event::Saved {
+                                                    doc_id,
+                                                    success: false,
+                                                    error: Some(format!(
+                                                        "Failed to overwrite PDF: {err}"
+                                                    )),
+                                                });
+                                            }
+                                        },
+                                        Err(err) => {
+                                            let _ = tx_evt.send(Event::Saved {
+                                                doc_id,
+                                                success: false,
+                                                error: Some(format!(
+                                                    "Failed to write temporary file: {err}"
+                                                )),
+                                            });
+                                        }
+                                    }
+                                }
+                                Err(err) => {
+                                    let _ = tx_evt.send(Event::Saved {
+                                        doc_id,
+                                        success: false,
+                                        error: Some(format!("Failed to serialize PDF: {err}")),
+                                    });
+                                }
+                            },
+                            Err(err) => {
+                                let _ = tx_evt.send(Event::Saved {
+                                    doc_id,
+                                    success: false,
+                                    error: Some(format!("Failed to apply annotations: {err}")),
+                                });
+                            }
+                        }
+                    } else {
+                        let _ = tx_evt.send(Event::Saved {
+                            doc_id,
+                            success: false,
+                            error: Some("Document not open".to_string()),
+                        });
+                    }
+                    ctx.request_repaint();
+                }
                 Command::Shutdown => break,
             }
         } else if let Some(ref mut search) = active_search {
@@ -596,6 +683,261 @@ fn merge_line_rects(rects: Vec<CanonicalRect>) -> Vec<CanonicalRect> {
     }
 
     result
+}
+
+/// Extracts all existing Highlight and Ink annotations from a PdfDocument's pages into canonical Highlights.
+pub fn extract_annotations_from_doc(doc: &PdfDocument) -> Vec<Highlight> {
+    let mut highlights = Vec::new();
+    let page_count = doc.pages().len() as usize;
+
+    for page_idx in 0..page_count {
+        let Ok(mut page) = doc.pages().get(page_idx as i32) else {
+            continue;
+        };
+        let page_h = page.height().value;
+        let annots = page.annotations_mut();
+        let annot_count = annots.len();
+
+        for i in 0..annot_count {
+            let Ok(mut annot) = annots.get(i) else {
+                continue;
+            };
+
+            if let Some(hl_annot) = annot.as_highlight_annotation_mut() {
+                let color = hl_annot
+                    .stroke_color()
+                    .or_else(|_| hl_annot.fill_color())
+                    .unwrap_or(PdfColor::new(255, 235, 59, 255));
+                let annot_color = AnnotationColor::new(color.red(), color.green(), color.blue());
+
+                let mut rects = Vec::new();
+                let pts = hl_annot.attachment_points_mut();
+                let pt_count = pts.len();
+                for p_idx in 0..pt_count {
+                    if let Ok(q) = pts.get(p_idx) {
+                        let x_min = q
+                            .x1()
+                            .value
+                            .min(q.x2().value)
+                            .min(q.x3().value)
+                            .min(q.x4().value);
+                        let x_max = q
+                            .x1()
+                            .value
+                            .max(q.x2().value)
+                            .max(q.x3().value)
+                            .max(q.x4().value);
+                        let y_bot = q
+                            .y1()
+                            .value
+                            .min(q.y2().value)
+                            .min(q.y3().value)
+                            .min(q.y4().value);
+                        let y_top = q
+                            .y1()
+                            .value
+                            .max(q.y2().value)
+                            .max(q.y3().value)
+                            .max(q.y4().value);
+                        let min_y = (page_h - y_top).max(0.0);
+                        let max_y = (page_h - y_bot).min(page_h);
+                        if x_max > x_min && max_y > min_y {
+                            rects.push(CanonicalRect::new(x_min, min_y, x_max, max_y));
+                        }
+                    }
+                }
+
+                if rects.is_empty() {
+                    if let Ok(b) = hl_annot.bounds() {
+                        let x_min = b.left().value;
+                        let x_max = b.right().value;
+                        let min_y = (page_h - b.top().value).max(0.0);
+                        let max_y = (page_h - b.bottom().value).min(page_h);
+                        if x_max > x_min && max_y > min_y {
+                            rects.push(CanonicalRect::new(x_min, min_y, x_max, max_y));
+                        }
+                    }
+                }
+
+                if !rects.is_empty() {
+                    highlights.push(Highlight {
+                        id: crate::annotations::generate_highlight_id(),
+                        page: page_idx,
+                        rects,
+                        points: Vec::new(),
+                        color: annot_color,
+                        alpha: 0.35,
+                        thickness: 1.0,
+                    });
+                }
+            } else if let Some(ink_annot) = annot.as_ink_annotation_mut() {
+                let mut annot_color = AnnotationColor::new(255, 235, 59);
+                let mut stroke_width = 12.0_f32;
+                let mut points = Vec::new();
+
+                let objects = ink_annot.objects_mut();
+                for obj in objects.iter() {
+                    if let Some(path_obj) = obj.as_path_object() {
+                        if let Ok(c) = path_obj.stroke_color() {
+                            annot_color = AnnotationColor::new(c.red(), c.green(), c.blue());
+                        }
+                        if let Ok(w) = path_obj.stroke_width() {
+                            if w.value > 0.0 {
+                                stroke_width = w.value;
+                            }
+                        }
+                        let segs = path_obj.segments();
+                        for s_idx in 0..segs.len() {
+                            if let Ok(seg) = segs.get(s_idx) {
+                                let (px, py) = seg.point();
+                                let can_x = px.value;
+                                let can_y = (page_h - py.value).clamp(0.0, page_h);
+                                points.push([can_x, can_y]);
+                            }
+                        }
+                    }
+                }
+
+                if points.is_empty() {
+                    if let Ok(b) = ink_annot.bounds() {
+                        let x_min = b.left().value;
+                        let x_max = b.right().value;
+                        let min_y = (page_h - b.top().value).max(0.0);
+                        let max_y = (page_h - b.bottom().value).min(page_h);
+                        points.push([x_min, min_y]);
+                        points.push([x_max, max_y]);
+                    }
+                }
+
+                if !points.is_empty() {
+                    highlights.push(Highlight {
+                        id: crate::annotations::generate_highlight_id(),
+                        page: page_idx,
+                        rects: Vec::new(),
+                        points,
+                        color: annot_color,
+                        alpha: 0.35,
+                        thickness: stroke_width,
+                    });
+                }
+            }
+        }
+    }
+
+    highlights
+}
+
+/// Applies highlights directly to a PdfDocument's pages in PDFium.
+/// Removes previous highlight and ink annotations and regenerates them according to `highlights`.
+pub fn apply_highlights_to_doc(doc: &PdfDocument, highlights: &[Highlight]) -> Result<(), String> {
+    let mut page_map: HashMap<usize, Vec<&Highlight>> = HashMap::new();
+    for hl in highlights {
+        page_map.entry(hl.page).or_default().push(hl);
+    }
+
+    let page_count = doc.pages().len() as usize;
+    for page_idx in 0..page_count {
+        let mut page = doc
+            .pages()
+            .get(page_idx as i32)
+            .map_err(|e| e.to_string())?;
+        let page_h = page.height().value;
+
+        let annots = page.annotations_mut();
+        let mut i = annots.len();
+        while i > 0 {
+            i -= 1;
+            if let Ok(annot) = annots.get(i) {
+                if matches!(
+                    annot,
+                    PdfPageAnnotation::Highlight(_) | PdfPageAnnotation::Ink(_)
+                ) {
+                    let _ = annots.delete_annotation(annot);
+                }
+            }
+        }
+
+        if let Some(page_highlights) = page_map.get(&page_idx) {
+            for hl in page_highlights {
+                if !hl.points.is_empty() {
+                    // Freehand ink annotation
+                    if let Ok(mut annot) = annots.create_ink_annotation() {
+                        let _ = annot.set_stroke_color(PdfColor::new(
+                            hl.color.r, hl.color.g, hl.color.b, 255,
+                        ));
+                        if hl.points.len() >= 2 {
+                            let start_x = hl.points[0][0];
+                            let start_y = (page_h - hl.points[0][1]).max(0.0);
+                            let stroke_width = hl.thickness.max(1.0);
+                            if let Ok(mut path) = PdfPagePathObject::new(
+                                doc,
+                                PdfPoints::new(start_x),
+                                PdfPoints::new(start_y),
+                                Some(PdfColor::new(hl.color.r, hl.color.g, hl.color.b, 255)),
+                                Some(PdfPoints::new(stroke_width)),
+                                None,
+                            ) {
+                                let _ = path.set_blend_mode(PdfPageObjectBlendMode::Multiply);
+                                for pt in &hl.points[1..] {
+                                    let x = pt[0];
+                                    let y = (page_h - pt[1]).max(0.0);
+                                    let _ = path.line_to(PdfPoints::new(x), PdfPoints::new(y));
+                                }
+                                let _ = annot.objects_mut().add_path_object(path);
+                            }
+                        }
+                        if let Some(bounds) = hl.bounding_rect() {
+                            let pdf_bottom = (page_h - bounds.max_y).max(0.0);
+                            let pdf_top = (page_h - bounds.min_y).min(page_h);
+                            let pdf_rect = PdfRect::new_from_values(
+                                pdf_bottom,
+                                bounds.min_x,
+                                pdf_top,
+                                bounds.max_x,
+                            );
+                            let _ = annot.set_bounds(pdf_rect);
+                        }
+                    }
+                } else if !hl.rects.is_empty() {
+                    // Text highlight annotation
+                    if let Ok(mut annot) = annots.create_highlight_annotation() {
+                        let _ = annot.set_stroke_color(PdfColor::new(
+                            hl.color.r, hl.color.g, hl.color.b, 255,
+                        ));
+                        for r in &hl.rects {
+                            let pdf_bottom = (page_h - r.max_y).max(0.0);
+                            let pdf_top = (page_h - r.min_y).min(page_h);
+                            let pdf_left = r.min_x;
+                            let pdf_right = r.max_x;
+                            // ISO 32000 quadpoints order in PDFium: top-left, top-right, bottom-left, bottom-right
+                            let quad = PdfQuadPoints::new_from_values(
+                                pdf_left, pdf_top, pdf_right, pdf_top, pdf_left, pdf_bottom,
+                                pdf_right, pdf_bottom,
+                            );
+                            let _ = annot
+                                .attachment_points_mut()
+                                .create_attachment_point_at_end(quad);
+                        }
+                        if let Some(bounds) = hl.bounding_rect() {
+                            let pdf_bottom = (page_h - bounds.max_y).max(0.0);
+                            let pdf_top = (page_h - bounds.min_y).min(page_h);
+                            let pdf_rect = PdfRect::new_from_values(
+                                pdf_bottom,
+                                bounds.min_x,
+                                pdf_top,
+                                bounds.max_x,
+                            );
+                            let _ = annot.set_bounds(pdf_rect);
+                        }
+                    }
+                }
+            }
+        }
+
+        let _ = page.regenerate_content();
+    }
+
+    Ok(())
 }
 
 /// Searches text on a single 1-based page of the document, returning matches in canonical coordinates.
@@ -1123,6 +1465,203 @@ mod tests {
     }
 
     #[test]
+    fn test_worker_create_highlight_and_save() {
+        let pdfium = bind_pdfium().expect("Pdfium must be available for fixture test");
+        let path = PathBuf::from("fixtures/MLE.pdf");
+        if !path.exists() {
+            return;
+        }
+
+        let doc = pdfium
+            .load_pdf_from_file(&path, None)
+            .expect("load MLE.pdf");
+        let mut page = doc.pages().get(0).expect("get page 0");
+        let initial_annots = page.annotations().len();
+
+        // Create a highlight annotation
+        let mut annot = page
+            .annotations_mut()
+            .create_highlight_annotation()
+            .expect("create highlight");
+        annot
+            .set_stroke_color(PdfColor::new(255, 235, 59, 255))
+            .expect("set stroke color");
+
+        let quad =
+            PdfQuadPoints::new_from_values(72.0, 720.0, 200.0, 720.0, 72.0, 700.0, 200.0, 700.0);
+        annot
+            .attachment_points_mut()
+            .create_attachment_point_at_end(quad)
+            .expect("add quad");
+
+        let bounds = PdfRect::new_from_values(700.0, 72.0, 720.0, 200.0);
+        annot.set_bounds(bounds).expect("set bounds");
+
+        assert_eq!(page.annotations().len(), initial_annots + 1);
+
+        // Save doc to bytes
+        let bytes = doc.save_to_bytes().expect("save to bytes");
+        assert!(!bytes.is_empty());
+
+        // Reload from bytes to verify the annotation was embedded
+        let reloaded_doc = pdfium
+            .load_pdf_from_byte_vec(bytes, None)
+            .expect("reload from bytes");
+        let reloaded_page = reloaded_doc.pages().get(0).expect("reloaded page 0");
+        assert_eq!(
+            reloaded_page.annotations().len(),
+            initial_annots + 1,
+            "Annotation must be present in reloaded document"
+        );
+    }
+
+    #[test]
+    fn test_worker_create_ink_annotation_and_save() {
+        let pdfium = bind_pdfium().expect("Pdfium must be available for fixture test");
+        let path = PathBuf::from("fixtures/MLE.pdf");
+        if !path.exists() {
+            return;
+        }
+
+        let doc = pdfium
+            .load_pdf_from_file(&path, None)
+            .expect("load MLE.pdf");
+        let mut page = doc.pages().get(0).expect("get page 0");
+        let initial_annots = page.annotations().len();
+
+        let mut annot = page
+            .annotations_mut()
+            .create_ink_annotation()
+            .expect("create ink");
+        annot
+            .set_stroke_color(PdfColor::new(76, 175, 80, 255))
+            .expect("set stroke color");
+
+        // Add a line path object to the ink annotation
+        let mut path_obj = PdfPagePathObject::new(
+            &doc,
+            PdfPoints::new(100.0),
+            PdfPoints::new(500.0),
+            Some(PdfColor::new(76, 175, 80, 255)),
+            Some(PdfPoints::new(4.0)),
+            None,
+        )
+        .expect("create path object");
+        path_obj
+            .line_to(PdfPoints::new(200.0), PdfPoints::new(550.0))
+            .expect("line to");
+        annot
+            .objects_mut()
+            .add_path_object(path_obj)
+            .expect("add path to annot");
+
+        let bounds = PdfRect::new_from_values(490.0, 95.0, 560.0, 205.0);
+        annot.set_bounds(bounds).expect("set bounds");
+
+        assert_eq!(page.annotations().len(), initial_annots + 1);
+
+        let bytes = doc.save_to_bytes().expect("save to bytes");
+        assert!(!bytes.is_empty());
+
+        let reloaded_doc = pdfium
+            .load_pdf_from_byte_vec(bytes, None)
+            .expect("reload from bytes");
+        let reloaded_page = reloaded_doc.pages().get(0).expect("reloaded page 0");
+        assert_eq!(
+            reloaded_page.annotations().len(),
+            initial_annots + 1,
+            "Ink annotation must be present in reloaded document"
+        );
+    }
+
+    #[test]
+    fn test_worker_highlight_render_multiply_blending() {
+        let pdfium = bind_pdfium().expect("Pdfium must be available for fixture test");
+        let path = PathBuf::from("fixtures/MLE.pdf");
+        if !path.exists() {
+            return;
+        }
+
+        let doc = pdfium
+            .load_pdf_from_file(&path, None)
+            .expect("load MLE.pdf");
+        let mut page = doc.pages().get(0).expect("get page 0");
+        let (ch, first_rect) = {
+            let text = page.text().expect("get text page");
+            let c = text.chars().get(0).expect("first char");
+            (
+                c.unicode_char(),
+                c.loose_bounds().expect("char loose bounds"),
+            )
+        };
+        println!("char 0: {:?}, rect: {:?}", ch, first_rect);
+
+        let render_config = PdfRenderConfig::new()
+            .set_target_width(800)
+            .render_annotations(true);
+        let orig_rgba = page
+            .render_with_config(&render_config)
+            .expect("render orig")
+            .as_rgba_bytes();
+
+        // Now add yellow highlight over the first char
+        let mut annot = page
+            .annotations_mut()
+            .create_highlight_annotation()
+            .expect("create highlight");
+        annot
+            .set_stroke_color(PdfColor::new(255, 235, 59, 255))
+            .expect("set stroke color");
+        let quad = PdfQuadPoints::new_from_values(
+            first_rect.left().value,
+            first_rect.top().value,
+            first_rect.right().value,
+            first_rect.top().value,
+            first_rect.left().value,
+            first_rect.bottom().value,
+            first_rect.right().value,
+            first_rect.bottom().value,
+        );
+        annot
+            .attachment_points_mut()
+            .create_attachment_point_at_end(quad)
+            .expect("add quad");
+        annot.set_bounds(first_rect).expect("set bounds");
+
+        let hl_bitmap = page
+            .render_with_config(&render_config)
+            .expect("render with hl");
+        let hl_rgba = hl_bitmap.as_rgba_bytes();
+
+        assert_eq!(orig_rgba.len(), hl_rgba.len());
+        // Find pixels that changed
+        let mut changed = 0;
+        let mut black_text_stayed_dark = 0;
+        for i in (0..orig_rgba.len()).step_by(4) {
+            let o_r = orig_rgba[i];
+            let o_g = orig_rgba[i + 1];
+            let o_b = orig_rgba[i + 2];
+            let h_r = hl_rgba[i];
+            let h_g = hl_rgba[i + 1];
+            let h_b = hl_rgba[i + 2];
+            if o_r != h_r || o_g != h_g || o_b != h_b {
+                changed += 1;
+                // If the original was black (text), under multiply blend it should still be black/dark (< 30)
+                if o_r < 30 && o_g < 30 && o_b < 30 && h_r < 40 && h_g < 40 && h_b < 40 {
+                    black_text_stayed_dark += 1;
+                }
+            }
+        }
+        println!(
+            "total pixels: {}, changed: {}, black_text_stayed_dark: {}",
+            orig_rgba.len() / 4,
+            changed,
+            black_text_stayed_dark
+        );
+        assert!(changed > 0, "Highlight must affect rendered bitmap");
+    }
+
+    #[test]
     fn test_worker_queue_priority_and_generation_pruning() {
         let path = PathBuf::from("fixtures/MLE.pdf");
         if !path.exists() {
@@ -1214,5 +1753,180 @@ mod tests {
 
         // Close doc
         tx_cmd.send(Command::Close { doc_id }).unwrap();
+    }
+
+    #[test]
+    fn test_worker_extract_annotations_roundtrip() {
+        let pdfium = bind_pdfium().expect("Pdfium must be available for fixture test");
+        let path = PathBuf::from("fixtures/MLE.pdf");
+        if !path.exists() {
+            return;
+        }
+
+        let doc = pdfium
+            .load_pdf_from_file(&path, None)
+            .expect("load MLE.pdf");
+
+        let hl1 = Highlight {
+            id: 1,
+            page: 0,
+            rects: vec![CanonicalRect::new(100.0, 100.0, 250.0, 120.0)],
+            points: Vec::new(),
+            color: AnnotationColor::new(255, 235, 59),
+            alpha: 0.35,
+            thickness: 1.0,
+        };
+
+        let hl2 = Highlight {
+            id: 2,
+            page: 0,
+            rects: Vec::new(),
+            points: vec![[50.0, 200.0], [150.0, 220.0], [250.0, 210.0]],
+            color: AnnotationColor::new(76, 175, 80),
+            alpha: 0.35,
+            thickness: 12.0,
+        };
+
+        apply_highlights_to_doc(&doc, &[hl1, hl2]).expect("apply highlights");
+        let bytes = doc.save_to_bytes().expect("save to bytes");
+
+        // Reload from bytes
+        let reloaded_doc = pdfium
+            .load_pdf_from_byte_vec(bytes, None)
+            .expect("reload from bytes");
+
+        let extracted = extract_annotations_from_doc(&reloaded_doc);
+        assert_eq!(extracted.len(), 2, "Must extract 2 annotations");
+
+        // Now add a 3rd annotation and apply all 3 to the reloaded doc
+        let hl3 = Highlight {
+            id: 3,
+            page: 0,
+            rects: vec![CanonicalRect::new(300.0, 100.0, 400.0, 120.0)],
+            points: Vec::new(),
+            color: AnnotationColor::new(255, 128, 0),
+            alpha: 0.35,
+            thickness: 1.0,
+        };
+
+        let mut all_hl = extracted;
+        all_hl.push(hl3);
+
+        apply_highlights_to_doc(&reloaded_doc, &all_hl).expect("apply 3 highlights");
+        let bytes2 = reloaded_doc.save_to_bytes().expect("save to bytes2");
+
+        let reloaded_doc2 = pdfium
+            .load_pdf_from_byte_vec(bytes2, None)
+            .expect("reload from bytes2");
+
+        let extracted2 = extract_annotations_from_doc(&reloaded_doc2);
+        assert_eq!(
+            extracted2.len(),
+            3,
+            "Must extract all 3 annotations without vanishing"
+        );
+    }
+
+    #[test]
+    fn test_apply_highlights_to_doc_renders_multiply_bitmap() {
+        let pdfium = bind_pdfium().expect("Pdfium must be available for fixture test");
+        let path = PathBuf::from("fixtures/MLE.pdf");
+        if !path.exists() {
+            return;
+        }
+
+        let doc = pdfium
+            .load_pdf_from_file(&path, None)
+            .expect("load MLE.pdf");
+        let render_config = PdfRenderConfig::new()
+            .set_target_width(800)
+            .render_annotations(true);
+
+        let orig_rgba = doc
+            .pages()
+            .get(0)
+            .unwrap()
+            .render_with_config(&render_config)
+            .unwrap()
+            .as_rgba_bytes();
+
+        let page0 = doc.pages().get(0).unwrap();
+        let page_h = page0.height().value;
+        let char_rect = {
+            let text = page0.text().unwrap();
+            let c = text.chars().get(0).unwrap();
+            let b = c.loose_bounds().unwrap();
+            CanonicalRect::new(
+                b.left().value,
+                (page_h - b.top().value).max(0.0),
+                b.right().value,
+                (page_h - b.bottom().value).min(page_h),
+            )
+        };
+
+        let hl = Highlight {
+            id: 1,
+            page: 0,
+            rects: vec![char_rect],
+            points: Vec::new(),
+            color: AnnotationColor::new(255, 235, 59),
+            alpha: 0.35,
+            thickness: 1.0,
+        };
+
+        let hl_ink = Highlight {
+            id: 2,
+            page: 0,
+            rects: Vec::new(),
+            points: vec![[50.0, 200.0], [150.0, 220.0], [250.0, 210.0]],
+            color: AnnotationColor::new(76, 175, 80),
+            alpha: 0.35,
+            thickness: 12.0,
+        };
+
+        apply_highlights_to_doc(&doc, &[hl, hl_ink]).expect("apply highlights");
+
+        let hl_rgba = doc
+            .pages()
+            .get(0)
+            .unwrap()
+            .render_with_config(&render_config)
+            .unwrap()
+            .as_rgba_bytes();
+
+        let mut changed = 0;
+        let mut orig_dark_count = 0;
+        let mut black_text_stayed_dark = 0;
+        for i in (0..orig_rgba.len()).step_by(4) {
+            let o_r = orig_rgba[i];
+            let o_g = orig_rgba[i + 1];
+            let o_b = orig_rgba[i + 2];
+            let h_r = hl_rgba[i];
+            let h_g = hl_rgba[i + 1];
+            let h_b = hl_rgba[i + 2];
+            if o_r != h_r || o_g != h_g || o_b != h_b {
+                changed += 1;
+                if o_r < 30 && o_g < 30 && o_b < 30 {
+                    orig_dark_count += 1;
+                    if orig_dark_count <= 5 {
+                        println!(
+                            "Orig dark pixel: ({}, {}, {}), after hl: ({}, {}, {})",
+                            o_r, o_g, o_b, h_r, h_g, h_b
+                        );
+                    }
+                    if h_r < 40 && h_g < 40 && h_b < 40 {
+                        black_text_stayed_dark += 1;
+                    }
+                }
+            }
+        }
+        println!(
+            "apply_highlights changed pixels: {}, orig_dark_count: {}, black_text_stayed_dark: {}",
+            changed, orig_dark_count, black_text_stayed_dark
+        );
+        assert!(
+            changed > 0,
+            "apply_highlights_to_doc must affect rendered page bitmap"
+        );
     }
 }

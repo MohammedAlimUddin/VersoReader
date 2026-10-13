@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use serde::{Deserialize, Serialize};
+
 pub type DocId = u64;
 
 /// Canonical page dimensions in points (origin top-left, unrotated).
@@ -45,7 +47,7 @@ pub struct OutlineItem {
 }
 
 /// An axis-aligned rectangle in canonical page space (points, origin top-left, unrotated).
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct CanonicalRect {
     pub min_x: f32,
     pub min_y: f32,
@@ -374,6 +376,17 @@ pub enum Command {
         query_id: u64,
         query: String,
     },
+    /// Synchronize all annotations on the document for native PDFium rendering.
+    SyncAnnotations {
+        doc_id: DocId,
+        highlights: Vec<crate::annotations::Highlight>,
+    },
+    /// Save the document with embedded annotations directly to the PDF file on disk.
+    SaveDoc {
+        doc_id: DocId,
+        path: PathBuf,
+        highlights: Vec<crate::annotations::Highlight>,
+    },
     /// Terminate the worker thread.
     #[allow(dead_code)]
     Shutdown,
@@ -391,6 +404,7 @@ pub enum Event {
         doc_id: DocId,
         page_count: usize,
         page_sizes: Vec<PageSize>,
+        annotations: Vec<crate::annotations::Highlight>,
     },
     /// Opening a document failed.
     OpenError { doc_id: DocId, error: String },
@@ -426,6 +440,12 @@ pub enum Event {
     },
     /// Result of an on-demand text extraction for clipboard copy.
     CopyTextResult { text: String },
+    /// Document save finished.
+    Saved {
+        doc_id: DocId,
+        success: bool,
+        error: Option<String>,
+    },
 }
 
 #[cfg(test)]

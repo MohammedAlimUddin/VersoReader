@@ -4,16 +4,18 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender};
 
+use crate::annotations::{DocumentAnnotations, UndoStack};
 use crate::cache::{PageTextCache, TextureCache, TextureKey};
 use crate::pdf::types::{
     DocId, OutlineItem, PageSize, RenderCommand, SearchMatch, TextLocation, TextSelection,
 };
 use crate::pdf::{start_worker, Command, Event, PageTransform};
+use crate::settings::Settings;
 use crate::ui::findbar::{render_find_bar, FindBarAction, FindState};
 use crate::ui::pathbar::{parse_pdf_path, PathBar};
 use crate::ui::sidebar_toc::render_sidebar_toc;
 use crate::ui::tabbar::{render_tab_bar, TabBarAction, TabItem};
-use crate::ui::toolbar::{Toolbar, ToolbarAction};
+use crate::ui::toolbar::{ActiveTool, Toolbar, ToolbarAction, ToolbarProps};
 use crate::ui::viewer::{
     compute_match_scroll_offset, render_viewer, ContextMenuState, PageRenderRequest, ViewerAction,
 };
@@ -47,6 +49,14 @@ pub struct PdfTab {
     pub drag_start: Option<TextLocation>,
     pub context_menu: Option<ContextMenuState>,
     pub pending_text_requests: HashSet<usize>,
+    pub active_tool: ActiveTool,
+    pub annotations: DocumentAnnotations,
+    pub file_key: String,
+    pub annotations_dirty: bool,
+    pub last_annotation_change: Option<Instant>,
+    pub undo_stack: UndoStack,
+    pub has_unsaved_changes: bool,
+    pub freehand_stroke: Option<(usize, Vec<[f32; 2]>)>,
 }
 
 /// Top-level tabs in the reader.
@@ -103,6 +113,8 @@ pub struct PdfViewApp {
     pub wayland_gesture_init_attempted: bool,
     pub pinch_active: bool,
     pub pinch_last_active: Option<Instant>,
+    pub last_scroll_unit: Option<egui::MouseWheelUnit>,
+    pub settings: Settings,
 }
 
 impl PdfViewApp {
@@ -150,6 +162,8 @@ impl PdfViewApp {
             wayland_gesture_init_attempted: false,
             pinch_active: false,
             pinch_last_active: None,
+            last_scroll_unit: None,
+            settings: Settings::load(),
         };
 
         if app.pending_open_path.is_none() {
@@ -217,6 +231,14 @@ impl PdfViewApp {
             drag_start: None,
             context_menu: None,
             pending_text_requests: HashSet::new(),
+            active_tool: ActiveTool::None,
+            annotations: DocumentAnnotations::default(),
+            file_key: String::new(),
+            annotations_dirty: false,
+            last_annotation_change: None,
+            undo_stack: UndoStack::default(),
+            has_unsaved_changes: false,
+            freehand_stroke: None,
         };
 
         self.tabs.push(Tab::Pdf(tab));
@@ -259,6 +281,12 @@ impl PdfViewApp {
                 tab.selection = None;
                 tab.drag_start = None;
                 tab.pending_text_requests.clear();
+                tab.active_tool = ActiveTool::None;
+                tab.annotations = DocumentAnnotations::default();
+                tab.file_key.clear();
+                tab.annotations_dirty = false;
+                tab.last_annotation_change = None;
+                tab.undo_stack = UndoStack::default();
                 let doc_id = tab.doc_id;
                 self.render_generation += 1;
                 self.pending_render_requests.clear();
@@ -298,6 +326,14 @@ impl PdfViewApp {
             drag_start: None,
             context_menu: None,
             pending_text_requests: HashSet::new(),
+            active_tool: ActiveTool::None,
+            annotations: DocumentAnnotations::default(),
+            file_key: String::new(),
+            annotations_dirty: false,
+            last_annotation_change: None,
+            undo_stack: UndoStack::default(),
+            has_unsaved_changes: false,
+            freehand_stroke: None,
         };
 
         // If switching from an existing tab, drop its textures from cache
@@ -320,6 +356,9 @@ impl PdfViewApp {
 
         let closed = self.tabs.remove(index);
         if let Tab::Pdf(tab) = closed {
+            if tab.annotations_dirty && !tab.file_key.is_empty() {
+                let _ = tab.annotations.save_for_key(&tab.file_key);
+            }
             let _ = self.tx_cmd.send(Command::Close { doc_id: tab.doc_id });
             self.cache.clear_doc(tab.doc_id);
             self.text_cache.clear_doc(tab.doc_id);
@@ -446,6 +485,25 @@ impl PdfViewApp {
     pub fn toggle_fullscreen(&mut self, ctx: &egui::Context) {
         self.is_fullscreen = !self.is_fullscreen;
         ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.is_fullscreen));
+    }
+
+    /// Saves annotations directly into the active PDF file.
+    pub fn save_active_pdf(&mut self) {
+        let active_idx = self.active_tab_idx;
+        if let Some(Tab::Pdf(tab)) = self.tabs.get_mut(active_idx) {
+            if !tab.is_loading && tab.page_count > 0 && !tab.path.as_os_str().is_empty() {
+                // Ensure local sidecar JSON is up to date
+                if !tab.file_key.is_empty() {
+                    let _ = tab.annotations.save_for_key(&tab.file_key);
+                    tab.annotations_dirty = false;
+                }
+                let _ = self.tx_cmd.send(Command::SaveDoc {
+                    doc_id: tab.doc_id,
+                    path: tab.path.clone(),
+                    highlights: tab.annotations.highlights.clone(),
+                });
+            }
+        }
     }
 
     /// Copies active text selection to system clipboard. If all selected pages are cached,
@@ -622,6 +680,30 @@ impl eframe::App for PdfViewApp {
             ctx.request_repaint();
         }
 
+        // Debounced annotation autosave (~500 ms)
+        for tab_item in &mut self.tabs {
+            if let Tab::Pdf(ref mut tab) = tab_item {
+                if tab.annotations_dirty {
+                    if let Some(last_change) = tab.last_annotation_change {
+                        if last_change.elapsed() >= Duration::from_millis(500) {
+                            if !tab.file_key.is_empty() {
+                                let _ = tab.annotations.save_for_key(&tab.file_key);
+                                tab.annotations_dirty = false;
+                                let _ = self.tx_cmd.send(Command::SyncAnnotations {
+                                    doc_id: tab.doc_id,
+                                    highlights: tab.annotations.highlights.clone(),
+                                });
+                            }
+                        } else {
+                            let remaining =
+                                Duration::from_millis(500).saturating_sub(last_change.elapsed());
+                            ctx.request_repaint_after(remaining);
+                        }
+                    }
+                }
+            }
+        }
+
         // Measure frame time for F3 debug stats
         let now = Instant::now();
         let elapsed = now.duration_since(self.last_frame_time).as_secs_f32() * 1000.0;
@@ -729,6 +811,11 @@ impl eframe::App for PdfViewApp {
             }
         }
 
+        // Save document shortcut: Ctrl+S / Cmd+S
+        if ctx.input(|i| (i.modifiers.ctrl || i.modifiers.command) && i.key_pressed(egui::Key::S)) {
+            self.save_active_pdf();
+        }
+
         // Copy selected text shortcut: Ctrl+C / Cmd+C or egui::Event::Copy
         let copy_requested = ctx.input(|i| {
             i.events.iter().any(|e| matches!(e, egui::Event::Copy))
@@ -743,6 +830,54 @@ impl eframe::App for PdfViewApp {
 
             if has_selection {
                 self.copy_selection(ctx);
+            }
+        }
+
+        // Undo / Redo shortcuts (when not editing text): Ctrl+Z / Ctrl+Y / Ctrl+Shift+Z
+        if !ctx.wants_keyboard_input() {
+            let ctrl = ctx.input(|i| i.modifiers.ctrl || i.modifiers.command);
+            let shift = ctx.input(|i| i.modifiers.shift);
+            let z_pressed = ctx.input(|i| i.key_pressed(egui::Key::Z));
+            let y_pressed = ctx.input(|i| i.key_pressed(egui::Key::Y));
+
+            if ctrl && !shift && z_pressed {
+                let undo_info = self.active_pdf_tab_mut().and_then(|tab| {
+                    if tab.undo_stack.undo(&mut tab.annotations) {
+                        tab.annotations_dirty = true;
+                        tab.has_unsaved_changes = true;
+                        tab.last_annotation_change = Some(Instant::now());
+                        Some((tab.doc_id, tab.annotations.highlights.clone()))
+                    } else {
+                        None
+                    }
+                });
+                if let Some((doc_id, highlights)) = undo_info {
+                    let _ = self
+                        .tx_cmd
+                        .send(Command::SyncAnnotations { doc_id, highlights });
+                    self.render_generation += 1;
+                    self.pending_render_requests.clear();
+                    ctx.request_repaint();
+                }
+            } else if (ctrl && y_pressed) || (ctrl && shift && z_pressed) {
+                let redo_info = self.active_pdf_tab_mut().and_then(|tab| {
+                    if tab.undo_stack.redo(&mut tab.annotations) {
+                        tab.annotations_dirty = true;
+                        tab.has_unsaved_changes = true;
+                        tab.last_annotation_change = Some(Instant::now());
+                        Some((tab.doc_id, tab.annotations.highlights.clone()))
+                    } else {
+                        None
+                    }
+                });
+                if let Some((doc_id, highlights)) = redo_info {
+                    let _ = self
+                        .tx_cmd
+                        .send(Command::SyncAnnotations { doc_id, highlights });
+                    self.render_generation += 1;
+                    self.pending_render_requests.clear();
+                    ctx.request_repaint();
+                }
             }
         }
 
@@ -826,6 +961,44 @@ impl eframe::App for PdfViewApp {
                 let avail_w = ctx.screen_rect().width();
                 self.fit_width(avail_w);
             }
+        } else {
+            // Natural touchpad scrolling speed adjustment (platform-safe, matches Edge/Chrome/system responsiveness)
+            let raw_scroll = ctx.input(|i| i.raw_scroll_delta);
+            let smooth_scroll = ctx.input(|i| i.smooth_scroll_delta);
+
+            if raw_scroll != egui::Vec2::ZERO || smooth_scroll != egui::Vec2::ZERO {
+                let wheel_unit = ctx.input(|i| {
+                    i.raw.events.iter().find_map(|e| match e {
+                        egui::Event::MouseWheel { unit, .. } => Some(*unit),
+                        _ => None,
+                    })
+                });
+
+                if let Some(unit) = wheel_unit {
+                    self.last_scroll_unit = Some(unit);
+                }
+
+                let is_touchpad = match self.last_scroll_unit {
+                    Some(egui::MouseWheelUnit::Point) => true,
+                    Some(egui::MouseWheelUnit::Line | egui::MouseWheelUnit::Page) => false,
+                    None => true,
+                };
+
+                let multiplier = if is_touchpad {
+                    self.settings.touchpad_scroll_speed.clamp(0.5, 10.0)
+                } else {
+                    self.settings.mouse_wheel_speed.clamp(0.5, 5.0)
+                };
+
+                if (multiplier - 1.0).abs() > 0.001 {
+                    ctx.input_mut(|i| {
+                        i.smooth_scroll_delta *= multiplier;
+                        i.raw_scroll_delta *= multiplier;
+                    });
+                }
+            } else {
+                self.last_scroll_unit = None;
+            }
         }
 
         // Keyboard navigation when no text input has focus and not pinching
@@ -874,6 +1047,7 @@ impl eframe::App for PdfViewApp {
                     doc_id,
                     page_count,
                     page_sizes,
+                    annotations,
                 } => {
                     for tab_item in &mut self.tabs {
                         if let Tab::Pdf(ref mut tab) = tab_item {
@@ -883,6 +1057,27 @@ impl eframe::App for PdfViewApp {
                                 tab.is_loading = false;
                                 tab.outline_loading = true;
                                 let _ = self.tx_cmd.send(Command::Outline { doc_id });
+                                tab.annotations.highlights = annotations;
+                                if !tab.path.as_os_str().is_empty() {
+                                    let file_size =
+                                        std::fs::metadata(&tab.path).map(|m| m.len()).unwrap_or(0);
+                                    let abs_path = std::fs::canonicalize(&tab.path)
+                                        .unwrap_or_else(|_| tab.path.clone());
+                                    tab.file_key =
+                                        DocumentAnnotations::compute_file_key(&abs_path, file_size);
+                                    let sidecar = DocumentAnnotations::load_for_key(&tab.file_key);
+                                    for sc_hl in sidecar.highlights {
+                                        if !tab
+                                            .annotations
+                                            .highlights
+                                            .iter()
+                                            .any(|h| h.id == sc_hl.id)
+                                        {
+                                            tab.annotations.highlights.push(sc_hl);
+                                        }
+                                    }
+                                    tab.annotations_dirty = false;
+                                }
                                 break;
                             }
                         }
@@ -946,6 +1141,7 @@ impl eframe::App for PdfViewApp {
                             res.bitmap_width_px,
                             res.height_px,
                             byte_size,
+                            res.generation,
                         );
                     }
                 }
@@ -1022,6 +1218,26 @@ impl eframe::App for PdfViewApp {
                         ctx.copy_text(text);
                     }
                 }
+                Event::Saved {
+                    doc_id,
+                    success,
+                    error,
+                } => {
+                    for tab_item in &mut self.tabs {
+                        if let Tab::Pdf(ref mut tab) = tab_item {
+                            if tab.doc_id == doc_id {
+                                if success {
+                                    tab.has_unsaved_changes = false;
+                                    self.render_generation += 1;
+                                    ctx.request_repaint();
+                                } else if let Some(err) = error {
+                                    eprintln!("Failed to save PDF {}: {}", tab.path.display(), err);
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -1079,12 +1295,14 @@ impl eframe::App for PdfViewApp {
                                 tooltip: pdf.path.to_str().unwrap_or(&pdf.title),
                                 is_active: idx == self.active_tab_idx,
                                 is_loading: pdf.is_loading,
+                                is_dirty: pdf.has_unsaved_changes,
                             },
                             Tab::Settings => TabItem {
                                 title: "Settings",
                                 tooltip: "Settings",
                                 is_active: idx == self.active_tab_idx,
                                 is_loading: false,
+                                is_dirty: false,
                             },
                         })
                         .collect();
@@ -1133,6 +1351,7 @@ impl eframe::App for PdfViewApp {
                     t.page_count > 0,
                     t.sidebar_open,
                     t.find_state.is_open,
+                    t.active_tool,
                 )
             });
 
@@ -1144,6 +1363,7 @@ impl eframe::App for PdfViewApp {
                 has_pages,
                 sidebar_open,
                 find_open,
+                active_tool,
             )) = active_tab_info
             {
                 if has_pages || is_loading {
@@ -1162,13 +1382,24 @@ impl eframe::App for PdfViewApp {
                             avail_h = ctx.screen_rect().height();
                             toolbar_action = self.toolbar.ui(
                                 ui,
-                                crate::ui::toolbar::ToolbarProps {
+                                ToolbarProps {
                                     current_page: current_p,
                                     total_pages,
                                     zoom,
                                     is_fullscreen,
                                     sidebar_open,
                                     find_open,
+                                    active_tool,
+                                    highlighter_color: self.settings.highlighter_color,
+                                    highlighter_thickness: self.settings.highlighter_thickness,
+                                    can_save: self
+                                        .active_pdf_tab()
+                                        .map(|t| !t.is_loading && t.page_count > 0)
+                                        .unwrap_or(false),
+                                    has_unsaved_changes: self
+                                        .active_pdf_tab()
+                                        .map(|t| t.has_unsaved_changes)
+                                        .unwrap_or(false),
                                 },
                             );
                         });
@@ -1221,6 +1452,36 @@ impl eframe::App for PdfViewApp {
                             }
                             ToolbarAction::ToggleFullscreen => {
                                 self.toggle_fullscreen(ctx);
+                            }
+                            ToolbarAction::ToggleHighlighter => {
+                                if let Some(tab) = self.active_pdf_tab_mut() {
+                                    tab.active_tool = if tab.active_tool == ActiveTool::Highlighter
+                                    {
+                                        ActiveTool::None
+                                    } else {
+                                        ActiveTool::Highlighter
+                                    };
+                                }
+                            }
+                            ToolbarAction::ToggleEraser => {
+                                if let Some(tab) = self.active_pdf_tab_mut() {
+                                    tab.active_tool = if tab.active_tool == ActiveTool::Eraser {
+                                        ActiveTool::None
+                                    } else {
+                                        ActiveTool::Eraser
+                                    };
+                                }
+                            }
+                            ToolbarAction::SetHighlighterColor(color) => {
+                                self.settings.highlighter_color = color;
+                                let _ = self.settings.save();
+                            }
+                            ToolbarAction::SetHighlighterThickness(thickness) => {
+                                self.settings.highlighter_thickness = thickness;
+                                let _ = self.settings.save();
+                            }
+                            ToolbarAction::Save => {
+                                self.save_active_pdf();
                             }
                         }
                     }
@@ -1472,6 +1733,11 @@ impl eframe::App for PdfViewApp {
                         drag_start: Option<TextLocation>,
                         context_menu: Option<ContextMenuState>,
                         pending_text_requests: HashSet<usize>,
+                        active_tool: ActiveTool,
+                        annotations: DocumentAnnotations,
+                        undo_stack: UndoStack,
+                        annotations_dirty: bool,
+                        freehand_stroke: Option<(usize, Vec<[f32; 2]>)>,
                     },
                     Error(String),
                     Settings,
@@ -1503,6 +1769,11 @@ impl eframe::App for PdfViewApp {
                                 drag_start: tab.drag_start,
                                 context_menu: tab.context_menu,
                                 pending_text_requests: tab.pending_text_requests.clone(),
+                                active_tool: tab.active_tool,
+                                annotations: std::mem::take(&mut tab.annotations),
+                                undo_stack: std::mem::take(&mut tab.undo_stack),
+                                annotations_dirty: tab.annotations_dirty,
+                                freehand_stroke: tab.freehand_stroke.clone(),
                             }
                         }
                     }
@@ -1555,6 +1826,11 @@ impl eframe::App for PdfViewApp {
                         mut drag_start,
                         mut context_menu,
                         pending_text_requests,
+                        active_tool,
+                        mut annotations,
+                        mut undo_stack,
+                        mut annotations_dirty,
+                        mut freehand_stroke,
                     } => {
                         let output = render_viewer(
                             ui,
@@ -1562,6 +1838,7 @@ impl eframe::App for PdfViewApp {
                             &page_sizes,
                             zoom,
                             rotation,
+                            self.render_generation,
                             &mut self.cache,
                             &mut self.text_cache,
                             &self.pending_render_requests,
@@ -1575,6 +1852,13 @@ impl eframe::App for PdfViewApp {
                             &mut selection,
                             &mut drag_start,
                             &mut context_menu,
+                            active_tool,
+                            self.settings.highlighter_color,
+                            self.settings.highlighter_thickness,
+                            &mut annotations,
+                            &mut undo_stack,
+                            &mut annotations_dirty,
+                            &mut freehand_stroke,
                         );
 
                         if let Some(action) = output.action {
@@ -1587,8 +1871,8 @@ impl eframe::App for PdfViewApp {
                                         self.tabs.get_mut(self.active_tab_idx)
                                     {
                                         tab.selection = Some(TextSelection::new(
-                                            TextLocation::new(p, 0),
-                                            TextLocation::new(p, usize::MAX),
+                                             TextLocation::new(p, 0),
+                                             TextLocation::new(p, usize::MAX),
                                         ));
                                         tab.drag_start = None;
                                         selection = tab.selection;
@@ -1601,8 +1885,8 @@ impl eframe::App for PdfViewApp {
                                     {
                                         let last_p = tab.page_count.saturating_sub(1);
                                         tab.selection = Some(TextSelection::new(
-                                            TextLocation::new(0, 0),
-                                            TextLocation::new(last_p, usize::MAX),
+                                             TextLocation::new(0, 0),
+                                             TextLocation::new(last_p, usize::MAX),
                                         ));
                                         tab.drag_start = None;
                                         selection = tab.selection;
@@ -1621,6 +1905,21 @@ impl eframe::App for PdfViewApp {
                             tab.selection = selection;
                             tab.drag_start = drag_start;
                             tab.context_menu = context_menu;
+                            tab.annotations = annotations;
+                            tab.undo_stack = undo_stack;
+                            tab.freehand_stroke = freehand_stroke;
+                            if output.annotations_changed {
+                                tab.has_unsaved_changes = true;
+                                tab.annotations_dirty = true;
+                                tab.last_annotation_change = Some(Instant::now());
+                                let _ = self.tx_cmd.send(Command::SyncAnnotations {
+                                    doc_id,
+                                    highlights: tab.annotations.highlights.clone(),
+                                });
+                                self.render_generation += 1;
+                                self.pending_render_requests.clear();
+                                ctx.request_repaint();
+                            }
                             for req_page in output.text_requests {
                                 if tab.pending_text_requests.insert(req_page) {
                                     let _ = self.tx_cmd.send(Command::PageText {
@@ -1672,5 +1971,41 @@ impl eframe::App for PdfViewApp {
                 }
             }
         });
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        for tab_item in &mut self.tabs {
+            if let Tab::Pdf(ref mut tab) = tab_item {
+                if tab.annotations_dirty && !tab.file_key.is_empty() {
+                    let _ = tab.annotations.save_for_key(&tab.file_key);
+                    tab.annotations_dirty = false;
+                }
+            }
+        }
+        let _ = self.settings.save();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_touchpad_scroll_multiplier_logic() {
+        let mut settings = Settings::default();
+        assert_eq!(settings.touchpad_scroll_speed, 2.5);
+        assert_eq!(settings.mouse_wheel_speed, 1.0);
+
+        // When touchpad (Point) scroll occurs, multiplier should be settings.touchpad_scroll_speed
+        let delta = egui::vec2(0.0, 10.0);
+        let speed = settings.touchpad_scroll_speed.clamp(0.5, 10.0);
+        let scaled = delta * speed;
+        assert_eq!(scaled.y, 25.0);
+
+        // Custom setting
+        settings.touchpad_scroll_speed = 3.5;
+        let speed2 = settings.touchpad_scroll_speed.clamp(0.5, 10.0);
+        let scaled2 = delta * speed2;
+        assert_eq!(scaled2.y, 35.0);
     }
 }

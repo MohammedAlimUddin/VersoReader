@@ -21,6 +21,7 @@ pub struct CachedTexture {
     pub byte_size: usize,
     pub width_px: u32,
     pub height_px: u32,
+    pub generation: u64,
 }
 
 /// LRU texture cache with a hard byte cap (default: 150 MB).
@@ -45,8 +46,14 @@ impl TextureCache {
     }
 
     /// Retrieves a cached texture reference if present, updating LRU recency.
+    #[allow(dead_code)]
     pub fn get(&mut self, key: &TextureKey) -> Option<&TextureHandle> {
         self.cache.get(key).map(|c| &c.texture)
+    }
+
+    /// Retrieves a cached texture reference and its generation if present, updating LRU recency.
+    pub fn get_entry(&mut self, key: &TextureKey) -> Option<(&TextureHandle, u64)> {
+        self.cache.get(key).map(|c| (&c.texture, c.generation))
     }
 
     /// Finds the best available cached texture for a given page and rotation,
@@ -83,6 +90,7 @@ impl TextureCache {
         width_px: u32,
         height_px: u32,
         byte_size: usize,
+        generation: u64,
     ) {
         // If an existing entry is replaced, subtract its size
         if let Some(old) = self.cache.pop(&key) {
@@ -97,6 +105,7 @@ impl TextureCache {
                 byte_size,
                 width_px,
                 height_px,
+                generation,
             },
         );
 
@@ -319,14 +328,14 @@ mod tests {
         assert!(cache.get_best_for_page(1, 5, 0).is_none());
 
         // Insert small texture
-        cache.insert(key_small, tex_small.clone(), 300, 400, 300 * 400 * 4);
+        cache.insert(key_small, tex_small.clone(), 300, 400, 300 * 400 * 4, 1);
         assert_eq!(
             cache.get_best_for_page(1, 5, 0).map(|t| t.id()),
             Some(tex_small.id())
         );
 
         // Insert large texture
-        cache.insert(key_large, tex_large.clone(), 1200, 1600, 1200 * 1600 * 4);
+        cache.insert(key_large, tex_large.clone(), 1200, 1600, 1200 * 1600 * 4, 1);
         // Best should now prefer the higher resolution one (1200 > 300)
         assert_eq!(
             cache.get_best_for_page(1, 5, 0).map(|t| t.id()),
@@ -360,8 +369,8 @@ mod tests {
             rotation: 0,
         };
 
-        cache.insert(key1.clone(), tex1, 200, 200, 10_000);
-        cache.insert(key2.clone(), tex2, 200, 200, 15_000);
+        cache.insert(key1.clone(), tex1, 200, 200, 10_000, 1);
+        cache.insert(key2.clone(), tex2, 200, 200, 15_000, 1);
 
         assert_eq!(cache.current_bytes(), 25_000);
         assert!(cache.contains(&key1));

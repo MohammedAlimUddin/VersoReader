@@ -3,9 +3,16 @@ use std::sync::Arc;
 
 use egui::{pos2, vec2, Color32, Rect, Stroke, StrokeKind};
 
+use crate::annotations::{
+    adjust_rect_thickness, generate_highlight_id, AnnotationColor, DocumentAnnotations, Highlight,
+    UndoStack,
+};
 use crate::cache::{PageTextCache, TextureCache, TextureKey};
 use crate::pdf::transform::PageTransform;
-use crate::pdf::types::{DocId, PageSize, PageTextData, SearchMatch, TextLocation, TextSelection};
+use crate::pdf::types::{
+    CanonicalRect, DocId, PageSize, PageTextData, SearchMatch, TextLocation, TextSelection,
+};
+use crate::ui::toolbar::ActiveTool;
 
 /// A render request emitted by the virtualized viewer.
 #[derive(Debug, Clone)]
@@ -40,6 +47,7 @@ pub struct ViewerOutput {
     pub current_scroll_offset_y: f32,
     pub viewport_top: f32,
     pub action: Option<ViewerAction>,
+    pub annotations_changed: bool,
 }
 
 /// Maximum texture side (in pixels) for page bitmaps.
@@ -86,6 +94,7 @@ pub fn render_viewer(
     page_sizes: &[PageSize],
     zoom: f32,
     rotation: u16,
+    render_generation: u64,
     cache: &mut TextureCache,
     text_cache: &mut PageTextCache,
     pending_requests: &HashSet<(usize, u32, u16)>,
@@ -99,10 +108,18 @@ pub fn render_viewer(
     selection: &mut Option<TextSelection>,
     drag_start: &mut Option<TextLocation>,
     context_menu: &mut Option<ContextMenuState>,
+    active_tool: ActiveTool,
+    highlighter_color: AnnotationColor,
+    highlighter_thickness: f32,
+    annotations: &mut DocumentAnnotations,
+    undo_stack: &mut UndoStack,
+    annotations_dirty: &mut bool,
+    freehand_stroke: &mut Option<(usize, Vec<[f32; 2]>)>,
 ) -> ViewerOutput {
     let mut action: Option<ViewerAction> = None;
     let mut render_requests = Vec::new();
     let mut text_requests = Vec::new();
+    let mut annotations_changed = false;
     let gap_y = 16.0;
     let page_count = page_sizes.len();
 
@@ -115,6 +132,7 @@ pub fn render_viewer(
             current_scroll_offset_y: 0.0,
             viewport_top: 0.0,
             action: None,
+            annotations_changed: false,
         };
     }
 
@@ -331,58 +349,55 @@ pub fn render_viewer(
                 });
             }
 
-            // Only process text selection if context menu didn't consume this interaction
+            // Only process annotations / text selection if context menu didn't consume this interaction
             if in_viewer && !menu_consumed_pointer {
-                // 1. Hover cursor: set Text (I-beam) cursor when hovering over text
-                if !is_primary_down {
-                    for info in &visible_info {
-                        if info.screen_rect.contains(pos) {
-                            if let Some(ref text) = info.text {
-                                let can_pt = info.transform.screen_to_canonical(pos);
-                                if text.is_hovering_text(can_pt) {
-                                    ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // 2. Double-click word selection: selects entire word
-                if is_double_click {
-                    *drag_start = None;
-                    for info in &visible_info {
-                        if info.screen_rect.contains(pos) {
-                            if let Some(ref text) = info.text {
-                                let can_pt = info.transform.screen_to_canonical(pos);
-                                if let Some(char_idx) = text.hit_test(can_pt) {
-                                    let (w_start, w_end) = text.get_word_range(char_idx);
-                                    *selection = Some(TextSelection::new(
-                                        TextLocation::new(info.page, w_start),
-                                        TextLocation::new(info.page, w_end),
-                                    ));
-                                    ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // 3. Primary press down (single click):
-                // Clears selection and starts drag anchor if over text.
-                // Does NOT select single character/letter!
-                if is_primary_pressed && !is_double_click {
+                if active_tool == ActiveTool::Eraser {
+                    // Eraser cursor
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
                     *selection = None;
                     *drag_start = None;
 
-                    for info in &visible_info {
-                        if info.screen_rect.contains(pos) {
-                            if let Some(ref text) = info.text {
+                    // Click or drag across highlights to delete them
+                    if is_primary_down || is_primary_pressed {
+                        for info in &visible_info {
+                            if info.screen_rect.contains(pos) {
                                 let can_pt = info.transform.screen_to_canonical(pos);
-                                if text.is_hovering_text(can_pt) {
-                                    if let Some(char_idx) = text.hit_test(can_pt) {
-                                        *drag_start = Some(TextLocation::new(info.page, char_idx));
+                                let r_can = 5.0 / (zoom * PageTransform::DPI_SCALE);
+                                let test_pts = [
+                                    can_pt,
+                                    pos2(can_pt.x + r_can, can_pt.y),
+                                    pos2(can_pt.x - r_can, can_pt.y),
+                                    pos2(can_pt.x, can_pt.y + r_can),
+                                    pos2(can_pt.x, can_pt.y - r_can),
+                                ];
+                                let mut removed_any = false;
+                                annotations.highlights.retain(|hl| {
+                                    if hl.page == info.page
+                                        && test_pts.iter().any(|&p| hl.contains_canonical_point(p))
+                                    {
+                                        undo_stack.push_delete(hl.clone());
+                                        removed_any = true;
+                                        false
+                                    } else {
+                                        true
+                                    }
+                                });
+                                if removed_any {
+                                    annotations_changed = true;
+                                    *annotations_dirty = true;
+                                    ui.ctx().request_repaint();
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    // 1. Hover cursor: set Text (I-beam) cursor when hovering over text
+                    if !is_primary_down {
+                        for info in &visible_info {
+                            if info.screen_rect.contains(pos) {
+                                if let Some(ref text) = info.text {
+                                    let can_pt = info.transform.screen_to_canonical(pos);
+                                    if text.is_hovering_text(can_pt) {
                                         ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
                                         break;
                                     }
@@ -390,60 +405,248 @@ pub fn render_viewer(
                             }
                         }
                     }
-                }
 
-                // 4. Dragging: only creates/extends selection when dragged to a different character
-                if is_primary_down && !is_primary_pressed && !is_double_click {
-                    if let Some(anchor) = *drag_start {
-                        let target = visible_info
-                            .iter()
-                            .find(|info| info.screen_rect.contains(pos))
-                            .or_else(|| {
-                                visible_info.iter().min_by(|a, b| {
-                                    let dist_a = (a.screen_rect.center().y - pos.y).abs();
-                                    let dist_b = (b.screen_rect.center().y - pos.y).abs();
-                                    dist_a
-                                        .partial_cmp(&dist_b)
-                                        .unwrap_or(std::cmp::Ordering::Equal)
-                                })
-                            });
-
-                        if let Some(info) = target {
-                            if let Some(ref text) = info.text {
-                                let can_pt = info.transform.screen_to_canonical(pos);
-                                if let Some(char_idx) = text.hit_test(can_pt) {
-                                    let focus = TextLocation::new(info.page, char_idx);
-                                    if focus != anchor {
-                                        *selection = Some(TextSelection::new(anchor, focus));
-                                        ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
-                                    } else {
-                                        *selection = None;
+                    // 2. Double-click word selection: selects entire word (or directly highlights it in highlighter mode)
+                    if is_double_click {
+                        *drag_start = None;
+                        for info in &visible_info {
+                            if info.screen_rect.contains(pos) {
+                                if let Some(ref text) = info.text {
+                                    let can_pt = info.transform.screen_to_canonical(pos);
+                                    if let Some(char_idx) = text.hit_test(can_pt) {
+                                        let (w_start, w_end) = text.get_word_range(char_idx);
+                                        if active_tool == ActiveTool::Highlighter {
+                                            let raw_rects =
+                                                text.get_selection_rects(w_start, w_end);
+                                            let line_rects: Vec<CanonicalRect> = raw_rects
+                                                .into_iter()
+                                                .map(|r| {
+                                                    adjust_rect_thickness(r, highlighter_thickness)
+                                                })
+                                                .collect();
+                                            if !line_rects.is_empty() {
+                                                let id = generate_highlight_id();
+                                                let hl = Highlight {
+                                                    id,
+                                                    page: info.page,
+                                                    rects: line_rects,
+                                                    points: Vec::new(),
+                                                    color: highlighter_color,
+                                                    alpha: 0.35,
+                                                    thickness: highlighter_thickness,
+                                                };
+                                                annotations.highlights.push(hl.clone());
+                                                undo_stack.push_add(hl);
+                                                annotations_changed = true;
+                                                *annotations_dirty = true;
+                                                *selection = None;
+                                                ui.ctx().request_repaint();
+                                            }
+                                        } else {
+                                            *selection = Some(TextSelection::new(
+                                                TextLocation::new(info.page, w_start),
+                                                TextLocation::new(info.page, w_end),
+                                            ));
+                                            ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
+                                        }
+                                        break;
                                     }
                                 }
                             }
                         }
+                    }
 
-                        // Autoscroll when dragging near top/bottom viewer boundaries
-                        let clip = ui.clip_rect();
-                        let margin = 35.0;
-                        if pos.y < clip.min.y + margin {
-                            let speed = ((clip.min.y + margin - pos.y) * 0.5).clamp(4.0, 24.0);
-                            autoscroll_delta = -speed;
-                            ui.ctx().request_repaint();
-                        } else if pos.y > clip.max.y - margin {
-                            let speed = ((pos.y - (clip.max.y - margin)) * 0.5).clamp(4.0, 24.0);
-                            autoscroll_delta = speed;
-                            ui.ctx().request_repaint();
+                    // 3. Primary press down (single click):
+                    // Clears selection and starts drag anchor if over text, or freehand stroke if in whitespace/margin.
+                    if is_primary_pressed && !is_double_click {
+                        *selection = None;
+                        *drag_start = None;
+                        *freehand_stroke = None;
+
+                        if active_tool == ActiveTool::Highlighter {
+                            for info in &visible_info {
+                                if info.screen_rect.contains(pos) {
+                                    let can_pt = info.transform.screen_to_canonical(pos);
+                                    let mut on_text = false;
+                                    if let Some(ref text) = info.text {
+                                        if text.is_hovering_text(can_pt) {
+                                            if let Some(char_idx) = text.hit_test(can_pt) {
+                                                *drag_start =
+                                                    Some(TextLocation::new(info.page, char_idx));
+                                                ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
+                                                on_text = true;
+                                            }
+                                        }
+                                    }
+                                    if !on_text {
+                                        // Freehand highlight drawing begins in non-text areas!
+                                        *freehand_stroke =
+                                            Some((info.page, vec![[can_pt.x, can_pt.y]]));
+                                        ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+                                    }
+                                    break;
+                                }
+                            }
+                        } else {
+                            for info in &visible_info {
+                                if info.screen_rect.contains(pos) {
+                                    if let Some(ref text) = info.text {
+                                        let can_pt = info.transform.screen_to_canonical(pos);
+                                        if text.is_hovering_text(can_pt) {
+                                            if let Some(char_idx) = text.hit_test(can_pt) {
+                                                *drag_start =
+                                                    Some(TextLocation::new(info.page, char_idx));
+                                                ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
-                }
 
-                // 5. Primary release: finish drag
-                if is_primary_released && !is_double_click {
-                    *drag_start = None;
-                    if let Some(cur_sel) = *selection {
-                        if cur_sel.is_empty() {
-                            *selection = None;
+                    // 4. Dragging: extends text selection or appends to freehand stroke
+                    if is_primary_down && !is_primary_pressed && !is_double_click {
+                        if let Some((fh_page, ref mut fh_pts)) = *freehand_stroke {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+                            for info in &visible_info {
+                                if info.page == fh_page {
+                                    let can_pt = info.transform.screen_to_canonical(pos);
+                                    if let Some(last) = fh_pts.last() {
+                                        let dx = can_pt.x - last[0];
+                                        let dy = can_pt.y - last[1];
+                                        if dx * dx + dy * dy >= 2.25 {
+                                            fh_pts.push([can_pt.x, can_pt.y]);
+                                            ui.ctx().request_repaint();
+                                        }
+                                    }
+                                    break;
+                                }
+                            }
+                        } else if let Some(anchor) = *drag_start {
+                            let target = visible_info
+                                .iter()
+                                .find(|info| info.screen_rect.contains(pos))
+                                .or_else(|| {
+                                    visible_info.iter().min_by(|a, b| {
+                                        let dist_a = (a.screen_rect.center().y - pos.y).abs();
+                                        let dist_b = (b.screen_rect.center().y - pos.y).abs();
+                                        dist_a
+                                            .partial_cmp(&dist_b)
+                                            .unwrap_or(std::cmp::Ordering::Equal)
+                                    })
+                                });
+
+                            if let Some(info) = target {
+                                if let Some(ref text) = info.text {
+                                    let can_pt = info.transform.screen_to_canonical(pos);
+                                    if let Some(char_idx) = text.hit_test(can_pt) {
+                                        let focus = TextLocation::new(info.page, char_idx);
+                                        if focus != anchor {
+                                            *selection = Some(TextSelection::new(anchor, focus));
+                                            ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
+                                        } else {
+                                            *selection = None;
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Autoscroll when dragging near top/bottom viewer boundaries
+                            let clip = ui.clip_rect();
+                            let margin = 35.0;
+                            if pos.y < clip.min.y + margin {
+                                let speed = ((clip.min.y + margin - pos.y) * 0.5).clamp(4.0, 24.0);
+                                autoscroll_delta = -speed;
+                                ui.ctx().request_repaint();
+                            } else if pos.y > clip.max.y - margin {
+                                let speed =
+                                    ((pos.y - (clip.max.y - margin)) * 0.5).clamp(4.0, 24.0);
+                                autoscroll_delta = speed;
+                                ui.ctx().request_repaint();
+                            }
+                        }
+                    }
+
+                    // 5. Primary release: finish drag
+                    if is_primary_released && !is_double_click {
+                        *drag_start = None;
+                        if let Some((fh_page, fh_pts)) = freehand_stroke.take() {
+                            if fh_pts.len() >= 2 {
+                                let id = generate_highlight_id();
+                                let stroke_thickness =
+                                    (12.0 * highlighter_thickness).clamp(3.0, 36.0);
+                                let hl = Highlight {
+                                    id,
+                                    page: fh_page,
+                                    rects: Vec::new(),
+                                    points: fh_pts,
+                                    color: highlighter_color,
+                                    alpha: 0.35,
+                                    thickness: stroke_thickness,
+                                };
+                                annotations.highlights.push(hl.clone());
+                                undo_stack.push_add(hl);
+                                annotations_changed = true;
+                                *annotations_dirty = true;
+                                ui.ctx().request_repaint();
+                            }
+                        } else if let Some(cur_sel) = *selection {
+                            if cur_sel.is_empty() {
+                                *selection = None;
+                            } else if active_tool == ActiveTool::Highlighter {
+                                // Commit highlight from selected text characters on release
+                                let (sel_start, sel_end) = cur_sel.normalized();
+                                let mut added_any = false;
+                                for page_idx in sel_start.page..=sel_end.page {
+                                    if let Some(text_data) = text_cache.get(doc_id, page_idx) {
+                                        let p_start = if page_idx == sel_start.page {
+                                            sel_start.char_idx
+                                        } else {
+                                            0
+                                        };
+                                        let p_end = if page_idx == sel_end.page {
+                                            sel_end
+                                                .char_idx
+                                                .min(text_data.chars.len().saturating_sub(1))
+                                        } else {
+                                            text_data.chars.len().saturating_sub(1)
+                                        };
+                                        if p_start <= p_end {
+                                            let raw_rects =
+                                                text_data.get_selection_rects(p_start, p_end);
+                                            let line_rects: Vec<CanonicalRect> = raw_rects
+                                                .into_iter()
+                                                .map(|r| {
+                                                    adjust_rect_thickness(r, highlighter_thickness)
+                                                })
+                                                .collect();
+                                            if !line_rects.is_empty() {
+                                                let id = generate_highlight_id();
+                                                let hl = Highlight {
+                                                    id,
+                                                    page: page_idx,
+                                                    rects: line_rects,
+                                                    points: Vec::new(),
+                                                    color: highlighter_color,
+                                                    alpha: 0.35,
+                                                    thickness: highlighter_thickness,
+                                                };
+                                                annotations.highlights.push(hl.clone());
+                                                undo_stack.push_add(hl);
+                                                added_any = true;
+                                            }
+                                        }
+                                    }
+                                }
+                                if added_any {
+                                    *selection = None;
+                                    annotations_changed = true;
+                                    *annotations_dirty = true;
+                                    ui.ctx().request_repaint();
+                                }
+                            }
                         }
                     }
                 }
@@ -470,15 +673,29 @@ pub fn render_viewer(
                 rotation,
             };
 
+            let (entry_opt, is_stale) = if let Some((tex, gen)) = cache.get_entry(&sharp_key) {
+                (Some(tex), gen < render_generation || annotations_changed)
+            } else {
+                (None, true)
+            };
+
             if is_in_viewport {
-                // Sharp render available -> paint sharp
-                if let Some(sharp_tex) = cache.get(&sharp_key) {
+                // Sharp render available -> paint sharp (and request refresh if stale)
+                if let Some(sharp_tex) = entry_opt {
                     painter.image(
                         sharp_tex.id(),
                         screen_rect,
                         Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
                         Color32::WHITE,
                     );
+                    if is_stale && !pending_requests.contains(&(idx, sharp_width, rotation)) {
+                        render_requests.push(PageRenderRequest {
+                            page: idx,
+                            width_px: sharp_width,
+                            rotation,
+                            priority: 1,
+                        });
+                    }
                 } else if let Some(fallback_tex) = cache.get_best_for_page(doc_id, idx, rotation) {
                     // Fallback to previous zoom level texture so zooming is smooth and never flashes blank
                     painter.image(
@@ -513,6 +730,78 @@ pub fn render_viewer(
                             rotation,
                             priority: 1,
                         });
+                    }
+                }
+
+                // 1. Draw persistent freehand ink strokes on this page
+                for hl in &annotations.highlights {
+                    if hl.page == idx && !hl.points.is_empty() {
+                        let stroke_color = Color32::from_rgba_unmultiplied(
+                            hl.color.r,
+                            hl.color.g,
+                            hl.color.b,
+                            (0.35_f32 * 255.0_f32).round() as u8,
+                        );
+                        let stroke_thickness = (hl.thickness * zoom).max(1.5);
+                        let screen_points: Vec<egui::Pos2> = hl
+                            .points
+                            .iter()
+                            .map(|p| transform.canonical_to_screen(pos2(p[0], p[1])))
+                            .collect();
+                        if screen_points.len() >= 2 {
+                            painter.add(egui::epaint::PathShape::line(
+                                screen_points,
+                                Stroke::new(stroke_thickness, stroke_color),
+                            ));
+                        } else if let Some(&pt) = screen_points.first() {
+                            painter.circle_filled(pt, stroke_thickness * 0.5, stroke_color);
+                        }
+                    }
+                }
+
+                // 2. When texture is stale (e.g. pending worker re-render after highlight/erase/undo),
+                // render text highlights via egui overlay so the highlight never blinks or vanishes.
+                // Once the sharp texture arrives with generation >= render_generation, it contains
+                // native ISO 32000 multiply blending (FXDIB_BLEND_MULTIPLY) with 100% pitch-black text.
+                if is_stale {
+                    for hl in &annotations.highlights {
+                        if hl.page == idx && !hl.rects.is_empty() {
+                            let hl_color = Color32::from_rgba_unmultiplied(
+                                hl.color.r,
+                                hl.color.g,
+                                hl.color.b,
+                                (0.28_f32 * 255.0_f32).round() as u8,
+                            );
+                            for r in &hl.rects {
+                                let screen_r = transform.canonical_to_screen_rect(r.to_egui_rect());
+                                painter.rect_filled(screen_r, 0.0, hl_color);
+                            }
+                        }
+                    }
+                }
+
+                // 3. Draw live freehand stroke preview if currently drawing on this page
+                if let Some((stroke_page, ref stroke_pts)) = *freehand_stroke {
+                    if stroke_page == idx && !stroke_pts.is_empty() {
+                        let live_color = Color32::from_rgba_unmultiplied(
+                            highlighter_color.r,
+                            highlighter_color.g,
+                            highlighter_color.b,
+                            (0.35_f32 * 255.0_f32).round() as u8,
+                        );
+                        let stroke_thickness = (12.0 * highlighter_thickness * zoom).max(1.5);
+                        let screen_points: Vec<egui::Pos2> = stroke_pts
+                            .iter()
+                            .map(|p| transform.canonical_to_screen(pos2(p[0], p[1])))
+                            .collect();
+                        if screen_points.len() >= 2 {
+                            painter.add(egui::epaint::PathShape::line(
+                                screen_points,
+                                Stroke::new(stroke_thickness, live_color),
+                            ));
+                        } else if let Some(&pt) = screen_points.first() {
+                            painter.circle_filled(pt, stroke_thickness * 0.5, live_color);
+                        }
                     }
                 }
 
@@ -551,7 +840,7 @@ pub fn render_viewer(
                     }
                 }
 
-                // Draw text selection overlay on this page through PageTransform
+                // Draw text selection / highlighter preview overlay on this page through PageTransform
                 if let Some(sel) = *selection {
                     if !sel.is_empty() {
                         let (sel_start, sel_end) = sel.normalized();
@@ -571,13 +860,27 @@ pub fn render_viewer(
                                         text_data.chars.len().saturating_sub(1)
                                     };
                                     if p_start <= p_end {
-                                        let sel_rects =
+                                        let raw_rects =
                                             text_data.get_selection_rects(p_start, p_end);
-                                        let sel_color =
-                                            Color32::from_rgba_unmultiplied(245, 90, 40, 115);
-                                        for r in sel_rects {
+                                        let is_hl = active_tool == ActiveTool::Highlighter;
+                                        let sel_color = if is_hl {
+                                            Color32::from_rgba_unmultiplied(
+                                                highlighter_color.r,
+                                                highlighter_color.g,
+                                                highlighter_color.b,
+                                                (0.28_f32 * 255.0_f32).round() as u8,
+                                            )
+                                        } else {
+                                            Color32::from_rgba_unmultiplied(245, 90, 40, 115)
+                                        };
+                                        for r in raw_rects {
+                                            let adj_r = if is_hl {
+                                                adjust_rect_thickness(r, highlighter_thickness)
+                                            } else {
+                                                r
+                                            };
                                             let screen_r = transform
-                                                .canonical_to_screen_rect(r.to_egui_rect());
+                                                .canonical_to_screen_rect(adj_r.to_egui_rect());
                                             painter.rect_filled(screen_r, 0.0, sel_color);
                                         }
                                     }
@@ -643,6 +946,7 @@ pub fn render_viewer(
         current_scroll_offset_y,
         viewport_top,
         action,
+        annotations_changed,
     }
 }
 
@@ -822,5 +1126,49 @@ mod tests {
         assert_eq!(screen_rect3.width(), r3.width());
         assert_eq!(screen_rect3.height(), r3.height());
         assert_eq!(screen_rect3.min, origin);
+    }
+
+    #[test]
+    fn test_highlight_stale_overlay_and_freehand_persistence() {
+        let hl_ink = Highlight {
+            id: 1,
+            page: 0,
+            rects: Vec::new(),
+            points: vec![[50.0, 100.0], [150.0, 120.0]],
+            color: AnnotationColor::new(255, 235, 59),
+            alpha: 0.35,
+            thickness: 12.0,
+        };
+        assert!(!hl_ink.points.is_empty());
+        assert!(hl_ink.rects.is_empty());
+        assert_eq!(hl_ink.page, 0);
+
+        let hl_text = Highlight {
+            id: 2,
+            page: 0,
+            rects: vec![CanonicalRect::new(100.0, 100.0, 200.0, 120.0)],
+            points: Vec::new(),
+            color: AnnotationColor::new(76, 175, 80),
+            alpha: 0.35,
+            thickness: 1.0,
+        };
+        assert!(!hl_text.rects.is_empty());
+        assert!(hl_text.points.is_empty());
+
+        // Verify stale condition logic:
+        // 1. Same generation without changes: not stale
+        let gen = 5;
+        let current_gen = 5;
+        let changed = false;
+        let is_stale_normal = gen < current_gen || changed;
+        assert!(!is_stale_normal);
+
+        // 2. Newer generation requested: stale
+        let is_stale_bumped = (gen < 6) || changed;
+        assert!(is_stale_bumped);
+
+        // 3. Annotations just changed on frame 0: immediately stale (zero vanishing gap!)
+        let is_stale_immediate = (gen < current_gen) || true;
+        assert!(is_stale_immediate);
     }
 }

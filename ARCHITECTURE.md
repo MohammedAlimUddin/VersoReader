@@ -40,16 +40,19 @@ Pdfium is strictly single-threaded. Per design rule:
   * `Outline { doc_id }`: Fetches bookmark/outline hierarchy.
   * `PageText { doc_id, page }`: Extracts character bounding boxes in canonical coordinates.
   * `Search { doc_id, query_id, query }`: Chunked per-page text search.
+  * `SyncAnnotations { doc_id, highlights }`: Synchronizes in-memory `/Highlight` and `/Ink` annotations onto worker's document handle.
+  * `SaveDoc { doc_id, path, highlights }`: Embeds ISO 32000 `/Highlight` & `/Ink` annotations and atomically saves PDF via temporary file + rename.
   * `Export { ... }`: Exports annotated PDF.
   * `Shutdown`: Exits worker loop cleanly.
 
 * **Worker → UI (`Event`)**:
   * `PdfiumReady` / `PdfiumError(String)`
-  * `Opened { doc_id, page_count, page_sizes }`
+  * `Opened { doc_id, page_count, page_sizes, annotations }`
   * `Rendered { doc_id, page, width_px, rotation, generation, image }`
   * `OutlineResult { doc_id, items }`
   * `PageTextResult { doc_id, page, chars, lines }`
   * `SearchResults { doc_id, query_id, page, matches, done }`
+  * `Saved { doc_id, success, error }`
   * `ExportResult { ... }`
 
 * **Repaint Notification**: After sending any event, the worker invokes `ctx.request_repaint()` to wake the UI thread.
@@ -85,10 +88,10 @@ If all fail, the worker sends `Event::PdfiumError` with the exact searched paths
 
 ## 5. Rendering Pipeline & Texture Cache
 * **Virtualization**: Layout is calculated upfront using page sizes returned at open. Only pages intersecting the viewport plus 1 page of prefetch above/below are rendered and drawn.
-* **Sharp Rendering & GPU Fallbacks**: Visible pages are requested at exact device pixel resolution (`sharp_width`) with top priority (`priority: 1`), rendering in ~30ms directly from PDFium without initial low-res blurriness. During active zooming, existing cached textures serve as GPU-filtered bilinear fallbacks until the new sharp texture finishes rendering, preventing white flashes or blur lockups.
+* **Sharp Rendering & GPU Fallbacks**: Visible pages are requested at exact device pixel resolution (`sharp_width`) with top priority (`priority: 1`), rendering in ~30ms directly from PDFium without initial low-res blurriness. During active zooming or annotation updates, existing cached textures serve as GPU-filtered bilinear fallbacks until the new sharp texture finishes rendering, preventing white flashes or blur lockups.
 * **Worker Command Scheduling**: The background worker thread prunes stale generation requests upon receiving new zoom/scroll commands and prioritizes visible page renders before prefetch tasks.
-* **Texture Limits**: Maximum texture side is capped at 4096 px.
-* **LRU Cache (`cache.rs`)**: Keyed by `(doc_id, page, width_px, rotation)` with a hard **150 MB** memory cap, actively freeing textures upon eviction or tab closure. Switching tabs drops the inactive tab's textures from the cache while retaining the worker's document handle; closing a tab sends `Command::Close` and immediately purges all associated textures.
+* **Texture Limits**: Maximum texture side is capped at 6144 px.
+* **LRU Cache (`cache.rs`)**: Keyed by `(doc_id, page, width_px, rotation)` with a hard **150 MB** memory cap and generation tracking (`CachedTexture.generation`). When an annotation is added/erased or zoom changes, generation is bumped and the previous texture is painted as a seamless fallback while PDFium generates the new texture with native `FXDIB_BLEND_MULTIPLY` blending. Switching tabs drops the inactive tab's textures from the cache while retaining the worker's document handle; closing a tab sends `Command::Close` and immediately purges all associated textures.
 
 ---
 
@@ -124,4 +127,20 @@ scripts/
 ARCHITECTURE.md    System architecture documentation
 PROGRESS.md        Milestone checklist and verification status
 ```
+
+---
+
+## 7. Annotation Storage & Lifecycle
+* **Storage Invariant**: Annotations (`Highlight`) are stored strictly in canonical coordinates (points, unrotated, origin top-left).
+* **Storage Path**: Persisted as JSON in `~/.local/share/pdfview/annotations/<blake3(abs path + file size)>.json`.
+* **Zero PDF Mutation**: The user's original PDF file is never modified or overwritten under any circumstances.
+* **Autosave & Persistence**:
+  - Debounced autosave (~500 ms) scheduled after user interaction.
+  - Immediate synchronous save upon tab close (`close_tab`) and application exit (`on_exit`).
+  - Automatic load upon document open in `Event::Opened`.
+* **Undo / Redo**: Bounded per-tab undo/redo stack (`UndoStack`, max 50 actions) for highlight creation and deletion, bound to `Ctrl+Z` and `Ctrl+Y` / `Ctrl+Shift+Z`.
+* **Hit-Testing & Interaction Tools**:
+  - **Highlighter**: Dragging over text creates line-height-adjusted highlight rectangles (`adjust_rect_thickness`), centering the band vertically on lines. Double-clicking words in highlighter mode directly highlights the target word. Drawn as translucent overlays (`alpha ~ 0.35`) directly above page bitmaps through `PageTransform`.
+  - **Eraser**: Sets cursor to `Crosshair`. Clicking or dragging across highlights hit-tests points in canonical space and removes all intersected highlights, pushing deletions to the undo stack.
+  - **Settings**: Active highlighter color and thickness fraction persist in `~/.config/pdfview/settings.toml`.
 

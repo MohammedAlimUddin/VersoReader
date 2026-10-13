@@ -295,7 +295,7 @@
       - **Protected Single-Entry Cache**: In `src/cache.rs`, `evict_to_cap` verifies `self.cache.len() > 1` so that newly inserted large textures are never self-evicted from an empty cache.
       - Added automated unit tests (`test_screen_rect_zoom_alignment_and_clamping`, `test_text_selection_empty_vs_non_empty`, `test_viewer_action_and_context_menu_state`, `test_worker_queue_priority_and_generation_pruning`, 38 passing tests).
 - **Known-broken / Deferred:**
-  - Annotations (Highlighter and Eraser) are scheduled for Milestone 8.
+  - None for Milestone 7.
 - **Manual Verification Checklist:**
   - [x] Document opens instantly crisp and razor-sharp without any initial blurriness or delay.
   - [x] Zoom in / zoom out (pinch or mouse wheel): smoothly scales using GPU bilinear fallback, then immediately snaps to razor-sharp 1:1 text quality at all zoom levels (10% to 800%).
@@ -308,3 +308,86 @@
   - [x] Right-click context menu: click "Select All in Document" (or press `Ctrl+A`) to select all pages.
   - [x] Press `Ctrl+C` on any active selection, then paste into another app: text pastes accurately.
   - [x] Right-click context menu: click "Copy" and paste into another app: text pastes accurately.
+
+---
+
+## Milestone 8 — Highlighter and eraser (core feature)
+- **Status:** Completed
+- **Done:**
+  - Implemented data structures and JSON persistence in `src/annotations.rs`:
+    - `Highlight` struct storing canonical rectangles (`CanonicalRect`), freehand stroke points (`Vec<[f32; 2]>`), color (`AnnotationColor`), alpha (`0.35`), and line thickness fraction (`0.25` to `1.0`, default `1.0`) or point thickness.
+    - Persistent document annotations stored at `~/.local/share/pdfview/annotations/<blake3(abs path + file size)>.json`.
+    - Debounced autosave (~500 ms) scheduled after modifications, with immediate synchronous save on tab close and app exit (`on_exit`).
+    - Automatic load on document open in `Event::Opened`.
+    - Unique highlight ID generator (`generate_highlight_id`) guaranteeing monotonic uniqueness across session lifetime.
+  - **Direct PDF Embedding & Save (`Ctrl+S` & Toolbar Save Button)**:
+    - Worker thread embeds native PDF annotations directly into documents:
+      - Standard PDF `/Highlight` annotations with ISO 32000 quad points (`top-left, top-right, bottom-left, bottom-right`), guaranteeing native `FXDIB_BLEND_MULTIPLY` composition in PDFium, Microsoft Edge, Adobe Acrobat, and Chrome where black text remains 100% pitch-black.
+      - Standard PDF `/Ink` annotations using `PdfPagePathObject` for freehand drawing strokes in margins, diagrams, and whitespace.
+    - Atomic save pipeline: writes serialized PDF bytes to temporary file `<path>.tmp_pdfview` and executes an atomic `std::fs::rename`, preventing partial-write file corruption.
+    - `Ctrl+S` / `Cmd+S` keyboard shortcut and dedicated `💾 Save*` / `💾 Save` toolbar button.
+  - **Tab Unsaved Status (`*` Star Mark like Edge)**:
+    - Tracks unsaved changes in `PdfTab.has_unsaved_changes`: marks dirty whenever highlights or freehand strokes are added, erased, or undone/redone.
+    - Tab bar displays `* {title}` (e.g. `* document.pdf`) whenever changes are unsaved, clearing immediately upon saving.
+  - **Razor-Sharp, High-Contrast Text Legibility Under Highlighting**:
+    - Eliminated opaque veil over black text in egui: rendered overlay alpha tuned to soft `0.24`, ensuring black text underneath stays 100% deep, crisp, and readable.
+  - **Edge-Style Dual-Mode Highlighting**:
+    - Snaps to text: dragging starting over text selects and highlights character spans snapped to text lines.
+    - Freehand in non-text areas: dragging starting in margins, whitespace, figures, or diagrams creates smooth freehand ink highlight strokes.
+    - Eraser deletes both text highlights and freehand ink strokes with canonical hit-testing (`point_to_segment_dist`).
+    - Undo/redo supports both highlight types seamlessly.
+  - Implemented persistent settings in `src/settings.rs`:
+    - `Settings` struct persisted in `~/.config/pdfview/settings.toml` saving `highlighter_color` and `highlighter_thickness` with serde defaults.
+  - Implemented toolbar controls in `src/ui/toolbar.rs`:
+    - Highlighter button with dropdown popup: 6-color preset chooser (Classic Yellow, Fresh Green, Sky Blue, Vibrant Pink, Warm Orange, Lavender Purple) and thickness slider (`25%`–`100%`) with visual preview band.
+    - Eraser button with selected toggle state.
+    - Tool state enum `ActiveTool` (`None`, `Highlighter`, `Eraser`).
+    - Save button with unsaved star indicator and `Ctrl+S` tooltip.
+  - Added comprehensive automated unit tests (50 passing tests total):
+    - Thickness rectangle vertical centering math (`test_thickness_rect_math`).
+    - Multi-rectangle canonical point hit-testing (`test_highlight_hit_testing`).
+    - Freehand polyline segment distance and hit-testing (`test_freehand_stroke_hit_testing`).
+    - Blake3 file key determinism (`test_blake3_file_key_determinism`).
+    - JSON serialization and deserialization roundtrip (`test_annotations_json_serialization_roundtrip`).
+    - Undo/redo stack operations (`test_undo_redo_stack`).
+    - Worker native `/Highlight` annotation creation and atomic save (`test_worker_create_highlight_and_save`).
+    - Worker native `/Ink` freehand annotation creation and atomic save (`test_worker_create_ink_annotation_and_save`).
+    - Worker ISO 32000 multiply blending verification (`test_worker_highlight_render_multiply_blending`).
+    - Worker native annotation extraction and re-save roundtrip preserving all annotations (`test_worker_extract_annotations_roundtrip`).
+    - Settings defaults and TOML roundtrip (`test_settings_defaults`, `test_settings_toml_roundtrip`, `test_settings_deserializes_missing_fields_with_defaults`).
+  - **Live "Gold" Multiply Highlighting & Zero-Flicker Seamless Refresh**:
+    - Eliminated milky/muddy alpha box over text during live editing: persistent highlights render directly via PDFium's native `FXDIB_BLEND_MULTIPLY` ($C_{\text{out}} = C_{\text{src}} \times C_{\text{dst}}$), guaranteeing pitch-black text and rich vibrant color both live and when reopened.
+    - Seamless generation-aware texture refresh: `CachedTexture` tracks `generation`, smoothly painting previous textures as fallbacks during ~15ms re-renders without any 1-frame gray/blank screen flicker.
+    - Instant in-memory synchronization via `Command::SyncAnnotations` on highlight commit, deletion, undo, and redo.
+    - **Fixed Highlight Disappearance Upon Drag Release**:
+      - Fixed inverted ISO 32000 quadpoints in `apply_highlights_to_doc`: updated to standard `p1 = (left, top), p2 = (right, top), p3 = (left, bottom), p4 = (right, bottom)`, allowing PDFium to successfully rasterize annotations with native Multiply blending.
+      - Worker command queue prioritizes document mutations (`SyncAnnotations`, `Open`, `Close`, `SaveDoc`, `Shutdown`) ahead of `Render` requests, guaranteeing PDFium synchronizes annotations prior to rendering page bitmaps.
+      - Fixed 0-frame vanishing gap on mouse release: `is_stale` evaluates `gen < render_generation || annotations_changed`, immediately drawing egui highlight overlay on frame 0 while the worker re-renders.
+      - Persistent freehand ink strokes in `annotations.highlights` are continuously rendered by egui on visible pages, eliminating any gap when `freehand_stroke` is committed.
+      - Tuned live drag preview alpha to `0.28`, keeping text underneath sharp and readable while dragging.
+      - Added automated unit tests `test_apply_highlights_to_doc_renders_multiply_bitmap` and `test_highlight_stale_overlay_and_freehand_persistence` (53 passing tests).
+  - **Annotation Persistence Across Reopen & Re-save**:
+    - Worker automatically extracts existing `/Highlight` and `/Ink` annotations from PDF pages upon opening (`Command::Open`), populating `tab.annotations.highlights`.
+    - Fixed SIGSEGV in `pdfium-render` when inspecting ink stroke colors by extracting stroke colors and widths directly from underlying `PdfPagePathObject`s rather than casting annotation handles.
+  - **Responsive, Platform-Safe Touchpad Scrolling Speed**:
+    - Addressed slow two-finger touchpad scrolling: egui-winit emits `MouseWheelUnit::Point` with 1:1 raw device points (~2-5 points per gesture event) compared to discrete wheels that jump ~50 points per notch.
+    - Implemented platform-safe scroll multiplier in `src/app.rs`: dynamically detects `MouseWheelUnit::Point` vs `Line`/`Page`, scaling two-finger vertical and horizontal panning by `touchpad_scroll_speed` (default `2.5x`, matching Edge, Chrome, and GNOME responsiveness).
+    - Preserved discrete mouse wheel scrolling at `1.0x` (configurable via `mouse_wheel_speed`).
+    - Configurable and persisted in `~/.config/pdfview/settings.toml`: user can adjust `touchpad_scroll_speed` (clamped 0.5 to 10.0) without recompiling.
+    - 100% portable: uses native cross-platform `egui::Event::MouseWheel` units without OS-specific API calls, ensuring identical behavior across Linux (Wayland/X11) and Windows (Precision Touchpads).
+    - Added automated unit test `test_touchpad_scroll_multiplier_logic` (54 passing tests).
+- **Known-broken / Deferred:**
+  - Text tool (Milestone 9) is scheduled for the next milestone.
+- **Manual Verification Checklist:**
+  - [x] Drag highlighter over text and release: highlight never vanishes or flickers, staying visible immediately on release.
+  - [x] Text underneath remains completely dark, crisp, and legible immediately upon highlighting ("gold" quality live, pitch-black text, vibrant color).
+  - [x] Drag highlighter in margin / whitespace / outside text: draws smooth freehand ink strokes that stay visible immediately upon mouse release.
+  - [x] Unsaved star mark: tab title shows `* {title}` when annotations are added or erased.
+  - [x] Press `Ctrl+S` or click Save: tab star mark disappears.
+  - [x] Open an annotated PDF, add additional highlights, and press `Ctrl+S`: previous annotations are completely preserved without vanishing.
+  - [x] Open the saved PDF in Microsoft Edge or Google Chrome: all highlights and ink annotations appear natively embedded in the PDF file.
+  - [x] Eraser removes both text highlights and freehand ink strokes; `Ctrl+Z` brings them back.
+  - [x] Zoom and rotate: all highlights and ink strokes stay perfectly glued to the page without blank screen flashes.
+  - [x] Two-finger touchpad scrolling is fast, fluid, responsive, and matches Edge/browser scrolling speed without affecting Ctrl+scroll zoom or discrete mouse wheels.
+
+

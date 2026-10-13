@@ -47,6 +47,7 @@ pub struct TabItem<'a> {
     pub tooltip: &'a str,
     pub is_active: bool,
     pub is_loading: bool,
+    pub is_dirty: bool,
 }
 
 /// Renders the tab bar at the top of the application window, acting as the window title bar.
@@ -76,6 +77,11 @@ pub fn render_tab_bar(
             };
 
             let truncated_title = truncate_filename(tab.title, 24);
+            let display_title = if tab.is_dirty {
+                format!("* {truncated_title}")
+            } else {
+                truncated_title
+            };
 
             let frame = egui::Frame::new()
                 .fill(bg_color)
@@ -100,7 +106,7 @@ pub fn render_tab_bar(
                         ui.label(egui::RichText::new("📄").size(11.0));
                     }
 
-                    let label_text = egui::RichText::new(&truncated_title)
+                    let label_text = egui::RichText::new(&display_title)
                         .color(text_color)
                         .size(12.0);
                     ui.label(label_text);
