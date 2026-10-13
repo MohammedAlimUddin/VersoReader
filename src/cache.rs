@@ -106,7 +106,7 @@ impl TextureCache {
 
     /// Evicts entries until current_bytes <= max_bytes.
     fn evict_to_cap(&mut self) {
-        while self.current_bytes > self.max_bytes {
+        while self.current_bytes > self.max_bytes && self.cache.len() > 1 {
             if let Some((_k, evicted)) = self.cache.pop_lru() {
                 self.current_bytes = self.current_bytes.saturating_sub(evicted.byte_size);
             } else {
@@ -156,6 +156,96 @@ impl TextureCache {
 impl Default for TextureCache {
     fn default() -> Self {
         Self::new(Self::DEFAULT_MAX_BYTES)
+    }
+}
+
+/// Key uniquely identifying extracted page text data in cache.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PageTextKey {
+    pub doc_id: DocId,
+    pub page: usize,
+}
+
+/// LRU cache for extracted page text and layout data, capped by page count (default: 32 pages).
+pub struct PageTextCache {
+    cache: LruCache<PageTextKey, std::sync::Arc<crate::pdf::types::PageTextData>>,
+}
+
+impl PageTextCache {
+    pub const DEFAULT_MAX_PAGES: usize = 32;
+
+    pub fn new(max_pages: usize) -> Self {
+        let capacity = NonZeroUsize::new(max_pages.max(1)).expect("non-zero capacity");
+        Self {
+            cache: LruCache::new(capacity),
+        }
+    }
+
+    /// Retrieves cached page text data, updating LRU recency.
+    pub fn get(
+        &mut self,
+        doc_id: DocId,
+        page: usize,
+    ) -> Option<std::sync::Arc<crate::pdf::types::PageTextData>> {
+        let key = PageTextKey { doc_id, page };
+        self.cache.get(&key).cloned()
+    }
+
+    /// Peeks at cached page text data without updating LRU recency.
+    pub fn peek(
+        &self,
+        doc_id: DocId,
+        page: usize,
+    ) -> Option<std::sync::Arc<crate::pdf::types::PageTextData>> {
+        let key = PageTextKey { doc_id, page };
+        self.cache.peek(&key).cloned()
+    }
+
+    /// Returns true if the page text is cached.
+    #[allow(dead_code)]
+    pub fn contains(&self, doc_id: DocId, page: usize) -> bool {
+        let key = PageTextKey { doc_id, page };
+        self.cache.contains(&key)
+    }
+
+    /// Inserts extracted page text into cache, evicting oldest if capacity is exceeded.
+    pub fn insert(
+        &mut self,
+        doc_id: DocId,
+        page: usize,
+        data: std::sync::Arc<crate::pdf::types::PageTextData>,
+    ) {
+        let key = PageTextKey { doc_id, page };
+        self.cache.put(key, data);
+    }
+
+    /// Clears all cached text for a given document.
+    pub fn clear_doc(&mut self, doc_id: DocId) {
+        let keys_to_remove: Vec<PageTextKey> = self
+            .cache
+            .iter()
+            .filter(|(k, _)| k.doc_id == doc_id)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in keys_to_remove {
+            self.cache.pop(&k);
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn len(&self) -> usize {
+        self.cache.len()
+    }
+
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.cache.is_empty()
+    }
+}
+
+impl Default for PageTextCache {
+    fn default() -> Self {
+        Self::new(Self::DEFAULT_MAX_PAGES)
     }
 }
 
@@ -282,5 +372,33 @@ mod tests {
         assert_eq!(cache.current_bytes(), 15_000);
         assert!(!cache.contains(&key1));
         assert!(cache.contains(&key2));
+    }
+
+    #[test]
+    fn test_page_text_cache() {
+        use crate::pdf::types::PageTextData;
+        use std::sync::Arc;
+
+        let mut cache = PageTextCache::new(2);
+        let data0 = Arc::new(PageTextData::new(0, Vec::new(), Vec::new()));
+        let data1 = Arc::new(PageTextData::new(1, Vec::new(), Vec::new()));
+        let data2 = Arc::new(PageTextData::new(2, Vec::new(), Vec::new()));
+
+        cache.insert(1, 0, data0);
+        cache.insert(1, 1, data1);
+        assert_eq!(cache.len(), 2);
+        assert!(cache.contains(1, 0));
+        assert!(cache.contains(1, 1));
+
+        // Insert third should evict oldest (0)
+        cache.insert(1, 2, data2);
+        assert_eq!(cache.len(), 2);
+        assert!(!cache.contains(1, 0));
+        assert!(cache.contains(1, 1));
+        assert!(cache.contains(1, 2));
+
+        // Clear doc
+        cache.clear_doc(1);
+        assert_eq!(cache.len(), 0);
     }
 }

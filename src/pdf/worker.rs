@@ -7,7 +7,8 @@ use crossbeam_channel::{Receiver, Sender};
 use pdfium_render::prelude::*;
 
 use crate::pdf::types::{
-    CanonicalRect, Command, DocId, Event, OutlineItem, PageSize, RenderResult, SearchMatch,
+    CanonicalRect, CharBox, Command, DocId, Event, LineBox, OutlineItem, PageSize, PageTextData,
+    RenderResult, SearchMatch,
 };
 
 static PDFIUM_INSTANCE: OnceLock<Result<&'static Pdfium, String>> = OnceLock::new();
@@ -111,22 +112,63 @@ fn worker_main(ctx: egui::Context, rx_cmd: Receiver<Command>, tx_evt: Sender<Eve
     let mut documents: HashMap<DocId, PdfDocument<'static>> = HashMap::new();
     let mut latest_generations: HashMap<DocId, u64> = HashMap::new();
     let mut active_search: Option<ActiveSearch> = None;
+    let mut cmd_queue: std::collections::VecDeque<Command> = std::collections::VecDeque::new();
 
     // Command loop: processes incoming UI requests sequentially on the worker thread.
-    // When a search job is active, checks try_recv first to ensure Render commands and user
-    // interactions take immediate priority.
+    // Drains pending commands so intermediate stale zoom generations are dropped instantly.
     loop {
-        let cmd = if active_search.is_some() {
-            match rx_cmd.try_recv() {
-                Ok(cmd) => Some(cmd),
-                Err(crossbeam_channel::TryRecvError::Empty) => None,
-                Err(crossbeam_channel::TryRecvError::Disconnected) => break,
+        // If local queue is empty, wait for next command from channel
+        if cmd_queue.is_empty() {
+            let next = if active_search.is_some() {
+                match rx_cmd.try_recv() {
+                    Ok(cmd) => Some(cmd),
+                    Err(crossbeam_channel::TryRecvError::Empty) => None,
+                    Err(crossbeam_channel::TryRecvError::Disconnected) => break,
+                }
+            } else {
+                match rx_cmd.recv() {
+                    Ok(cmd) => Some(cmd),
+                    Err(_) => break,
+                }
+            };
+            if let Some(cmd) = next {
+                cmd_queue.push_back(cmd);
             }
+        }
+
+        // Drain all pending incoming commands from rx_cmd into local queue
+        while let Ok(pending_cmd) = rx_cmd.try_recv() {
+            cmd_queue.push_back(pending_cmd);
+        }
+
+        // Fast scan: update latest_generations across all queued commands
+        for c in &cmd_queue {
+            if let Command::Render(rc) = c {
+                let latest = latest_generations.entry(rc.doc_id).or_insert(rc.generation);
+                if rc.generation > *latest {
+                    *latest = rc.generation;
+                }
+            }
+        }
+
+        // Prune stale Render requests whose generation is older than latest seen for that document
+        cmd_queue.retain(|c| {
+            if let Command::Render(rc) = c {
+                if let Some(&latest) = latest_generations.get(&rc.doc_id) {
+                    return rc.generation >= latest;
+                }
+            }
+            true
+        });
+
+        // Pick next command: prioritize visible page renders (priority 1) over prefetch
+        let cmd = if let Some(pos) = cmd_queue
+            .iter()
+            .position(|c| matches!(c, Command::Render(rc) if rc.priority == 1))
+        {
+            cmd_queue.remove(pos)
         } else {
-            match rx_cmd.recv() {
-                Ok(cmd) => Some(cmd),
-                Err(_) => break,
-            }
+            cmd_queue.pop_front()
         };
 
         if let Some(cmd) = cmd {
@@ -197,7 +239,7 @@ fn worker_main(ctx: egui::Context, rx_cmd: Receiver<Command>, tx_evt: Sender<Eve
                         if render_cmd.page < page_count {
                             match doc.pages().get(render_cmd.page as i32) {
                                 Ok(page) => {
-                                    let target_w = render_cmd.width_px.clamp(32, 4096) as i32;
+                                    let target_w = render_cmd.width_px.clamp(32, 6144) as i32;
                                     let rotation_setting = match render_cmd.rotation % 360 {
                                         90 => PdfPageRenderRotation::Degrees90,
                                         180 => PdfPageRenderRotation::Degrees180,
@@ -206,11 +248,11 @@ fn worker_main(ctx: egui::Context, rx_cmd: Receiver<Command>, tx_evt: Sender<Eve
                                     };
                                     let render_config = PdfRenderConfig::new()
                                         .set_target_width(target_w)
-                                        .set_maximum_width(4096)
-                                        .set_maximum_height(4096)
+                                        .set_maximum_width(6144)
+                                        .set_maximum_height(6144)
                                         .set_format(PdfBitmapFormat::BGRA)
                                         .rotate(rotation_setting, true)
-                                        .use_lcd_text_rendering(true)
+                                        .use_lcd_text_rendering(false)
                                         .set_text_smoothing(true)
                                         .set_image_smoothing(true)
                                         .set_path_smoothing(true);
@@ -276,6 +318,101 @@ fn worker_main(ctx: egui::Context, rx_cmd: Receiver<Command>, tx_evt: Sender<Eve
                     if let Some(doc) = documents.get(&doc_id) {
                         let items = extract_outline(doc);
                         let _ = tx_evt.send(Event::OutlineResult { doc_id, items });
+                        ctx.request_repaint();
+                    }
+                }
+                Command::PageText { doc_id, page } => {
+                    if let Some(doc) = documents.get(&doc_id) {
+                        if let Some(data) = extract_page_text(doc, page) {
+                            let _ = tx_evt.send(Event::PageTextResult {
+                                doc_id,
+                                page,
+                                data: std::sync::Arc::new(data),
+                            });
+                            ctx.request_repaint();
+                        }
+                    }
+                }
+                Command::ExtractTextForCopy {
+                    doc_id,
+                    start_page,
+                    start_char,
+                    end_page,
+                    end_char,
+                } => {
+                    if let Some(doc) = documents.get(&doc_id) {
+                        let page_count = doc.pages().len() as usize;
+                        let s_page = start_page.min(page_count.saturating_sub(1));
+                        let e_page = end_page.min(page_count.saturating_sub(1));
+                        let mut full_text = String::new();
+
+                        for p in s_page..=e_page {
+                            if let Ok(page) = doc.pages().get(p as _) {
+                                if let Ok(text_page) = page.text() {
+                                    let page_str = if p == s_page && s_page == e_page {
+                                        if start_char == 0 && end_char == usize::MAX {
+                                            text_page.all()
+                                        } else {
+                                            let chars: Vec<char> = text_page
+                                                .chars()
+                                                .iter()
+                                                .map(|c| c.unicode_char().unwrap_or(' '))
+                                                .collect();
+                                            let c_start = start_char.min(chars.len());
+                                            let c_end = end_char.min(chars.len().saturating_sub(1));
+                                            if c_start <= c_end && c_start < chars.len() {
+                                                chars[c_start..=c_end].iter().collect()
+                                            } else {
+                                                String::new()
+                                            }
+                                        }
+                                    } else if p == s_page {
+                                        if start_char == 0 {
+                                            text_page.all()
+                                        } else {
+                                            let chars: Vec<char> = text_page
+                                                .chars()
+                                                .iter()
+                                                .map(|c| c.unicode_char().unwrap_or(' '))
+                                                .collect();
+                                            let c_start = start_char.min(chars.len());
+                                            if c_start < chars.len() {
+                                                chars[c_start..].iter().collect()
+                                            } else {
+                                                String::new()
+                                            }
+                                        }
+                                    } else if p == e_page {
+                                        if end_char == usize::MAX {
+                                            text_page.all()
+                                        } else {
+                                            let chars: Vec<char> = text_page
+                                                .chars()
+                                                .iter()
+                                                .map(|c| c.unicode_char().unwrap_or(' '))
+                                                .collect();
+                                            let c_end = end_char.min(chars.len().saturating_sub(1));
+                                            if c_end < chars.len() {
+                                                chars[..=c_end].iter().collect()
+                                            } else {
+                                                String::new()
+                                            }
+                                        }
+                                    } else {
+                                        text_page.all()
+                                    };
+
+                                    if !page_str.is_empty() {
+                                        if !full_text.is_empty() && !full_text.ends_with('\n') {
+                                            full_text.push('\n');
+                                        }
+                                        full_text.push_str(&page_str);
+                                    }
+                                }
+                            }
+                        }
+
+                        let _ = tx_evt.send(Event::CopyTextResult { text: full_text });
                         ctx.request_repaint();
                     }
                 }
@@ -574,6 +711,169 @@ pub fn extract_outline(doc: &PdfDocument) -> Vec<OutlineItem> {
     items
 }
 
+/// Extracts all characters and layout line boxes for a given page in canonical coordinates.
+pub fn extract_page_text(doc: &PdfDocument, page_idx: usize) -> Option<PageTextData> {
+    let page = doc.pages().get(page_idx as i32).ok()?;
+    let text_page = page.text().ok()?;
+    let count = text_page.len();
+    if count <= 0 {
+        return Some(PageTextData::new(page_idx, Vec::new(), Vec::new()));
+    }
+
+    let crop_box = if let Ok(crop) = page.boundaries().crop() {
+        crop.bounds
+    } else if let Ok(media) = page.boundaries().media() {
+        media.bounds
+    } else {
+        PdfRect::new(
+            PdfPoints::ZERO,
+            PdfPoints::ZERO,
+            page.height(),
+            page.width(),
+        )
+    };
+    let rotation = page.rotation().unwrap_or(PdfPageRenderRotation::None);
+
+    let page_chars = text_page.chars();
+    let mut raw_chars: Vec<(char, CanonicalRect)> = Vec::with_capacity(count as usize);
+
+    for char_item in page_chars.iter() {
+        let ch = char_item.unicode_char().unwrap_or(' ');
+        let raw_rect = char_item
+            .loose_bounds()
+            .or_else(|_| char_item.tight_bounds())
+            .unwrap_or(PdfRect::new(
+                PdfPoints::new(0.0),
+                PdfPoints::new(0.0),
+                PdfPoints::new(0.0),
+                PdfPoints::new(0.0),
+            ));
+
+        let canon = user_rect_to_canonical(&raw_rect, &crop_box, rotation);
+        raw_chars.push((ch, canon));
+    }
+
+    // Group characters into reading order lines
+    struct LineAccum {
+        char_indices: Vec<usize>,
+        min_x: f32,
+        max_x: f32,
+        min_y: f32,
+        max_y: f32,
+    }
+
+    let mut line_accums: Vec<LineAccum> = Vec::new();
+    let mut cur_accum: Option<LineAccum> = None;
+
+    for (idx, &(ch, rect)) in raw_chars.iter().enumerate() {
+        if let Some(mut cur) = cur_accum.take() {
+            if ch == '\r' || ch == '\n' {
+                cur.char_indices.push(idx);
+                line_accums.push(cur);
+                cur_accum = None;
+            } else if rect.max_x > rect.min_x && rect.max_y > rect.min_y {
+                let overlap = (cur.max_y.min(rect.max_y) - cur.min_y.max(rect.min_y)).max(0.0);
+                let min_h = (cur.max_y - cur.min_y).min(rect.max_y - rect.min_y);
+                if min_h > 0.0 && (overlap / min_h) > 0.45 && rect.min_x >= cur.min_x - 15.0 {
+                    cur.char_indices.push(idx);
+                    cur.min_x = cur.min_x.min(rect.min_x);
+                    cur.max_x = cur.max_x.max(rect.max_x);
+                    cur.min_y = cur.min_y.min(rect.min_y);
+                    cur.max_y = cur.max_y.max(rect.max_y);
+                    cur_accum = Some(cur);
+                } else {
+                    line_accums.push(cur);
+                    cur_accum = Some(LineAccum {
+                        char_indices: vec![idx],
+                        min_x: rect.min_x,
+                        max_x: rect.max_x,
+                        min_y: rect.min_y,
+                        max_y: rect.max_y,
+                    });
+                }
+            } else {
+                cur.char_indices.push(idx);
+                cur_accum = Some(cur);
+            }
+        } else if ch == '\r' || ch == '\n' {
+            if let Some(mut cur) = cur_accum.take() {
+                cur.char_indices.push(idx);
+                line_accums.push(cur);
+            }
+        } else {
+            cur_accum = Some(LineAccum {
+                char_indices: vec![idx],
+                min_x: rect.min_x,
+                max_x: rect.max_x,
+                min_y: rect.min_y,
+                max_y: rect.max_y,
+            });
+        }
+    }
+
+    if let Some(cur) = cur_accum {
+        line_accums.push(cur);
+    }
+
+    // Build final CharBox and LineBox collections
+    let mut final_chars = Vec::with_capacity(raw_chars.len());
+    let mut final_lines = Vec::with_capacity(line_accums.len());
+
+    for (line_idx, accum) in line_accums.into_iter().enumerate() {
+        if accum.char_indices.is_empty() {
+            continue;
+        }
+
+        let start_char_idx = final_chars.len();
+        let l_min_y = accum.min_y;
+        let l_max_y = accum.max_y;
+
+        for &c_idx in &accum.char_indices {
+            let (ch, mut r) = raw_chars[c_idx];
+            if l_max_y > l_min_y {
+                r.min_y = l_min_y;
+                r.max_y = l_max_y;
+            }
+            final_chars.push(CharBox {
+                ch,
+                rect: r,
+                line_idx,
+            });
+        }
+        let end_char_idx = final_chars.len();
+
+        // Fix zero-width spaces within the line
+        for i in start_char_idx..end_char_idx {
+            if final_chars[i].rect.max_x <= final_chars[i].rect.min_x + 0.01 {
+                let prev_x = if i > start_char_idx {
+                    final_chars[i - 1].rect.max_x
+                } else {
+                    accum.min_x
+                };
+                let next_x = if i + 1 < end_char_idx
+                    && final_chars[i + 1].rect.max_x > final_chars[i + 1].rect.min_x
+                {
+                    final_chars[i + 1].rect.min_x
+                } else {
+                    prev_x + 4.0
+                };
+                final_chars[i].rect.min_x = prev_x;
+                final_chars[i].rect.max_x = next_x.max(prev_x);
+            }
+        }
+
+        if accum.max_x > accum.min_x + 0.01 && l_max_y > l_min_y {
+            let l_box = CanonicalRect::new(accum.min_x, l_min_y, accum.max_x, l_max_y);
+            final_lines.push(LineBox {
+                rect: l_box,
+                char_range: start_char_idx..end_char_idx,
+            });
+        }
+    }
+
+    Some(PageTextData::new(page_idx, final_chars, final_lines))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -756,5 +1056,163 @@ mod tests {
             let tanenbaum_matches = search_page(&book_doc, 4, "tanenbaum");
             assert_eq!(tanenbaum_matches.len(), 1);
         }
+    }
+
+    #[test]
+    fn test_worker_extract_page_text() {
+        let pdfium = bind_pdfium().expect("Pdfium must be available for fixture test");
+        let path = PathBuf::from("fixtures/MLE.pdf");
+        if !path.exists() {
+            return;
+        }
+
+        let doc = pdfium
+            .load_pdf_from_file(&path, None)
+            .expect("load MLE.pdf");
+        let page_text = extract_page_text(&doc, 0).expect("page text extraction");
+        assert_eq!(page_text.page, 0);
+        assert!(!page_text.chars.is_empty());
+        assert!(!page_text.lines.is_empty());
+
+        // Characters should have valid canonical bounds
+        for ch in &page_text.chars {
+            assert!(ch.rect.max_x >= ch.rect.min_x);
+            assert!(ch.rect.max_y >= ch.rect.min_y);
+        }
+
+        // Lines should group characters properly
+        for line in &page_text.lines {
+            assert!(line.char_range.end > line.char_range.start);
+            assert!(line.char_range.end <= page_text.chars.len());
+            assert!(line.rect.max_x >= line.rect.min_x);
+            assert!(line.rect.max_y >= line.rect.min_y);
+        }
+
+        let book_path =
+            PathBuf::from("fixtures/Modern Operating Systems 4th Edition--Andrew Tanenbaum.pdf");
+        if book_path.exists() {
+            let book_doc = pdfium
+                .load_pdf_from_file(&book_path, None)
+                .expect("load book");
+            let p3_text = extract_page_text(&book_doc, 3).expect("page 3 text");
+            for line in p3_text.lines.iter().take(10) {
+                let s = p3_text.extract_text_range(
+                    line.char_range.start,
+                    line.char_range.end.saturating_sub(1),
+                );
+                assert!(!s.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn test_worker_extract_text_for_copy() {
+        let pdfium = bind_pdfium().expect("Pdfium must be available for fixture test");
+        let path = PathBuf::from("fixtures/MLE.pdf");
+        if !path.exists() {
+            return;
+        }
+
+        let doc = pdfium
+            .load_pdf_from_file(&path, None)
+            .expect("load MLE.pdf");
+        let page = doc.pages().get(0).expect("get page 0");
+        let text_page = page.text().expect("get text page");
+        let all_text = text_page.all();
+        assert!(!all_text.is_empty());
+    }
+
+    #[test]
+    fn test_worker_queue_priority_and_generation_pruning() {
+        let path = PathBuf::from("fixtures/MLE.pdf");
+        if !path.exists() {
+            return;
+        }
+
+        let ctx = egui::Context::default();
+        let (tx_cmd, rx_evt) = start_worker(ctx);
+
+        // Receive PdfiumReady
+        let evt = rx_evt
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        assert!(matches!(evt, Event::PdfiumReady));
+
+        // Open doc
+        let doc_id = 999;
+        tx_cmd
+            .send(Command::Open {
+                doc_id,
+                path: path.clone(),
+            })
+            .unwrap();
+
+        let evt = rx_evt
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        assert!(matches!(evt, Event::Opened { doc_id: 999, .. }));
+
+        // Send:
+        // 1. Stale generation Render: gen 1, priority 3 (should be pruned)
+        // 2. Prefetch Render: gen 2, priority 3 (prefetch, page 1)
+        // 3. Visible Render: gen 2, priority 1 (visible, page 0)
+        use crate::pdf::types::RenderCommand;
+        tx_cmd
+            .send(Command::Render(RenderCommand {
+                doc_id,
+                page: 1,
+                width_px: 200,
+                rotation: 0,
+                generation: 1,
+                priority: 3,
+            }))
+            .unwrap();
+        tx_cmd
+            .send(Command::Render(RenderCommand {
+                doc_id,
+                page: 1,
+                width_px: 300,
+                rotation: 0,
+                generation: 2,
+                priority: 3,
+            }))
+            .unwrap();
+        tx_cmd
+            .send(Command::Render(RenderCommand {
+                doc_id,
+                page: 0,
+                width_px: 400,
+                rotation: 0,
+                generation: 2,
+                priority: 1,
+            }))
+            .unwrap();
+
+        // The first render result MUST be page 0 (priority 1), NOT page 1 (priority 3 or stale gen 1)
+        let evt1 = rx_evt
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .unwrap();
+        if let Event::Rendered(res) = evt1 {
+            assert_eq!(res.page, 0, "Visible page 0 must be rendered first");
+            assert_eq!(res.generation, 2);
+            assert_eq!(res.width_px, 400);
+        } else {
+            panic!("Expected Rendered event, got {:?}", evt1);
+        }
+
+        // The second render result MUST be page 1 from generation 2 (generation 1 must have been skipped)
+        let evt2 = rx_evt
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .unwrap();
+        if let Event::Rendered(res) = evt2 {
+            assert_eq!(res.page, 1);
+            assert_eq!(res.generation, 2, "Stale generation 1 should be dropped");
+            assert_eq!(res.width_px, 300);
+        } else {
+            panic!("Expected Rendered event, got {:?}", evt2);
+        }
+
+        // Close doc
+        tx_cmd.send(Command::Close { doc_id }).unwrap();
     }
 }

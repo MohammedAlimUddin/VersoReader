@@ -245,7 +245,7 @@
     - Match scroll offset viewport centering calculation (`test_compute_match_scroll_offset`).
     - Zoom anchor scroll calculation test (`test_zoom_anchor_scroll_calculation`).
 - **Known-broken / Deferred:**
-  - Text layer and mouse drag selection are scheduled for Milestone 7.
+  - Text layer and mouse drag selection are completed in Milestone 7.
 - **Manual Verification Checklist:**
   - [x] Click the `🔍` button in the toolbar (or press `Ctrl+F`): Find bar opens and focuses the text box.
   - [x] Search a word (e.g. "operating" or "systems"): highlights appear exactly on the text characters without any offset or random placements.
@@ -255,3 +255,56 @@
   - [x] Press `Esc` or click `×`: closes the Find bar and clears highlights.
   - [x] Test zoomed in and rotated: highlights rotate and scale exactly with the page text.
   - [x] Touchpad pinch-to-zoom: zooming smoothly scales in and out centered on the cursor without any simultaneous vertical scrolling.
+
+---
+
+## Milestone 7 — Text layer and selection
+- **Status:** Completed
+- **Done:**
+  - Extracted text characters and reading order line layout from PDFium in `src/pdf/worker.rs`:
+    - `Command::PageText { doc_id, page }` extracts character bounding boxes using `loose_bounds()` / `tight_bounds()`, converted to canonical unrotated coordinates through `user_rect_to_canonical`.
+    - Contiguous characters grouped into layout lines with vertical overlap detection and `\r`/`\n` line delimiters without phantom zero-width line boxes.
+    - Zero-width space bounding boxes reconstructed seamlessly between neighbors.
+    - Lines enforce uniform baseline and line heights, enabling clean single-rectangle rendering per line.
+    - Emits `Event::PageTextResult { doc_id, page, data }` non-blockingly over channel to the UI.
+  - Implemented `PageTextCache` in `src/cache.rs`:
+    - Strict LRU page cache capped at 32 pages per document using `lru::LruCache`.
+    - Automatically cleaned up on document close via `clear_doc(doc_id)` alongside texture cache.
+  - Interactive text selection & hover in `src/ui/viewer.rs`:
+    - Disabled default primary drag scrolling via `scroll_area.drag_to_scroll(false)` while preserving full mouse wheel, touchpad 2-finger scroll, and scrollbar dragging.
+    - Hover cursor dynamically sets to `CursorIcon::Text` (I-beam) whenever hovering over text lines across ALL lines, pages, and large PDFs (fixed coordinate space comparison by using screen-space `ui.clip_rect().contains(pos)` and `info.screen_rect.contains(pos)`).
+    - Mouse left-click drag selects text characters across lines and across pages.
+    - Translucent orangish-red selection highlight (`rgba(245, 90, 40, 115)`) per line through `PageTransform`, rendering cleanly above the page bitmap with crisp text readability.
+    - Synchronized zoom texture rects: page bitmap bounds match `raw_screen_rect`, preventing any selection drift or mismatch when zoomed in (10% to 800%).
+    - 2D multi-column hit testing in `find_best_line`: vertically overlapping columns (e.g. 2-column papers or books) are disambiguated horizontally, keeping selection within the column dragged in.
+    - Double-click word selection: fires reliably on click release via `button_double_clicked`, expanding to word boundaries via `get_word_range` and preserving selection.
+    - Single-click away or on page margins immediately clears selection.
+    - Smooth edge autoscrolling when dragging selection near the top or bottom of the viewport using `ui.clip_rect()` bounds.
+    - **Fixed single-click vs double-click text selection**: Single-clicking anywhere clears selection and never highlights single letters/characters; words are selected exclusively on double-click via `get_word_range`, and ranges are selected via click-and-drag.
+    - **Fixed system clipboard copy (`Ctrl+C` and context menu)**: In `egui-winit`, pressing `Ctrl+C` produces an `egui::Event::Copy` and early-returns without pushing `Key::C` to the general key event queue. Updated `src/app.rs` shortcut detection to check `egui::Event::Copy` as well as `Key::C` when no text input is focused, ensuring `Ctrl+C` immediately and reliably copies selected text to the clipboard.
+    - **Ultra-Low Zoom Latency & Edge-Grade Sharp Rendering**:
+      - Fixed persistent text blurriness on document open and after zooming: removed flawed `has_newer` worker check that inadvertently dropped sharp renders whenever competing requests were queued, leaving `self.pending_render_requests` deadlocked on the UI.
+      - Worker command queue (`cmd_queue`) immediately drains `rx_cmd` and prunes stale generations via `cmd_queue.retain(|c| ...)`. Visible page renders (`priority: 1`) are prioritized and dispatched first, processing in ~30ms directly from PDFium.
+      - Removed 35% low-res preview requests that caused the initial blurry flash; sharp textures are requested directly for visible pages, starting crystal clear immediately upon open.
+      - During active zooming, existing high-res textures serve as GPU-filtered bilinear fallbacks until the new resolution finishes rendering, preventing any white flashes or blur lockups.
+      - Added automated unit test `test_worker_queue_priority_and_generation_pruning` (38 passing tests).
+    - **High-Zoom Edge-Grade Crisp Sharpness & Texture Budgeting**:
+      - **Resolved 4096 px Artificial Clamping**: In `src/ui/viewer.rs` and `src/pdf/worker.rs`, the previous 4096 px dimension cap artificially clamped portrait pages (such as US Letter) to only 3165 px wide, forcing OpenGL to bilinear-stretch 3165 px bitmaps across 4080–6500 screen pixels and locking `sharp_key` so that zoom levels past 350% never re-rendered. Increased `MAX_TEXTURE_SIDE` to 6144 px, providing 1:1 bit-perfect native vector resolution up to ~580% zoom on portrait pages while keeping single-page memory strictly under ~116 MB (safely below the 150 MB cache limit).
+      - **Eliminated Subpixel Chromatic Aberration**: In `src/pdf/worker.rs`, changed `.use_lcd_text_rendering(true)` to `false` while preserving `.set_text_smoothing(true)`. Eliminates red/cyan colored fringe blur along magnified font stems, producing pure, high-contrast grayscale anti-aliasing matching modern Chromium/Edge on Linux.
+      - **Prevented High-Zoom Cache Thrashing**: In `src/ui/viewer.rs`, offscreen prefetch requests are throttled when single-page texture memory exceeds 45 MB, preventing offscreen pages from evicting the active visible page's sharp texture from the 150 MB LRU cache.
+      - **Protected Single-Entry Cache**: In `src/cache.rs`, `evict_to_cap` verifies `self.cache.len() > 1` so that newly inserted large textures are never self-evicted from an empty cache.
+      - Added automated unit tests (`test_screen_rect_zoom_alignment_and_clamping`, `test_text_selection_empty_vs_non_empty`, `test_viewer_action_and_context_menu_state`, `test_worker_queue_priority_and_generation_pruning`, 38 passing tests).
+- **Known-broken / Deferred:**
+  - Annotations (Highlighter and Eraser) are scheduled for Milestone 8.
+- **Manual Verification Checklist:**
+  - [x] Document opens instantly crisp and razor-sharp without any initial blurriness or delay.
+  - [x] Zoom in / zoom out (pinch or mouse wheel): smoothly scales using GPU bilinear fallback, then immediately snaps to razor-sharp 1:1 text quality at all zoom levels (10% to 800%).
+  - [x] Text selection highlight is a vibrant orangish-red (`rgba(245, 90, 40, 115)`).
+  - [x] Single click on any word: does NOT select a letter; clears selection.
+  - [x] Double-click on any word: entire word is selected cleanly.
+  - [x] Cursor I-beam appears reliably across all lines and pages (including page 2+, 100+, and large books).
+  - [x] Zoom in past window width (e.g. 200% - 500%): text is razor-sharp (chef's kiss quality), latency to sharp text is virtually instantaneous, and selection highlights/cursor follow the text perfectly across the entire page.
+  - [x] Right-click context menu: click "Select All on Page {N}" to select that entire page without deselecting.
+  - [x] Right-click context menu: click "Select All in Document" (or press `Ctrl+A`) to select all pages.
+  - [x] Press `Ctrl+C` on any active selection, then paste into another app: text pastes accurately.
+  - [x] Right-click context menu: click "Copy" and paste into another app: text pastes accurately.

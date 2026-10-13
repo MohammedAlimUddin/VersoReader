@@ -85,7 +85,8 @@ If all fail, the worker sends `Event::PdfiumError` with the exact searched paths
 
 ## 5. Rendering Pipeline & Texture Cache
 * **Virtualization**: Layout is calculated upfront using page sizes returned at open. Only pages intersecting the viewport plus 1 page of prefetch above/below are rendered and drawn.
-* **Progressive Rendering**: Low-resolution (~35% scale) render requested first for responsive feedback, swapped with full-resolution render once ready.
+* **Sharp Rendering & GPU Fallbacks**: Visible pages are requested at exact device pixel resolution (`sharp_width`) with top priority (`priority: 1`), rendering in ~30ms directly from PDFium without initial low-res blurriness. During active zooming, existing cached textures serve as GPU-filtered bilinear fallbacks until the new sharp texture finishes rendering, preventing white flashes or blur lockups.
+* **Worker Command Scheduling**: The background worker thread prunes stale generation requests upon receiving new zoom/scroll commands and prioritizes visible page renders before prefetch tasks.
 * **Texture Limits**: Maximum texture side is capped at 4096 px.
 * **LRU Cache (`cache.rs`)**: Keyed by `(doc_id, page, width_px, rotation)` with a hard **150 MB** memory cap, actively freeing textures upon eviction or tab closure. Switching tabs drops the inactive tab's textures from the cache while retaining the worker's document handle; closing a tab sends `Command::Close` and immediately purges all associated textures.
 
@@ -97,7 +98,7 @@ If all fail, the worker sends `Event::PdfiumError` with the exact searched paths
 src/
   main.rs          eframe application entry point and CLI arg parsing
   app.rs           Main application state, event drain, top-level update loop
-  cache.rs         LRU texture cache with byte size cap
+  cache.rs         LRU texture cache (150 MB cap) and LRU PageTextCache (32 pages cap)
   annotations.rs   Highlight and TextBox data structures, hit-testing, sidecar JSON
   export.rs        PDF annotation export writer
   settings.rs      Settings persistence (settings.toml)

@@ -4,15 +4,19 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender};
 
-use crate::cache::{TextureCache, TextureKey};
-use crate::pdf::types::{DocId, OutlineItem, PageSize, RenderCommand, SearchMatch};
+use crate::cache::{PageTextCache, TextureCache, TextureKey};
+use crate::pdf::types::{
+    DocId, OutlineItem, PageSize, RenderCommand, SearchMatch, TextLocation, TextSelection,
+};
 use crate::pdf::{start_worker, Command, Event, PageTransform};
 use crate::ui::findbar::{render_find_bar, FindBarAction, FindState};
 use crate::ui::pathbar::{parse_pdf_path, PathBar};
 use crate::ui::sidebar_toc::render_sidebar_toc;
 use crate::ui::tabbar::{render_tab_bar, TabBarAction, TabItem};
 use crate::ui::toolbar::{Toolbar, ToolbarAction};
-use crate::ui::viewer::{compute_match_scroll_offset, render_viewer, PageRenderRequest};
+use crate::ui::viewer::{
+    compute_match_scroll_offset, render_viewer, ContextMenuState, PageRenderRequest, ViewerAction,
+};
 
 /// State of an open PDF document tab.
 #[derive(Debug, Clone)]
@@ -39,6 +43,10 @@ pub struct PdfTab {
     pub sidebar_open: bool,
     pub sidebar_width: f32,
     pub find_state: FindState,
+    pub selection: Option<TextSelection>,
+    pub drag_start: Option<TextLocation>,
+    pub context_menu: Option<ContextMenuState>,
+    pub pending_text_requests: HashSet<usize>,
 }
 
 /// Top-level tabs in the reader.
@@ -77,8 +85,9 @@ pub struct PdfViewApp {
     // Startup
     pub pending_open_path: Option<PathBuf>,
 
-    // Texture cache and active requests
+    // Cache and active requests
     pub cache: TextureCache,
+    pub text_cache: PageTextCache,
     pub pending_render_requests: HashSet<(usize, u32, u16)>,
     pub render_generation: u64,
 
@@ -129,6 +138,7 @@ impl PdfViewApp {
             is_fullscreen: false,
             pending_open_path,
             cache: TextureCache::default(),
+            text_cache: PageTextCache::default(),
             pending_render_requests: HashSet::new(),
             render_generation: 0,
             debug_visible: false,
@@ -203,6 +213,10 @@ impl PdfViewApp {
             sidebar_open: false,
             sidebar_width: 280.0,
             find_state: FindState::default(),
+            selection: None,
+            drag_start: None,
+            context_menu: None,
+            pending_text_requests: HashSet::new(),
         };
 
         self.tabs.push(Tab::Pdf(tab));
@@ -242,6 +256,9 @@ impl PdfViewApp {
                 tab.outline = None;
                 tab.outline_loading = false;
                 tab.find_state = FindState::default();
+                tab.selection = None;
+                tab.drag_start = None;
+                tab.pending_text_requests.clear();
                 let doc_id = tab.doc_id;
                 self.render_generation += 1;
                 self.pending_render_requests.clear();
@@ -277,6 +294,10 @@ impl PdfViewApp {
             sidebar_open: false,
             sidebar_width: 280.0,
             find_state: FindState::default(),
+            selection: None,
+            drag_start: None,
+            context_menu: None,
+            pending_text_requests: HashSet::new(),
         };
 
         // If switching from an existing tab, drop its textures from cache
@@ -301,6 +322,7 @@ impl PdfViewApp {
         if let Tab::Pdf(tab) = closed {
             let _ = self.tx_cmd.send(Command::Close { doc_id: tab.doc_id });
             self.cache.clear_doc(tab.doc_id);
+            self.text_cache.clear_doc(tab.doc_id);
         }
 
         if self.tabs.is_empty() {
@@ -424,6 +446,55 @@ impl PdfViewApp {
     pub fn toggle_fullscreen(&mut self, ctx: &egui::Context) {
         self.is_fullscreen = !self.is_fullscreen;
         ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.is_fullscreen));
+    }
+
+    /// Copies active text selection to system clipboard. If all selected pages are cached,
+    /// performs instantaneous extraction on UI thread; otherwise requests on-demand worker
+    /// extraction to prevent loading all pages into memory or freezing UI.
+    pub fn copy_selection(&mut self, ctx: &egui::Context) {
+        let active_idx = self.active_tab_idx;
+        if let Some(Tab::Pdf(tab)) = self.tabs.get(active_idx) {
+            if let Some(sel) = tab.selection {
+                if sel.is_empty() {
+                    return;
+                }
+                let (start, end) = sel.normalized();
+                let all_cached =
+                    (start.page..=end.page).all(|p| self.text_cache.peek(tab.doc_id, p).is_some());
+
+                if all_cached {
+                    let mut full_text = String::new();
+                    for p in start.page..=end.page {
+                        if let Some(pt_data) = self.text_cache.peek(tab.doc_id, p) {
+                            let c_start = if p == start.page { start.char_idx } else { 0 };
+                            let c_end = if p == end.page {
+                                end.char_idx.min(pt_data.chars.len().saturating_sub(1))
+                            } else {
+                                pt_data.chars.len().saturating_sub(1)
+                            };
+                            let page_str = pt_data.extract_text_range(c_start, c_end);
+                            if !page_str.is_empty() {
+                                if !full_text.is_empty() && !full_text.ends_with('\n') {
+                                    full_text.push('\n');
+                                }
+                                full_text.push_str(&page_str);
+                            }
+                        }
+                    }
+                    if !full_text.is_empty() {
+                        ctx.copy_text(full_text);
+                    }
+                } else {
+                    let _ = self.tx_cmd.send(Command::ExtractTextForCopy {
+                        doc_id: tab.doc_id,
+                        start_page: start.page,
+                        start_char: start.char_idx,
+                        end_page: end.page,
+                        end_char: end.char_idx,
+                    });
+                }
+            }
+        }
     }
 
     /// Dispatches a render request to the background worker thread.
@@ -658,10 +729,47 @@ impl eframe::App for PdfViewApp {
             }
         }
 
-        // Close Find bar shortcut: Esc (when not in fullscreen)
+        // Copy selected text shortcut: Ctrl+C / Cmd+C or egui::Event::Copy
+        let copy_requested = ctx.input(|i| {
+            i.events.iter().any(|e| matches!(e, egui::Event::Copy))
+                || ((i.modifiers.ctrl || i.modifiers.command) && i.key_pressed(egui::Key::C))
+        });
+        if copy_requested && !ctx.wants_keyboard_input() {
+            let has_selection = self
+                .active_pdf_tab()
+                .and_then(|t| t.selection)
+                .map(|s| !s.is_empty())
+                .unwrap_or(false);
+
+            if has_selection {
+                self.copy_selection(ctx);
+            }
+        }
+
+        // Select all text in document shortcut: Ctrl+A / Cmd+A
+        if ctx.input(|i| (i.modifiers.ctrl || i.modifiers.command) && i.key_pressed(egui::Key::A)) {
+            let text_input_active = ctx.wants_keyboard_input();
+            if !text_input_active {
+                if let Some(tab) = self.active_pdf_tab_mut() {
+                    let last_page = tab.page_count.saturating_sub(1);
+                    tab.selection = Some(TextSelection::new(
+                        TextLocation::new(0, 0),
+                        TextLocation::new(last_page, usize::MAX),
+                    ));
+                    tab.drag_start = None;
+                }
+            }
+        }
+
+        // Close context menu / Find bar / clear selection shortcut: Esc (when not in fullscreen)
         if !self.is_fullscreen && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             if let Some(tab) = self.active_pdf_tab_mut() {
-                if tab.find_state.is_open {
+                if tab.context_menu.is_some() {
+                    tab.context_menu = None;
+                } else if tab.selection.is_some() {
+                    tab.selection = None;
+                    tab.drag_start = None;
+                } else if tab.find_state.is_open {
                     tab.find_state.is_open = false;
                     tab.find_state.clear_matches();
                     let doc_id = tab.doc_id;
@@ -896,6 +1004,22 @@ impl eframe::App for PdfViewApp {
                                 break;
                             }
                         }
+                    }
+                }
+                Event::PageTextResult { doc_id, page, data } => {
+                    self.text_cache.insert(doc_id, page, data);
+                    for tab_item in &mut self.tabs {
+                        if let Tab::Pdf(ref mut tab) = tab_item {
+                            if tab.doc_id == doc_id {
+                                tab.pending_text_requests.remove(&page);
+                                break;
+                            }
+                        }
+                    }
+                }
+                Event::CopyTextResult { text } => {
+                    if !text.is_empty() {
+                        ctx.copy_text(text);
                     }
                 }
             }
@@ -1330,6 +1454,7 @@ impl eframe::App for PdfViewApp {
                 });
             }
             PdfiumStatus::Ready => {
+                #[allow(clippy::large_enum_variant)]
                 enum ActiveTabState {
                     Loading(String),
                     EmptyTab,
@@ -1343,6 +1468,10 @@ impl eframe::App for PdfViewApp {
                         set_scroll: Option<f32>,
                         search_matches: Vec<SearchMatch>,
                         active_match_idx: Option<usize>,
+                        selection: Option<TextSelection>,
+                        drag_start: Option<TextLocation>,
+                        context_menu: Option<ContextMenuState>,
+                        pending_text_requests: HashSet<usize>,
                     },
                     Error(String),
                     Settings,
@@ -1370,6 +1499,10 @@ impl eframe::App for PdfViewApp {
                                 set_scroll: tab.pending_set_scroll_offset_y.take(),
                                 search_matches: tab.find_state.matches.clone(),
                                 active_match_idx: tab.find_state.current_match_idx,
+                                selection: tab.selection,
+                                drag_start: tab.drag_start,
+                                context_menu: tab.context_menu,
+                                pending_text_requests: tab.pending_text_requests.clone(),
                             }
                         }
                     }
@@ -1418,6 +1551,10 @@ impl eframe::App for PdfViewApp {
                         set_scroll,
                         search_matches,
                         active_match_idx,
+                        mut selection,
+                        mut drag_start,
+                        mut context_menu,
+                        pending_text_requests,
                     } => {
                         let output = render_viewer(
                             ui,
@@ -1426,14 +1563,54 @@ impl eframe::App for PdfViewApp {
                             zoom,
                             rotation,
                             &mut self.cache,
+                            &mut self.text_cache,
                             &self.pending_render_requests,
+                            &pending_text_requests,
                             scroll_to_page,
                             scroll_delta,
                             set_scroll,
                             &search_matches,
                             active_match_idx,
                             is_pinching,
+                            &mut selection,
+                            &mut drag_start,
+                            &mut context_menu,
                         );
+
+                        if let Some(action) = output.action {
+                            match action {
+                                ViewerAction::Copy => {
+                                    self.copy_selection(ui.ctx());
+                                }
+                                ViewerAction::SelectAllPage(p) => {
+                                    if let Some(Tab::Pdf(tab)) =
+                                        self.tabs.get_mut(self.active_tab_idx)
+                                    {
+                                        tab.selection = Some(TextSelection::new(
+                                            TextLocation::new(p, 0),
+                                            TextLocation::new(p, usize::MAX),
+                                        ));
+                                        tab.drag_start = None;
+                                        selection = tab.selection;
+                                        drag_start = None;
+                                    }
+                                }
+                                ViewerAction::SelectAllDocument => {
+                                    if let Some(Tab::Pdf(tab)) =
+                                        self.tabs.get_mut(self.active_tab_idx)
+                                    {
+                                        let last_p = tab.page_count.saturating_sub(1);
+                                        tab.selection = Some(TextSelection::new(
+                                            TextLocation::new(0, 0),
+                                            TextLocation::new(last_p, usize::MAX),
+                                        ));
+                                        tab.drag_start = None;
+                                        selection = tab.selection;
+                                        drag_start = None;
+                                    }
+                                }
+                            }
+                        }
 
                         if let Some(Tab::Pdf(tab)) = self.tabs.get_mut(self.active_tab_idx) {
                             tab.current_page = output.current_page;
@@ -1441,6 +1618,17 @@ impl eframe::App for PdfViewApp {
                             tab.last_viewport_top = output.viewport_top;
                             tab.last_scroll_offset_y = output.current_scroll_offset_y;
                             tab.scroll_offset_y = output.current_scroll_offset_y;
+                            tab.selection = selection;
+                            tab.drag_start = drag_start;
+                            tab.context_menu = context_menu;
+                            for req_page in output.text_requests {
+                                if tab.pending_text_requests.insert(req_page) {
+                                    let _ = self.tx_cmd.send(Command::PageText {
+                                        doc_id,
+                                        page: req_page,
+                                    });
+                                }
+                            }
                         }
 
                         for req in output.requests {
