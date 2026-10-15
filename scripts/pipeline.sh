@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 echo "=========================================================="
-echo "          VersoReader — Quality & CI Pipeline             "
+echo "          Verso Reader — Quality & CI Pipeline            "
 echo "=========================================================="
 
 cd "$REPO_DIR"

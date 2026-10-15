@@ -118,12 +118,13 @@ pub struct PdfViewApp {
     pub pinch_active: bool,
     pub pinch_last_active: Option<Instant>,
     pub last_scroll_unit: Option<egui::MouseWheelUnit>,
+    pub last_window_title: String,
     pub settings: Settings,
 }
 
 impl PdfViewApp {
     pub fn new(cc: &eframe::CreationContext<'_>, initial_path: Option<String>) -> Self {
-        cc.egui_ctx.set_visuals(egui::Visuals::dark());
+        crate::ui::theme::Theme::apply(&cc.egui_ctx);
 
         let (tx_cmd, rx_evt) = start_worker(cc.egui_ctx.clone());
 
@@ -167,6 +168,7 @@ impl PdfViewApp {
             pinch_active: false,
             pinch_last_active: None,
             last_scroll_unit: None,
+            last_window_title: "Verso Reader".to_string(),
             settings: Settings::load(),
         };
 
@@ -716,6 +718,22 @@ impl eframe::App for PdfViewApp {
         let elapsed = now.duration_since(self.last_frame_time).as_secs_f32() * 1000.0;
         self.last_frame_time = now;
         self.frame_time_ms = self.frame_time_ms * 0.9 + elapsed * 0.1;
+
+        // Synchronize viewport title with active document
+        let desired_title = if let Some(tab) = self.active_pdf_tab() {
+            if tab.title.is_empty() {
+                "Verso Reader".to_string()
+            } else {
+                format!("{} — Verso Reader", tab.title)
+            }
+        } else {
+            "Verso Reader".to_string()
+        };
+
+        if self.last_window_title != desired_title {
+            self.last_window_title = desired_title.clone();
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(desired_title));
+        }
 
         // Toggle debug display with F3
         if ctx.input(|i| i.key_pressed(egui::Key::F3)) {
@@ -2133,19 +2151,19 @@ mod tests {
     #[test]
     fn test_touchpad_scroll_multiplier_logic() {
         let mut settings = Settings::default();
-        assert_eq!(settings.touchpad_scroll_speed, 2.5);
+        assert_eq!(settings.touchpad_scroll_speed, 3.5);
         assert_eq!(settings.mouse_wheel_speed, 1.0);
 
         // When touchpad (Point) scroll occurs, multiplier should be settings.touchpad_scroll_speed
         let delta = egui::vec2(0.0, 10.0);
         let speed = settings.touchpad_scroll_speed.clamp(0.5, 10.0);
         let scaled = delta * speed;
-        assert_eq!(scaled.y, 25.0);
+        assert_eq!(scaled.y, 35.0);
 
         // Custom setting
-        settings.touchpad_scroll_speed = 3.5;
+        settings.touchpad_scroll_speed = 4.5;
         let speed2 = settings.touchpad_scroll_speed.clamp(0.5, 10.0);
         let scaled2 = delta * speed2;
-        assert_eq!(scaled2.y, 35.0);
+        assert_eq!(scaled2.y, 45.0);
     }
 }

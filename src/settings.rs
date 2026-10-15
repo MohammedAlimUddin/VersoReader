@@ -17,7 +17,7 @@ fn default_highlighter_thickness() -> f32 {
 }
 
 fn default_touchpad_scroll_speed() -> f32 {
-    2.5
+    3.5
 }
 
 fn default_mouse_wheel_speed() -> f32 {
@@ -69,12 +69,20 @@ impl Default for Settings {
 }
 
 impl Settings {
-    /// Returns the canonical path `~/.config/pdfview/settings.toml`.
+    /// Returns the canonical path `~/.config/verso-reader/settings.toml` (falling back to legacy path if present).
     pub fn config_path() -> Option<PathBuf> {
-        BaseDirs::new().map(|base| base.config_dir().join("pdfview").join("settings.toml"))
+        BaseDirs::new().map(|base| {
+            let primary = base.config_dir().join("verso-reader").join("settings.toml");
+            let legacy = base.config_dir().join("pdfview").join("settings.toml");
+            if primary.exists() || !legacy.exists() {
+                primary
+            } else {
+                legacy
+            }
+        })
     }
 
-    /// Loads settings from `~/.config/pdfview/settings.toml`, returning defaults on error or missing file.
+    /// Loads settings from `~/.config/verso-reader/settings.toml`, returning defaults on error or missing file.
     pub fn load() -> Self {
         if let Some(path) = Self::config_path() {
             if path.exists() {
@@ -88,7 +96,7 @@ impl Settings {
         Self::default()
     }
 
-    /// Saves settings to `~/.config/pdfview/settings.toml`.
+    /// Saves settings to `~/.config/verso-reader/settings.toml`.
     pub fn save(&self) -> Result<(), std::io::Error> {
         if let Some(path) = Self::config_path() {
             if let Some(parent) = path.parent() {
@@ -114,7 +122,7 @@ mod tests {
         assert_eq!(s.text_color, AnnotationColor::new(0, 0, 0));
         assert!(!s.sidebar_open);
         assert!(!s.pathbar_collapsed);
-        assert_eq!(s.touchpad_scroll_speed, 2.5);
+        assert_eq!(s.touchpad_scroll_speed, 3.5);
         assert_eq!(s.mouse_wheel_speed, 1.0);
     }
 
