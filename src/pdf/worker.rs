@@ -34,7 +34,19 @@ pub fn candidate_library_paths() -> Vec<PathBuf> {
         }
     }
 
-    // 3. ./lib
+    // 3. ~/.local/lib/pdfview
+    if let Some(base_dirs) = directories::BaseDirs::new() {
+        paths.push(
+            base_dirs
+                .home_dir()
+                .join(".local")
+                .join("lib")
+                .join("pdfview")
+                .join(Pdfium::pdfium_platform_library_name_at_path("")),
+        );
+    }
+
+    // 4. ./lib
     paths.push(PathBuf::from("./lib").join(Pdfium::pdfium_platform_library_name_at_path("")));
 
     paths
@@ -1399,6 +1411,10 @@ pub fn extract_page_text(doc: &PdfDocument, page_idx: usize) -> Option<PageTextD
 mod tests {
     use super::*;
 
+    // Mutex to ensure tests calling Pdfium or spawning the worker execute sequentially,
+    // adhering strictly to Rule 3 (single-threaded Pdfium engine).
+    static TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn test_candidate_paths_not_empty() {
         let paths = candidate_library_paths();
@@ -1410,6 +1426,7 @@ mod tests {
 
     #[test]
     fn test_bind_pdfium_with_local_lib() {
+        let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let res = bind_pdfium();
         assert!(
             res.is_ok(),
@@ -1420,6 +1437,7 @@ mod tests {
 
     #[test]
     fn test_worker_open_and_render_fixture() {
+        let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let pdfium = bind_pdfium().expect("Pdfium must be available for fixture test");
         let path = PathBuf::from("fixtures/MLE.pdf");
         if !path.exists() {
@@ -1452,7 +1470,53 @@ mod tests {
     }
 
     #[test]
+    fn test_performance_audit_cold_start_metrics() {
+        let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let t0 = std::time::Instant::now();
+        let pdfium = bind_pdfium().expect("Pdfium bind");
+        let t_bind = t0.elapsed();
+
+        let path = PathBuf::from("fixtures/MLE.pdf");
+        if !path.exists() {
+            return;
+        }
+
+        let t_load_start = std::time::Instant::now();
+        let doc = pdfium
+            .load_pdf_from_file(&path, None)
+            .expect("load MLE.pdf");
+        let t_load = t_load_start.elapsed();
+
+        let t_render_start = std::time::Instant::now();
+        let page = doc.pages().get(0).expect("get page 0");
+        let render_config = PdfRenderConfig::new().set_target_width(800);
+        let bitmap = page.render_with_config(&render_config).expect("render");
+        let t_render = t_render_start.elapsed();
+        let total_time = t0.elapsed();
+
+        println!("\n=== PERFORMANCE AUDIT METRICS ===");
+        println!("• Pdfium binding time: {:?}", t_bind);
+        println!("• Document load time: {:?}", t_load);
+        println!("• Page 0 render time (800px): {:?}", t_render);
+        println!("• Total cold start to first page: {:?}", total_time);
+        println!(
+            "• Bitmap size: {}x{} ({} bytes)",
+            bitmap.width(),
+            bitmap.height(),
+            bitmap.as_rgba_bytes().len()
+        );
+        println!("=================================\n");
+
+        assert!(
+            total_time.as_millis() < 300,
+            "Cold start to first page must be < 300ms (got {:?})",
+            total_time
+        );
+    }
+
+    #[test]
     fn test_worker_open_large_book_fixture() {
+        let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let pdfium = bind_pdfium().expect("Pdfium must be available for fixture test");
         let path =
             PathBuf::from("fixtures/Modern Operating Systems 4th Edition--Andrew Tanenbaum.pdf");
@@ -1469,6 +1533,7 @@ mod tests {
 
     #[test]
     fn test_worker_open_and_close_multiple_tabs() {
+        let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let pdfium = bind_pdfium().expect("Pdfium must be available for fixture test");
         let path = PathBuf::from("fixtures/MLE.pdf");
         if !path.exists() {
@@ -1493,6 +1558,7 @@ mod tests {
 
     #[test]
     fn test_worker_extract_outline_large_book() {
+        let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let pdfium = bind_pdfium().expect("Pdfium must be available for fixture test");
         let path =
             PathBuf::from("fixtures/Modern Operating Systems 4th Edition--Andrew Tanenbaum.pdf");
@@ -1513,6 +1579,7 @@ mod tests {
 
     #[test]
     fn test_worker_search_page_fixture() {
+        let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let pdfium = bind_pdfium().expect("Pdfium must be available for fixture test");
         let path = PathBuf::from("fixtures/MLE.pdf");
         if !path.exists() {
@@ -1581,6 +1648,7 @@ mod tests {
 
     #[test]
     fn test_worker_extract_page_text() {
+        let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let pdfium = bind_pdfium().expect("Pdfium must be available for fixture test");
         let path = PathBuf::from("fixtures/MLE.pdf");
         if !path.exists() {
@@ -1628,6 +1696,7 @@ mod tests {
 
     #[test]
     fn test_worker_extract_text_for_copy() {
+        let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let pdfium = bind_pdfium().expect("Pdfium must be available for fixture test");
         let path = PathBuf::from("fixtures/MLE.pdf");
         if !path.exists() {
@@ -1645,6 +1714,7 @@ mod tests {
 
     #[test]
     fn test_worker_create_highlight_and_save() {
+        let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let pdfium = bind_pdfium().expect("Pdfium must be available for fixture test");
         let path = PathBuf::from("fixtures/MLE.pdf");
         if !path.exists() {
@@ -1696,6 +1766,7 @@ mod tests {
 
     #[test]
     fn test_worker_create_ink_annotation_and_save() {
+        let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let pdfium = bind_pdfium().expect("Pdfium must be available for fixture test");
         let path = PathBuf::from("fixtures/MLE.pdf");
         if !path.exists() {
@@ -1755,6 +1826,7 @@ mod tests {
 
     #[test]
     fn test_worker_highlight_render_multiply_blending() {
+        let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let pdfium = bind_pdfium().expect("Pdfium must be available for fixture test");
         let path = PathBuf::from("fixtures/MLE.pdf");
         if !path.exists() {
@@ -1842,6 +1914,7 @@ mod tests {
 
     #[test]
     fn test_worker_queue_priority_and_generation_pruning() {
+        let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let path = PathBuf::from("fixtures/MLE.pdf");
         if !path.exists() {
             return;
@@ -1930,12 +2003,14 @@ mod tests {
             panic!("Expected Rendered event, got {:?}", evt2);
         }
 
-        // Close doc
+        // Close doc and shutdown worker cleanly
         tx_cmd.send(Command::Close { doc_id }).unwrap();
+        tx_cmd.send(Command::Shutdown).unwrap();
     }
 
     #[test]
     fn test_worker_extract_annotations_roundtrip() {
+        let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let pdfium = bind_pdfium().expect("Pdfium must be available for fixture test");
         let path = PathBuf::from("fixtures/MLE.pdf");
         if !path.exists() {
@@ -2009,6 +2084,7 @@ mod tests {
 
     #[test]
     fn test_worker_text_box_annotations_roundtrip() {
+        let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let pdfium = bind_pdfium().expect("Pdfium must be available for fixture test");
         let path = PathBuf::from("fixtures/MLE.pdf");
         if !path.exists() {
@@ -2074,6 +2150,7 @@ mod tests {
 
     #[test]
     fn test_apply_highlights_to_doc_renders_multiply_bitmap() {
+        let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let pdfium = bind_pdfium().expect("Pdfium must be available for fixture test");
         let path = PathBuf::from("fixtures/MLE.pdf");
         if !path.exists() {
@@ -2177,6 +2254,7 @@ mod tests {
 
     #[test]
     fn test_extract_annotations_from_existing_fixture_mle() {
+        let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let pdfium = bind_pdfium().expect("Pdfium must be available for fixture test");
         let path = PathBuf::from("fixtures/MLE.pdf");
         if !path.exists() {
@@ -2261,5 +2339,182 @@ mod tests {
         assert_eq!(parse_font_size_from_metadata("size=16"), Some(16.0));
         assert_eq!(parse_font_size_from_metadata("author_name"), None);
         assert_eq!(parse_font_size_from_metadata("size=2000"), None); // clamped
+    }
+
+    #[test]
+    fn test_worker_stress_rapid_open_close_leak_audit() {
+        let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let src_path = PathBuf::from("fixtures/MLE.pdf");
+        if !src_path.exists() {
+            return;
+        }
+
+        let temp_path =
+            std::env::temp_dir().join(format!("verso_stress_leak_{}.pdf", std::process::id()));
+        if let Err(e) = std::fs::copy(&src_path, &temp_path) {
+            eprintln!("Failed to copy fixture for stress test: {e}");
+            return;
+        }
+
+        let ctx = egui::Context::default();
+        let (tx_cmd, rx_evt) = start_worker(ctx);
+        let ready = rx_evt
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .expect("Worker must send PdfiumReady");
+        assert!(matches!(ready, Event::PdfiumReady));
+
+        // Rapidly open and close documents in a loop 20 times
+        for i in 1..=20 {
+            let doc_id = i as u64;
+            tx_cmd
+                .send(Command::Open {
+                    doc_id,
+                    path: temp_path.clone(),
+                })
+                .unwrap();
+
+            let evt = rx_evt
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("Worker must respond with Open event");
+            assert!(
+                matches!(evt, Event::Opened { doc_id: d, .. } if d == doc_id),
+                "Expected Opened event for doc_id {doc_id}, got {evt:?}"
+            );
+
+            tx_cmd.send(Command::Close { doc_id }).unwrap();
+        }
+
+        tx_cmd.send(Command::Shutdown).unwrap();
+        let _ = std::fs::remove_file(temp_path);
+    }
+
+    #[test]
+    fn test_worker_stress_large_book_multipage_render_load() {
+        let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let path =
+            PathBuf::from("fixtures/Modern Operating Systems 4th Edition--Andrew Tanenbaum.pdf");
+        if !path.exists() {
+            return;
+        }
+
+        let ctx = egui::Context::default();
+        let (tx_cmd, rx_evt) = start_worker(ctx);
+        let ready = rx_evt
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .expect("Worker must send PdfiumReady");
+        assert!(matches!(ready, Event::PdfiumReady));
+
+        let doc_id = 888;
+        tx_cmd
+            .send(Command::Open {
+                doc_id,
+                path: path.clone(),
+            })
+            .unwrap();
+
+        let evt = rx_evt
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("Worker must open large book");
+        let page_count = match evt {
+            Event::Opened { page_count, .. } => page_count,
+            other => panic!("Expected Opened event, got {:?}", other),
+        };
+        assert!(page_count > 100, "Large book fixture must have > 100 pages");
+
+        // Queue high-res renders for multiple distant pages (simulating fast jumps and 300% zoom)
+        use crate::pdf::types::RenderCommand;
+        let test_pages = [0, 5, 20, 50, 100.min(page_count - 1)];
+        for &p in &test_pages {
+            tx_cmd
+                .send(Command::Render(RenderCommand {
+                    doc_id,
+                    page: p,
+                    width_px: 2400, // 300% zoom
+                    rotation: 0,
+                    generation: 1,
+                    priority: 1,
+                }))
+                .unwrap();
+        }
+
+        // Receive all renders without crashes or timeout
+        let mut received = 0;
+        while received < test_pages.len() {
+            let evt = rx_evt
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("Must receive render result");
+            if let Event::Rendered(res) = evt {
+                assert_eq!(res.doc_id, doc_id);
+                assert!(res.bitmap_width_px > 0);
+                assert!(res.height_px > 0);
+                assert_eq!(
+                    res.rgba.len(),
+                    (res.bitmap_width_px * res.height_px * 4) as usize
+                );
+                received += 1;
+            }
+        }
+        assert_eq!(received, test_pages.len());
+
+        tx_cmd.send(Command::Close { doc_id }).unwrap();
+        tx_cmd.send(Command::Shutdown).unwrap();
+    }
+
+    #[test]
+    fn test_worker_corrupt_file_graceful_handling() {
+        let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        // Create a temporary corrupted non-PDF file
+        let temp_dir = std::env::temp_dir();
+        let corrupt_path = temp_dir.join("verso_corrupt_test.pdf");
+        std::fs::write(&corrupt_path, b"CORRUPTED_NOT_A_REAL_PDF_HEADER_12345").unwrap();
+
+        let ctx = egui::Context::default();
+        let (tx_cmd, rx_evt) = start_worker(ctx);
+        let ready = rx_evt
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .expect("Worker must send PdfiumReady");
+        assert!(matches!(ready, Event::PdfiumReady));
+
+        let doc_id = 777;
+        tx_cmd
+            .send(Command::Open {
+                doc_id,
+                path: corrupt_path.clone(),
+            })
+            .unwrap();
+
+        let evt = rx_evt
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .expect("Worker must respond to corrupt open");
+
+        match evt {
+            Event::OpenError { doc_id: d, error } => {
+                assert_eq!(d, doc_id);
+                assert!(
+                    error.contains("Failed to open PDF"),
+                    "Error message should explain failure gracefully: {error}"
+                );
+            }
+            other => panic!("Expected OpenError for corrupt file, got {:?}", other),
+        }
+
+        let _ = std::fs::remove_file(corrupt_path);
+
+        // Verify worker is still healthy and can open a valid file immediately after
+        let valid_path = PathBuf::from("fixtures/MLE.pdf");
+        if valid_path.exists() {
+            tx_cmd
+                .send(Command::Open {
+                    doc_id: 778,
+                    path: valid_path,
+                })
+                .unwrap();
+            let evt2 = rx_evt
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .expect("Worker must remain operational after error");
+            assert!(matches!(evt2, Event::Opened { doc_id: 778, .. }));
+            tx_cmd.send(Command::Close { doc_id: 778 }).unwrap();
+        }
+        tx_cmd.send(Command::Shutdown).unwrap();
     }
 }
