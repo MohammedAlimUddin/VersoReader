@@ -377,7 +377,7 @@
     - 100% portable: uses native cross-platform `egui::Event::MouseWheel` units without OS-specific API calls, ensuring identical behavior across Linux (Wayland/X11) and Windows (Precision Touchpads).
     - Added automated unit test `test_touchpad_scroll_multiplier_logic` (54 passing tests).
 - **Known-broken / Deferred:**
-  - Text tool (Milestone 9) is scheduled for the next milestone.
+  - None for Milestone 8.
 - **Manual Verification Checklist:**
   - [x] Drag highlighter over text and release: highlight never vanishes or flickers, staying visible immediately on release.
   - [x] Text underneath remains completely dark, crisp, and legible immediately upon highlighting ("gold" quality live, pitch-black text, vibrant color).
@@ -389,5 +389,109 @@
   - [x] Eraser removes both text highlights and freehand ink strokes; `Ctrl+Z` brings them back.
   - [x] Zoom and rotate: all highlights and ink strokes stay perfectly glued to the page without blank screen flashes.
   - [x] Two-finger touchpad scrolling is fast, fluid, responsive, and matches Edge/browser scrolling speed without affecting Ctrl+scroll zoom or discrete mouse wheels.
+
+---
+
+## Milestone 9 — Text tool
+- **Status:** Completed
+- **Done:**
+  - **Text Box Data Model & Undo/Redo (`src/annotations.rs`)**:
+    - Created `TextBox` struct with `id: u64`, `page: usize`, `pos: [f32; 2]`, `text: String`, `font_size: f32`, `color: AnnotationColor`, `width: f32`.
+    - Implemented `estimated_height()`, `bounding_rect()`, and canonical hit-testing `contains_canonical_point(pt)` with 4pt tolerance.
+    - Created `EditingTextBox` representing live inline typing state with `new()`, `from_existing()`, and `to_text_box()` (auto-discarding whitespace-only entries).
+    - Monotonic `generate_text_box_id() -> u64` ID generator.
+    - Extended `DocumentAnnotations` schema (v2) with `#[serde(default)] pub text_boxes: Vec<TextBox>`.
+    - Added `AddTextBox`, `DeleteTextBox`, `ModifyTextBox` actions to `AnnotationAction` and `UndoStack`, supporting full `Ctrl+Z` / `Ctrl+Y` undo and redo.
+    - Added preset text colors `PRESET_TEXT_COLORS: [AnnotationColor; 6]` (Black, Dark Gray, Navy Blue, Crimson Red, Forest Green, Purple).
+  - **Persistent Settings (`src/settings.rs`)**:
+    - Added `text_font_size: f32` (default 16.0 pt) and `text_color: AnnotationColor` (default black RGB 0, 0, 0), persisted to `~/.config/pdfview/settings.toml`.
+  - **Toolbar Controls (`src/ui/toolbar.rs`)**:
+    - `T Text` toggle button for `ActiveTool::Text`.
+    - Font size dropdown selector (10pt, 12pt, 14pt, 16pt, 18pt, 24pt, 32pt, 36pt).
+    - Preset color picker popup with active selection indicator.
+  - **Native PDF `/FreeText` Embedding & Extraction (`src/pdf/worker.rs`)**:
+    - Implemented native ISO 32000 `/FreeText` annotation generation in `apply_annotations_to_doc`: sets contents, bounding rectangle, stroke/fill colors, and print/zoom/rotate flags.
+    - Automatic extraction of existing `/FreeText` annotations upon opening (`extract_annotations_from_doc`), preserving them without vanishing across reload and re-save cycles.
+    - Atomic file save (`Command::SaveDoc`) embeds `/FreeText` directly into the PDF file so opening in Microsoft Edge, Google Chrome, or Adobe Acrobat displays the text natively.
+    - Worker renders `/FreeText` annotations directly into page bitmaps with correct rotation and razor-sharp clarity.
+  - **Viewer Interaction & Inline Editing (`src/ui/viewer.rs`)**:
+    - Single click on page with Text tool places a new inline text box at the clicked point and focuses immediately.
+    - Inline multiline text typing with `egui::TextEdit::multiline`: Enter inserts a newline, clicking outside commits the box, empty/whitespace boxes are discarded.
+    - Single click on an existing text box selects it (blue outline) and allows drag-to-move across all rotations using `screen_to_canonical_delta`; mouse release records the move in the undo stack.
+    - Double click on an existing text box enters inline editing mode.
+    - `Delete` key deletes the selected text box (with undo support).
+    - Eraser tool deletes text boxes on click or drag.
+    - Stale / dragging overlay renders text immediately for zero-flicker responsiveness.
+  - **Quality Gates & Automated Unit Tests**:
+    - Passed `cargo fmt`.
+    - Passed `cargo clippy --all-targets -- -D warnings` with zero warnings.
+    - 57 automated unit tests passing (`test_text_box_undo_redo`, `test_worker_text_box_annotations_roundtrip`, `test_annotations_json_serialization_roundtrip`, `test_extract_annotations_from_existing_fixture_mle`, etc.).
+  - **Bug Fixes — Text Tool Refinements (User Feedback)**:
+    1. **Transparent Background & Exact Font Color**:
+       - Fixed issue where loss of focus filled the entire text box background with the selected color or black.
+       - Removed `set_fill_color` on PDFium `/FreeText` annotation (which was setting `/IC` Interior Color), ensuring the background is 100% transparent.
+       - Replaced line-by-line painter with `painter.galley(screen_pos, galley, text_col)` which continuously paints the text in the user's selected color at all times (not just when stale/dragging).
+    2. **Resizable Text Area**:
+       - Added interactive horizontal resize handle on the right edge of selected and actively-editing text boxes.
+       - Hovering the right edge displays `egui::CursorIcon::ResizeHorizontal`.
+       - Dragging the resize handle dynamically resizes `width` (`clamped >= 40.0 pt`), reflowing and wrapping multiline text in real time with proportional font metrics.
+       - Mouse release commits the new width, recording a `ModifyTextBox` entry in the `UndoStack` for full `Ctrl+Z` / `Ctrl+Y` undo/redo support.
+    3. **Discard Unsaved Annotations on Close**:
+       - Fixed issue where reopening a document without saving restored discarded/unsaved text from legacy sidecar JSON files.
+       - Removed auto-saving dirty annotations to `~/.local/share/pdfview/annotations/` on tab close, app exit, and debounced timers.
+       - Removed sidecar merging on document open: documents load directly from the PDF file, cleanly discarding any uncommitted edits when closing without saving (`Ctrl+S`).
+    4. **No Black Layer When Moving Text**:
+       - Fixed issue where moving text boxes caused black solid layers to cover the text.
+       - Removed opaque background fill during text box drag/selection; text remains rendered with full clarity and transparent background throughout movement and relocation.
+    - Added unit tests: `test_text_box_resize_and_wrapped_height` and `test_hit_test_resize_handle`.
+  - **Bug Fix — Crash (SIGSEGV) when Opening PDFs with Existing Annotations**:
+    - **Issue**: Running `./target/release/pdfview "fixtures/MLE.pdf"` resulted in `Segmentation fault (core dumped)`.
+    - **Root Cause**: In `pdfium-render = "=0.9.4"`, `PdfPageAnnotationPrivate::stroke_color_impl` has an upstream bug. When an annotation uses appearance streams (or has no direct `/C` color array), `FPDFAnnot_GetColor` returns `false`. `pdfium-render` attempts fallback by unsoundly casting the annotation handle to a page object (`self.handle() as FPDF_PAGEOBJECT`) and invoking `FPDFPageObj_GetStrokeColor(handle)`. Since `FPDF_ANNOTATION` is a `CPDF_Annot*` while `FPDF_PAGEOBJECT` is a `CPDF_PageObject*`, PDFium dereferenced invalid memory in `CPDF_ColorState::GetStrokeColorRef()`, causing a SIGSEGV.
+    - **Fix**: Replaced direct calls to `annot.stroke_color()` with `safe_extract_annot_color`, extracting stroke/fill colors directly from valid page objects within `annot.objects()`, or falling back safely to preset colors.
+    - **Regression Test**: Added `test_extract_annotations_from_existing_fixture_mle` verifying error-free extraction of all 7 highlights and 3 text boxes from `fixtures/MLE.pdf`.
+  - **Bug Fix — Elimination of Solid Black Rectangular Bars on Page Bitmaps**:
+    - **Issue**: Opening a document containing FreeText annotations (or creating/editing text boxes) caused solid black rectangular bars to appear directly on the page under the text (as shown in user screenshot `media_1792086379503_92d80f62.png`). In Microsoft Edge, the document opened and rendered text cleanly, but VersoReader showed black bars.
+    - **Root Cause**: PDFium's C++ rasterizer, when `render_annotations(true)` is set on `PdfRenderConfig`, renders `/FreeText` annotations without pre-calculated appearance streams (`/AP`) by filling their entire bounding box with the annotation's stroke/border color or black default. Because the in-memory `PdfDocument` kept `/FreeText` annotations on its pages, PDFium baked these solid black boxes directly into the page bitmap! Since egui renders the text boxes dynamically in `src/ui/viewer.rs`, having PDFium also rasterize them resulted in black bars under the text and black blocks left behind when moving text.
+    - **Fix**:
+      1. Upon opening (`Command::Open`), after `extract_annotations_from_doc(&doc)` extracts the text boxes into the UI, `apply_highlights_to_doc(&doc, &annotations)` cleans the in-memory `PdfDocument` of `/FreeText` annotations while keeping native multiply-blended highlights.
+      2. During live viewing and editing (`Command::SyncAnnotations`), only highlights are synchronized to the in-memory `PdfDocument`; text boxes are exclusively rendered by egui with transparent backgrounds and the exact user-selected font color.
+      3. On file save (`Command::SaveDoc`), `apply_annotations_to_doc` writes all `/FreeText` annotations into the PDF, serializes via `doc.save_to_bytes()`, and immediately restores the in-memory document to a clean state for uninterrupted viewing.
+    - **Verification**: Added pixel assertions in `test_extract_annotations_from_existing_fixture_mle` and `test_worker_text_box_annotations_roundtrip` ensuring zero black pixels and zero bitmap diffs on rendered pages.
+  - **Bug Fix — Text Tool Cursor & Click-Through Prevention (User Feedback)**:
+    1. **Normal Pointer Cursor**:
+       - With `ActiveTool::Text` active, the cursor remains the standard arrow pointer (`egui::CursorIcon::Default`) rather than switching to an I-beam icon (`CursorIcon::Text`).
+       - Underlying text hover only shows the I-beam selection cursor when `ActiveTool::None` is active.
+       - Toolbar color swatches and buttons display `PointingHand` cursor on hover.
+    2. **Click-Through Prevention When Choosing Colors / Options**:
+       - Fixed issue where selecting a color or option from floating dropdowns/popups clicked through to the PDF page underneath and created an unwanted text box.
+       - Added overlay detection (`ui.ctx().layer_id_at(pos)`) and popup open detection (`ui.memory(|m| m.any_popup_open())`), ensuring clicks on popup menus or clicks that dismiss open popups never spawn text boxes on the page.
+    4. **Text Font Size Persistence Across Document Restarts**:
+       - Fixed issue where text boxes of varying font sizes (e.g. 10pt, 24pt, 32pt) were reset to an identical 16pt default whenever the document was closed and reopened.
+       - Implemented metadata persistence in `apply_annotations_to_doc`: writes `VersoReader:size=<font_size>` into the annotation's creator/author field (`/T`) in PDFium.
+       - Implemented multi-tier extraction in `extract_annotations_from_doc`:
+         1. Reads exact font size from creator metadata (`VersoReader:size=...`).
+         2. Inspects embedded text objects within `annot.objects()`.
+         3. Calculates the geometric font size from the annotation's bounding box height and line count, snapping to standard presets (10, 12, 14, 16, 18, 20, 24, 28, 32, 36 pt).
+       - Added regression unit tests: `test_parse_font_size_from_metadata` and font size roundtrip assertions in `test_worker_text_box_annotations_roundtrip` and `test_extract_annotations_from_existing_fixture_mle`.
+- **Known-broken / Deferred:**
+  - Export copy of PDF (Milestone 10) is scheduled next.
+- **Manual Verification Checklist:**
+  - [x] Launch `cargo run --release -- "fixtures/MLE.pdf"`: opens immediately without segmentation fault.
+  - [x] Click `T Text` in toolbar: toolbar displays font size and color picker. Cursor remains standard arrow (not I-beam).
+  - [x] Click color picker dropdown in toolbar: click any color swatch. No text box is created on the page.
+  - [x] Click on a page: an inline text box appears and typing begins immediately.
+  - [x] With text box selected or being edited, change color in toolbar: text box color updates immediately with undo/redo support.
+  - [x] Create multiple text boxes with different font sizes (e.g. 10pt, 24pt, 32pt) and save (`Ctrl+S`).
+  - [x] Reopen document: all text boxes retain their exact original font sizes without getting reset or made equal.
+  - [x] Press Enter: creates a new line in the text box.
+  - [x] Click outside: commits the text box; background remains 100% transparent and only font color reflects chosen color.
+  - [x] Hover right edge of selected text box: cursor changes to `ResizeHorizontal`. Dragging resizes the text box width and reflows text.
+  - [x] Double-click an existing text box: re-enters inline editing.
+  - [x] Click and drag an existing text box: moves smoothly without black layer covering text; text stays crisp and visible throughout.
+  - [x] Press `Delete` key on a selected text box: deletes the box; `Ctrl+Z` restores it.
+  - [x] Click Eraser and click a text box: deletes the text box.
+  - [x] Close document without saving (`Ctrl+S`): unsaved text is cleanly discarded and does not reappear on reopen.
+  - [x] Press `Ctrl+S` / Save: tab star mark disappears.
+  - [x] Open the saved PDF in Microsoft Edge or Google Chrome: text box annotations appear natively embedded in the PDF file with transparent background.
 
 

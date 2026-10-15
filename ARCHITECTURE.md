@@ -131,16 +131,18 @@ PROGRESS.md        Milestone checklist and verification status
 ---
 
 ## 7. Annotation Storage & Lifecycle
-* **Storage Invariant**: Annotations (`Highlight`) are stored strictly in canonical coordinates (points, unrotated, origin top-left).
+* **Storage Invariant**: Annotations (`Highlight`, `TextBox`) are stored strictly in canonical coordinates (points, unrotated, origin top-left).
 * **Storage Path**: Persisted as JSON in `~/.local/share/pdfview/annotations/<blake3(abs path + file size)>.json`.
-* **Zero PDF Mutation**: The user's original PDF file is never modified or overwritten under any circumstances.
-* **Autosave & Persistence**:
-  - Debounced autosave (~500 ms) scheduled after user interaction.
-  - Immediate synchronous save upon tab close (`close_tab`) and application exit (`on_exit`).
-  - Automatic load upon document open in `Event::Opened`.
-* **Undo / Redo**: Bounded per-tab undo/redo stack (`UndoStack`, max 50 actions) for highlight creation and deletion, bound to `Ctrl+Z` and `Ctrl+Y` / `Ctrl+Shift+Z`.
+* **Direct PDF Embedding (`Ctrl+S`)**: Native ISO 32000 `/Highlight`, `/Ink`, and `/FreeText` annotations are embedded directly into the document using an atomic temporary-file-and-rename pipeline, enabling seamless viewing across Microsoft Edge, Chrome, and Adobe Acrobat.
+* **Document Persistence & Lifecycle**:
+  - When opening a document, annotations are extracted directly from the PDF file (`extract_annotations_from_doc`).
+  - Unsaved annotations are discarded on tab close or exit without overwriting the user's PDF, ensuring pristine clean reopen states.
+  - Pressing `Ctrl+S` or clicking Save embeds all annotations into the PDF file.
+* **Undo / Redo**: Bounded per-tab undo/redo stack (`UndoStack`, max 50 actions) for highlights and text boxes (`Add`, `Delete`, `Modify`), bound to `Ctrl+Z` and `Ctrl+Y` / `Ctrl+Shift+Z`.
 * **Hit-Testing & Interaction Tools**:
-  - **Highlighter**: Dragging over text creates line-height-adjusted highlight rectangles (`adjust_rect_thickness`), centering the band vertically on lines. Double-clicking words in highlighter mode directly highlights the target word. Drawn as translucent overlays (`alpha ~ 0.35`) directly above page bitmaps through `PageTransform`.
-  - **Eraser**: Sets cursor to `Crosshair`. Clicking or dragging across highlights hit-tests points in canonical space and removes all intersected highlights, pushing deletions to the undo stack.
-  - **Settings**: Active highlighter color and thickness fraction persist in `~/.config/pdfview/settings.toml`.
+  - **Highlighter**: Dragging over text creates line-height-adjusted highlight rectangles (`adjust_rect_thickness`), centering the band vertically on lines. Dragging in whitespace or margins creates freehand ink strokes. Drawn with native PDFium `FXDIB_BLEND_MULTIPLY` blending.
+  - **Text Tool**: Clicking on a page creates an inline `egui::TextEdit::multiline` text box. Double-clicking existing boxes edits them; clicking and dragging moves them across pages with full rotation support; pressing `Delete` deletes selected boxes; empty boxes are discarded on commit. Text is rendered continuously using egui's text layout engine over a transparent background matching the selected font color.
+  - **Text Box Resizing**: Selected and actively editing text boxes feature an interactive circular handle on the right edge. Hovering displays `CursorIcon::ResizeHorizontal`; dragging resizes box width (clamped $\ge 40\text{ pt}$) with dynamic multiline text reflow and wrapping; mouse release pushes an undoable `ModifyTextBox` action.
+  - **Eraser**: Sets cursor to `Crosshair`. Clicking or dragging across highlights or text boxes hit-tests points in canonical space and deletes them, pushing deletions to the undo stack.
+  - **Settings**: Active highlighter color/thickness, text font size, text color, and touchpad/mouse wheel multipliers persist in `~/.config/pdfview/settings.toml`.
 

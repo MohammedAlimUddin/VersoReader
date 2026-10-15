@@ -6,7 +6,7 @@ use std::thread;
 use crossbeam_channel::{Receiver, Sender};
 use pdfium_render::prelude::*;
 
-use crate::annotations::{AnnotationColor, Highlight};
+use crate::annotations::{AnnotationColor, Highlight, TextBox};
 use crate::pdf::types::{
     CanonicalRect, CharBox, Command, DocId, Event, LineBox, OutlineItem, PageSize, PageTextData,
     RenderResult, SearchMatch,
@@ -209,13 +209,15 @@ fn worker_main(ctx: egui::Context, rx_cmd: Receiver<Command>, tx_evt: Sender<Eve
                                     }
                                 }
 
-                                let annotations = extract_annotations_from_doc(&doc);
+                                let (annotations, text_boxes) = extract_annotations_from_doc(&doc);
+                                let _ = apply_highlights_to_doc(&doc, &annotations);
                                 documents.insert(doc_id, doc);
                                 let _ = tx_evt.send(Event::Opened {
                                     doc_id,
                                     page_count,
                                     page_sizes,
                                     annotations,
+                                    text_boxes,
                                 });
                                 ctx.request_repaint();
                             }
@@ -474,7 +476,11 @@ fn worker_main(ctx: egui::Context, rx_cmd: Receiver<Command>, tx_evt: Sender<Eve
                         }
                     }
                 }
-                Command::SyncAnnotations { doc_id, highlights } => {
+                Command::SyncAnnotations {
+                    doc_id,
+                    highlights,
+                    text_boxes: _,
+                } => {
                     if let Some(doc) = documents.get(&doc_id) {
                         let _ = apply_highlights_to_doc(doc, &highlights);
                     }
@@ -483,52 +489,59 @@ fn worker_main(ctx: egui::Context, rx_cmd: Receiver<Command>, tx_evt: Sender<Eve
                     doc_id,
                     path,
                     highlights,
+                    text_boxes,
                 } => {
                     if let Some(doc) = documents.get(&doc_id) {
-                        match apply_highlights_to_doc(doc, &highlights) {
-                            Ok(_) => match doc.save_to_bytes() {
-                                Ok(bytes) => {
-                                    let tmp_path = path.with_extension("pdf.tmp_pdfview");
-                                    match std::fs::write(&tmp_path, &bytes) {
-                                        Ok(_) => match std::fs::rename(&tmp_path, &path) {
-                                            Ok(_) => {
-                                                let _ = tx_evt.send(Event::Saved {
-                                                    doc_id,
-                                                    success: true,
-                                                    error: None,
-                                                });
-                                            }
+                        match apply_annotations_to_doc(doc, &highlights, &text_boxes) {
+                            Ok(_) => {
+                                let save_res = doc.save_to_bytes();
+                                // Keep in-memory document clean of FreeText annotations so PDFium won't render black boxes
+                                let _ = apply_highlights_to_doc(doc, &highlights);
+                                match save_res {
+                                    Ok(bytes) => {
+                                        let tmp_path = path.with_extension("pdf.tmp_pdfview");
+                                        match std::fs::write(&tmp_path, &bytes) {
+                                            Ok(_) => match std::fs::rename(&tmp_path, &path) {
+                                                Ok(_) => {
+                                                    let _ = tx_evt.send(Event::Saved {
+                                                        doc_id,
+                                                        success: true,
+                                                        error: None,
+                                                    });
+                                                }
+                                                Err(err) => {
+                                                    let _ = std::fs::remove_file(&tmp_path);
+                                                    let _ = tx_evt.send(Event::Saved {
+                                                        doc_id,
+                                                        success: false,
+                                                        error: Some(format!(
+                                                            "Failed to overwrite PDF: {err}"
+                                                        )),
+                                                    });
+                                                }
+                                            },
                                             Err(err) => {
-                                                let _ = std::fs::remove_file(&tmp_path);
                                                 let _ = tx_evt.send(Event::Saved {
                                                     doc_id,
                                                     success: false,
                                                     error: Some(format!(
-                                                        "Failed to overwrite PDF: {err}"
+                                                        "Failed to write temporary file: {err}"
                                                     )),
                                                 });
                                             }
-                                        },
-                                        Err(err) => {
-                                            let _ = tx_evt.send(Event::Saved {
-                                                doc_id,
-                                                success: false,
-                                                error: Some(format!(
-                                                    "Failed to write temporary file: {err}"
-                                                )),
-                                            });
                                         }
                                     }
+                                    Err(err) => {
+                                        let _ = tx_evt.send(Event::Saved {
+                                            doc_id,
+                                            success: false,
+                                            error: Some(format!("Failed to serialize PDF: {err}")),
+                                        });
+                                    }
                                 }
-                                Err(err) => {
-                                    let _ = tx_evt.send(Event::Saved {
-                                        doc_id,
-                                        success: false,
-                                        error: Some(format!("Failed to serialize PDF: {err}")),
-                                    });
-                                }
-                            },
+                            }
                             Err(err) => {
+                                let _ = apply_highlights_to_doc(doc, &highlights);
                                 let _ = tx_evt.send(Event::Saved {
                                     doc_id,
                                     success: false,
@@ -685,9 +698,106 @@ fn merge_line_rects(rects: Vec<CanonicalRect>) -> Vec<CanonicalRect> {
     result
 }
 
-/// Extracts all existing Highlight and Ink annotations from a PdfDocument's pages into canonical Highlights.
-pub fn extract_annotations_from_doc(doc: &PdfDocument) -> Vec<Highlight> {
+fn safe_extract_annot_color(
+    objects: &PdfPageAnnotationObjects,
+    default_color: AnnotationColor,
+) -> AnnotationColor {
+    for obj in objects.iter() {
+        if let Ok(c) = obj.fill_color() {
+            if c.red() > 0 || c.green() > 0 || c.blue() > 0 {
+                return AnnotationColor::new(c.red(), c.green(), c.blue());
+            }
+        }
+        if let Ok(c) = obj.stroke_color() {
+            if c.red() > 0 || c.green() > 0 || c.blue() > 0 {
+                return AnnotationColor::new(c.red(), c.green(), c.blue());
+            }
+        }
+    }
+    default_color
+}
+
+fn parse_font_size_from_metadata(s: &str) -> Option<f32> {
+    if let Some(idx) = s.find("size=") {
+        let rest = &s[idx + 5..];
+        let num_str: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '.')
+            .collect();
+        if let Ok(v) = num_str.parse::<f32>() {
+            if (6.0..=120.0).contains(&v) {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
+fn safe_extract_annot_font_size(
+    annot: &PdfPageAnnotation,
+    objects: &PdfPageAnnotationObjects,
+    text: &str,
+    default_font_size: f32,
+) -> f32 {
+    // 1. Try to read size encoded in creator metadata (e.g. "VersoReader:size=24.0")
+    if let Some(creator) = annot.creator() {
+        if let Some(size) = parse_font_size_from_metadata(&creator) {
+            return size;
+        }
+    }
+
+    // 2. Try to inspect any embedded text objects within the annotation
+    for obj in objects.iter() {
+        if let Some(text_obj) = obj.as_text_object() {
+            let size = text_obj.unscaled_font_size().value;
+            if size > 0.0 {
+                return size;
+            }
+        }
+    }
+
+    // 3. Estimate from annotation bounding box height and line count
+    if let Ok(b) = annot.bounds() {
+        let box_h = (b.top().value - b.bottom().value).abs();
+        let width = (b.right().value - b.left().value).abs().max(40.0);
+        let chars_per_line = (width / (16.0 * 0.52)).max(1.0);
+        let mut total_lines = 0.0;
+        for line in text.lines() {
+            let count = (line.chars().count() as f32 / chars_per_line)
+                .ceil()
+                .max(1.0);
+            total_lines += count;
+        }
+        if total_lines == 0.0 {
+            total_lines = 1.0;
+        }
+
+        let line_h = ((box_h - 8.0) / total_lines).max(12.0);
+        let approx_size = line_h / 1.3;
+
+        const PRESETS: [f32; 10] = [10.0, 12.0, 14.0, 16.0, 18.0, 20.0, 24.0, 28.0, 32.0, 36.0];
+        let mut best_preset = default_font_size;
+        let mut min_diff = f32::MAX;
+        for &p in &PRESETS {
+            let diff = (approx_size - p).abs();
+            if diff < min_diff {
+                min_diff = diff;
+                best_preset = p;
+            }
+        }
+        if min_diff <= 2.5 {
+            return best_preset;
+        }
+        return approx_size.clamp(8.0, 72.0);
+    }
+
+    default_font_size
+}
+
+/// Extracts all existing Highlight, Ink, and FreeText annotations from a PdfDocument's pages into canonical models.
+pub fn extract_annotations_from_doc(doc: &PdfDocument) -> (Vec<Highlight>, Vec<TextBox>) {
     let mut highlights = Vec::new();
+    let mut text_boxes = Vec::new();
     let page_count = doc.pages().len() as usize;
 
     for page_idx in 0..page_count {
@@ -704,11 +814,10 @@ pub fn extract_annotations_from_doc(doc: &PdfDocument) -> Vec<Highlight> {
             };
 
             if let Some(hl_annot) = annot.as_highlight_annotation_mut() {
-                let color = hl_annot
-                    .stroke_color()
-                    .or_else(|_| hl_annot.fill_color())
-                    .unwrap_or(PdfColor::new(255, 235, 59, 255));
-                let annot_color = AnnotationColor::new(color.red(), color.green(), color.blue());
+                let annot_color = safe_extract_annot_color(
+                    hl_annot.objects(),
+                    AnnotationColor::new(255, 235, 59),
+                );
 
                 let mut rects = Vec::new();
                 let pts = hl_annot.attachment_points_mut();
@@ -820,19 +929,60 @@ pub fn extract_annotations_from_doc(doc: &PdfDocument) -> Vec<Highlight> {
                         thickness: stroke_width,
                     });
                 }
+            } else if annot.annotation_type() == PdfPageAnnotationType::FreeText {
+                let text = annot.contents().unwrap_or_default();
+                if !text.is_empty() {
+                    let annot_color = if !annot.objects().is_empty() {
+                        safe_extract_annot_color(annot.objects(), AnnotationColor::new(0, 0, 0))
+                    } else {
+                        annot
+                            .stroke_color()
+                            .or_else(|_| annot.fill_color())
+                            .map(|c| AnnotationColor::new(c.red(), c.green(), c.blue()))
+                            .unwrap_or(AnnotationColor::new(0, 0, 0))
+                    };
+                    let (pos, width) = if let Ok(b) = annot.bounds() {
+                        let min_x = b.left().value;
+                        let min_y = (page_h - b.top().value).max(0.0);
+                        let w = (b.right().value - b.left().value).abs();
+                        ([min_x, min_y], w.max(40.0))
+                    } else {
+                        ([50.0, 50.0], 180.0)
+                    };
+                    let font_size =
+                        safe_extract_annot_font_size(&annot, annot.objects(), &text, 16.0);
+                    text_boxes.push(TextBox {
+                        id: crate::annotations::generate_text_box_id(),
+                        page: page_idx,
+                        pos,
+                        text,
+                        font_size,
+                        color: annot_color,
+                        width,
+                    });
+                }
             }
         }
     }
 
-    highlights
+    (highlights, text_boxes)
 }
 
-/// Applies highlights directly to a PdfDocument's pages in PDFium.
-/// Removes previous highlight and ink annotations and regenerates them according to `highlights`.
-pub fn apply_highlights_to_doc(doc: &PdfDocument, highlights: &[Highlight]) -> Result<(), String> {
+/// Applies highlights and text boxes directly to a PdfDocument's pages in PDFium.
+/// Removes previous highlight, ink, and free text annotations and regenerates them.
+pub fn apply_annotations_to_doc(
+    doc: &PdfDocument,
+    highlights: &[Highlight],
+    text_boxes: &[TextBox],
+) -> Result<(), String> {
     let mut page_map: HashMap<usize, Vec<&Highlight>> = HashMap::new();
     for hl in highlights {
         page_map.entry(hl.page).or_default().push(hl);
+    }
+
+    let mut text_box_map: HashMap<usize, Vec<&TextBox>> = HashMap::new();
+    for tb in text_boxes {
+        text_box_map.entry(tb.page).or_default().push(tb);
     }
 
     let page_count = doc.pages().len() as usize;
@@ -850,7 +1000,9 @@ pub fn apply_highlights_to_doc(doc: &PdfDocument, highlights: &[Highlight]) -> R
             if let Ok(annot) = annots.get(i) {
                 if matches!(
                     annot,
-                    PdfPageAnnotation::Highlight(_) | PdfPageAnnotation::Ink(_)
+                    PdfPageAnnotation::Highlight(_)
+                        | PdfPageAnnotation::Ink(_)
+                        | PdfPageAnnotation::FreeText(_)
                 ) {
                     let _ = annots.delete_annotation(annot);
                 }
@@ -934,10 +1086,37 @@ pub fn apply_highlights_to_doc(doc: &PdfDocument, highlights: &[Highlight]) -> R
             }
         }
 
+        if let Some(page_boxes) = text_box_map.get(&page_idx) {
+            for tb in page_boxes {
+                if let Ok(mut annot) = annots.create_free_text_annotation(&tb.text) {
+                    let pdf_left = tb.pos[0];
+                    let pdf_right = tb.pos[0] + tb.width.max(40.0);
+                    let box_h = tb.estimated_height();
+                    let pdf_bottom = (page_h - (tb.pos[1] + box_h)).max(0.0);
+                    let pdf_top = (page_h - tb.pos[1]).min(page_h);
+                    let pdf_rect =
+                        PdfRect::new_from_values(pdf_bottom, pdf_left, pdf_top, pdf_right);
+                    let _ = annot.set_bounds(pdf_rect);
+                    let color = PdfColor::new(tb.color.r, tb.color.g, tb.color.b, 255);
+                    let _ = annot.set_stroke_color(color);
+                    let _ = annot.set_is_printed(true);
+                    let _ = annot.set_is_zoomable(true);
+                    let _ = annot.set_is_rotatable(true);
+                    let _ = annot.set_creator(&format!("VersoReader:size={:.1}", tb.font_size));
+                }
+            }
+        }
+
         let _ = page.regenerate_content();
     }
 
     Ok(())
+}
+
+/// Helper wrapper for applying only highlights.
+#[allow(dead_code)]
+pub fn apply_highlights_to_doc(doc: &PdfDocument, highlights: &[Highlight]) -> Result<(), String> {
+    apply_annotations_to_doc(doc, highlights, &[])
 }
 
 /// Searches text on a single 1-based page of the document, returning matches in canonical coordinates.
@@ -1795,8 +1974,9 @@ mod tests {
             .load_pdf_from_byte_vec(bytes, None)
             .expect("reload from bytes");
 
-        let extracted = extract_annotations_from_doc(&reloaded_doc);
+        let (extracted, text_boxes) = extract_annotations_from_doc(&reloaded_doc);
         assert_eq!(extracted.len(), 2, "Must extract 2 annotations");
+        assert_eq!(text_boxes.len(), 0);
 
         // Now add a 3rd annotation and apply all 3 to the reloaded doc
         let hl3 = Highlight {
@@ -1819,11 +1999,76 @@ mod tests {
             .load_pdf_from_byte_vec(bytes2, None)
             .expect("reload from bytes2");
 
-        let extracted2 = extract_annotations_from_doc(&reloaded_doc2);
+        let (extracted2, _) = extract_annotations_from_doc(&reloaded_doc2);
         assert_eq!(
             extracted2.len(),
             3,
             "Must extract all 3 annotations without vanishing"
+        );
+    }
+
+    #[test]
+    fn test_worker_text_box_annotations_roundtrip() {
+        let pdfium = bind_pdfium().expect("Pdfium must be available for fixture test");
+        let path = PathBuf::from("fixtures/MLE.pdf");
+        if !path.exists() {
+            return;
+        }
+
+        let doc = pdfium
+            .load_pdf_from_file(&path, None)
+            .expect("load fixture");
+
+        let tb = TextBox {
+            id: 1,
+            page: 0,
+            pos: [100.0, 150.0],
+            text: "Hello VersoReader Text Box".to_string(),
+            font_size: 24.0,
+            color: AnnotationColor::new(192, 57, 43),
+            width: 200.0,
+        };
+
+        apply_annotations_to_doc(&doc, &[], std::slice::from_ref(&tb))
+            .expect("apply text box annotation");
+        let bytes = doc.save_to_bytes().expect("save to bytes");
+
+        let reloaded = pdfium
+            .load_pdf_from_byte_vec(bytes, None)
+            .expect("reload from bytes");
+
+        let (extracted_hl, extracted_tb) = extract_annotations_from_doc(&reloaded);
+        assert_eq!(extracted_hl.len(), 0);
+        assert_eq!(extracted_tb.len(), 1, "Must extract 1 text box annotation");
+        assert_eq!(extracted_tb[0].page, 0);
+        assert_eq!(extracted_tb[0].text, "Hello VersoReader Text Box");
+        assert_eq!(extracted_tb[0].font_size, 24.0);
+        assert_eq!(extracted_tb[0].color, AnnotationColor::new(192, 57, 43));
+
+        let render_config = PdfRenderConfig::new()
+            .set_target_width(800)
+            .render_annotations(true);
+        let clean_doc = pdfium.load_pdf_from_file(&path, None).unwrap();
+        apply_highlights_to_doc(&clean_doc, &[]).unwrap();
+        let orig_page = clean_doc.pages().get(0).unwrap();
+        let orig_bmp = orig_page.render_with_config(&render_config).unwrap();
+
+        // Clean reloaded doc of FreeText annotations as the worker does upon open
+        apply_highlights_to_doc(&reloaded, &extracted_hl).unwrap();
+        let page0 = reloaded.pages().get(0).unwrap();
+        let bmp = page0.render_with_config(&render_config).unwrap();
+        let orig_rgba = orig_bmp.as_rgba_bytes();
+        let bmp_rgba = bmp.as_rgba_bytes();
+
+        let mut diff_count = 0;
+        for (o, b) in orig_rgba.iter().zip(bmp_rgba.iter()) {
+            if o != b {
+                diff_count += 1;
+            }
+        }
+        assert_eq!(
+            diff_count, 0,
+            "Rendered page bitmap must have 0 diff pixels when FreeText is rendered by egui instead of PDFium"
         );
     }
 
@@ -1928,5 +2173,93 @@ mod tests {
             changed > 0,
             "apply_highlights_to_doc must affect rendered page bitmap"
         );
+    }
+
+    #[test]
+    fn test_extract_annotations_from_existing_fixture_mle() {
+        let pdfium = bind_pdfium().expect("Pdfium must be available for fixture test");
+        let path = PathBuf::from("fixtures/MLE.pdf");
+        if !path.exists() {
+            return;
+        }
+
+        let doc = pdfium
+            .load_pdf_from_file(&path, None)
+            .expect("load MLE.pdf");
+        let (extracted_hl, extracted_tb) = extract_annotations_from_doc(&doc);
+        assert!(
+            extracted_tb.len() >= 3,
+            "Must extract text boxes from MLE.pdf (got {})",
+            extracted_tb.len()
+        );
+
+        // Clean in-memory document of FreeText annotations so PDFium won't render black bars
+        apply_highlights_to_doc(&doc, &extracted_hl).expect("apply highlights only to clean doc");
+
+        let render_config = PdfRenderConfig::new()
+            .set_target_width(800)
+            .render_annotations(true);
+        let page = doc.pages().get(0).unwrap();
+        let bmp = page.render_with_config(&render_config).unwrap();
+        let rgba = bmp.as_rgba_bytes();
+        let w = bmp.width() as usize;
+        let scale = 800.0 / 612.0;
+
+        // Check pixels inside all text boxes: none should be solid black!
+        for tb in &extracted_tb {
+            let cx = tb.pos[0] + tb.width * 0.5;
+            let cy = tb.pos[1] + 10.0;
+            let px = (cx * scale) as usize;
+            let py = (cy * scale) as usize;
+            let idx = (py * w + px) * 4;
+            let pixel = [rgba[idx], rgba[idx + 1], rgba[idx + 2], rgba[idx + 3]];
+            println!(
+                "Pixel at ({}, {}) for TB '{}': {:?}",
+                px,
+                py,
+                tb.text.trim(),
+                pixel
+            );
+            assert_ne!(
+                pixel,
+                [0, 0, 0, 255],
+                "Pixel inside text box must NOT be solid black! Got: {:?}",
+                pixel
+            );
+        }
+
+        // Test saving with all annotations
+        apply_annotations_to_doc(&doc, &extracted_hl, &extracted_tb)
+            .expect("apply annotations for save");
+        let bytes = doc.save_to_bytes().expect("save to bytes");
+        let reloaded = pdfium.load_pdf_from_byte_vec(bytes, None).expect("reload");
+        let (re_hl, re_tb) = extract_annotations_from_doc(&reloaded);
+        assert_eq!(re_hl.len(), extracted_hl.len());
+        assert_eq!(re_tb.len(), extracted_tb.len());
+        for (tb, re) in extracted_tb.iter().zip(re_tb.iter()) {
+            assert_eq!(tb.text, re.text);
+            assert!(
+                (tb.font_size - re.font_size).abs() < 0.1,
+                "Font size must match across save/reload for '{}': expected {}, got {}",
+                tb.text.trim(),
+                tb.font_size,
+                re.font_size
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_font_size_from_metadata() {
+        assert_eq!(
+            parse_font_size_from_metadata("VersoReader:size=24.0"),
+            Some(24.0)
+        );
+        assert_eq!(
+            parse_font_size_from_metadata("VersoReader:size=10.5"),
+            Some(10.5)
+        );
+        assert_eq!(parse_font_size_from_metadata("size=16"), Some(16.0));
+        assert_eq!(parse_font_size_from_metadata("author_name"), None);
+        assert_eq!(parse_font_size_from_metadata("size=2000"), None); // clamped
     }
 }

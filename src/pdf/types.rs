@@ -380,12 +380,15 @@ pub enum Command {
     SyncAnnotations {
         doc_id: DocId,
         highlights: Vec<crate::annotations::Highlight>,
+        #[allow(dead_code)]
+        text_boxes: Vec<crate::annotations::TextBox>,
     },
     /// Save the document with embedded annotations directly to the PDF file on disk.
     SaveDoc {
         doc_id: DocId,
         path: PathBuf,
         highlights: Vec<crate::annotations::Highlight>,
+        text_boxes: Vec<crate::annotations::TextBox>,
     },
     /// Terminate the worker thread.
     #[allow(dead_code)]
@@ -405,6 +408,7 @@ pub enum Event {
         page_count: usize,
         page_sizes: Vec<PageSize>,
         annotations: Vec<crate::annotations::Highlight>,
+        text_boxes: Vec<crate::annotations::TextBox>,
     },
     /// Opening a document failed.
     OpenError { doc_id: DocId, error: String },

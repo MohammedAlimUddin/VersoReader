@@ -6,6 +6,7 @@ pub enum ActiveTool {
     None,
     Highlighter,
     Eraser,
+    Text,
 }
 
 /// Actions emitted by user interactions in the toolbar.
@@ -22,8 +23,11 @@ pub enum ToolbarAction {
     ToggleFullscreen,
     ToggleHighlighter,
     ToggleEraser,
+    ToggleText,
     SetHighlighterColor(AnnotationColor),
     SetHighlighterThickness(f32),
+    SetTextFontSize(f32),
+    SetTextColor(AnnotationColor),
     Save,
 }
 
@@ -39,6 +43,8 @@ pub struct ToolbarProps {
     pub active_tool: ActiveTool,
     pub highlighter_color: AnnotationColor,
     pub highlighter_thickness: f32,
+    pub text_font_size: f32,
+    pub text_color: AnnotationColor,
     pub can_save: bool,
     pub has_unsaved_changes: bool,
 }
@@ -288,6 +294,95 @@ impl Toolbar {
                 .on_hover_text("Eraser (click or drag across highlights to delete)");
             if eraser_btn.clicked() {
                 action = Some(ToolbarAction::ToggleEraser);
+            }
+
+            // Text tool
+            let text_active = props.active_tool == ActiveTool::Text;
+            let text_btn = ui
+                .add(
+                    egui::Button::new(egui::RichText::new("T Text").size(13.0))
+                        .selected(text_active),
+                )
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text("Text tool (click on page to add or edit text boxes)");
+            if text_btn.clicked() {
+                action = Some(ToolbarAction::ToggleText);
+            }
+
+            if text_active {
+                // Font size picker
+                egui::ComboBox::from_id_salt("text_font_size_combo")
+                    .width(60.0)
+                    .selected_text(format!("{:.0} pt", props.text_font_size))
+                    .show_ui(ui, |ui| {
+                        for &size in &[10.0, 12.0, 14.0, 16.0, 18.0, 20.0, 24.0, 28.0, 32.0, 36.0] {
+                            let is_sel = (props.text_font_size - size).abs() < 0.1;
+                            if ui
+                                .selectable_label(is_sel, format!("{:.0} pt", size))
+                                .clicked()
+                            {
+                                action = Some(ToolbarAction::SetTextFontSize(size));
+                            }
+                        }
+                    });
+
+                // Text color picker popup
+                let text_color_popup_id = ui.make_persistent_id("text_color_popup");
+                let cur_col = egui::Color32::from_rgb(
+                    props.text_color.r,
+                    props.text_color.g,
+                    props.text_color.b,
+                );
+                let (col_rect, col_resp) =
+                    ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
+                let col_resp = col_resp
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .on_hover_text("Text color");
+                let p = ui.painter();
+                p.rect_filled(col_rect, 3.0, cur_col);
+                p.rect_stroke(
+                    col_rect,
+                    3.0,
+                    egui::Stroke::new(1.0_f32, egui::Color32::LIGHT_GRAY),
+                    egui::StrokeKind::Outside,
+                );
+                if col_resp.clicked() {
+                    ui.memory_mut(|m| m.toggle_popup(text_color_popup_id));
+                }
+
+                egui::popup_below_widget(
+                    ui,
+                    text_color_popup_id,
+                    &col_resp,
+                    egui::PopupCloseBehavior::CloseOnClickOutside,
+                    |ui| {
+                        ui.label(egui::RichText::new("Text Color").strong().size(12.0));
+                        ui.horizontal(|ui| {
+                            for color in crate::annotations::PRESET_TEXT_COLORS {
+                                let is_sel = props.text_color == color;
+                                let c = egui::Color32::from_rgb(color.r, color.g, color.b);
+                                let (r, resp) = ui.allocate_exact_size(
+                                    egui::vec2(20.0, 20.0),
+                                    egui::Sense::click(),
+                                );
+                                let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+                                let p = ui.painter();
+                                p.rect_filled(r, 3.0, c);
+                                if is_sel {
+                                    p.rect_stroke(
+                                        r,
+                                        3.0,
+                                        egui::Stroke::new(2.0_f32, egui::Color32::WHITE),
+                                        egui::StrokeKind::Outside,
+                                    );
+                                }
+                                if resp.clicked() {
+                                    action = Some(ToolbarAction::SetTextColor(color));
+                                }
+                            }
+                        });
+                    },
+                );
             }
 
             ui.separator();

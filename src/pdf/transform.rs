@@ -96,6 +96,19 @@ impl PageTransform {
 
         Rect::from_min_max(pos2(min_x, min_y), pos2(max_x, max_y))
     }
+
+    /// Maps a screen displacement vector to a canonical coordinate delta.
+    pub fn screen_to_canonical_delta(&self, screen_delta: Vec2) -> Vec2 {
+        let z = self.zoom * Self::DPI_SCALE;
+        let dx = screen_delta.x / z;
+        let dy = screen_delta.y / z;
+        match self.rotation {
+            90 => vec2(dy, -dx),
+            180 => vec2(-dx, -dy),
+            270 => vec2(-dy, dx),
+            _ => vec2(dx, dy),
+        }
+    }
 }
 
 #[cfg(test)]

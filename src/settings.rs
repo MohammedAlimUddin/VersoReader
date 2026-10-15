@@ -24,6 +24,14 @@ fn default_mouse_wheel_speed() -> f32 {
     1.0
 }
 
+fn default_text_font_size() -> f32 {
+    16.0
+}
+
+fn default_text_color() -> AnnotationColor {
+    AnnotationColor::new(0, 0, 0)
+}
+
 /// Persistent user settings saved in ~/.config/pdfview/settings.toml.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Settings {
@@ -31,6 +39,10 @@ pub struct Settings {
     pub highlighter_color: AnnotationColor,
     #[serde(default = "default_highlighter_thickness")]
     pub highlighter_thickness: f32,
+    #[serde(default = "default_text_font_size")]
+    pub text_font_size: f32,
+    #[serde(default = "default_text_color")]
+    pub text_color: AnnotationColor,
     #[serde(default)]
     pub sidebar_open: bool,
     #[serde(default)]
@@ -46,6 +58,8 @@ impl Default for Settings {
         Self {
             highlighter_color: default_highlighter_color(),
             highlighter_thickness: default_highlighter_thickness(),
+            text_font_size: default_text_font_size(),
+            text_color: default_text_color(),
             sidebar_open: false,
             pathbar_collapsed: false,
             touchpad_scroll_speed: default_touchpad_scroll_speed(),
@@ -96,6 +110,8 @@ mod tests {
         let s = Settings::default();
         assert_eq!(s.highlighter_color, PRESET_HIGHLIGHT_COLORS[0]);
         assert_eq!(s.highlighter_thickness, 1.0);
+        assert_eq!(s.text_font_size, 16.0);
+        assert_eq!(s.text_color, AnnotationColor::new(0, 0, 0));
         assert!(!s.sidebar_open);
         assert!(!s.pathbar_collapsed);
         assert_eq!(s.touchpad_scroll_speed, 2.5);
@@ -107,6 +123,8 @@ mod tests {
         let s = Settings {
             highlighter_color: PRESET_HIGHLIGHT_COLORS[3],
             highlighter_thickness: 0.65,
+            text_font_size: 20.0,
+            text_color: AnnotationColor::new(192, 57, 43),
             sidebar_open: true,
             pathbar_collapsed: true,
             touchpad_scroll_speed: 3.0,

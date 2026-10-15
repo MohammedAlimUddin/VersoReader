@@ -33,6 +33,16 @@ pub const PRESET_HIGHLIGHT_COLORS: [AnnotationColor; 6] = [
     AnnotationColor::new(171, 71, 188),  // 6. Lavender Purple
 ];
 
+/// Preset text box colors.
+pub const PRESET_TEXT_COLORS: [AnnotationColor; 6] = [
+    AnnotationColor::new(0, 0, 0),      // 1. Classic Black
+    AnnotationColor::new(80, 80, 80),   // 2. Dark Gray
+    AnnotationColor::new(26, 82, 118),  // 3. Navy Blue
+    AnnotationColor::new(192, 57, 43),  // 4. Crimson Red
+    AnnotationColor::new(39, 174, 96),  // 5. Forest Green
+    AnnotationColor::new(142, 68, 173), // 6. Purple
+];
+
 /// A highlight annotation over one or more text lines or a freehand ink stroke on a page.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Highlight {
@@ -155,18 +165,163 @@ pub fn generate_highlight_id() -> u64 {
         .wrapping_add(NEXT_HIGHLIGHT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
 }
 
-/// Persisted document annotations schema.
+fn default_text_box_width() -> f32 {
+    180.0
+}
+
+/// A text box annotation on a page (Milestone 9).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TextBox {
+    pub id: u64,
+    /// 0-based page index
+    pub page: usize,
+    /// Canonical position (top-left of text box in unrotated canonical points)
+    pub pos: [f32; 2],
+    pub text: String,
+    pub font_size: f32,
+    pub color: AnnotationColor,
+    /// Width of text box in canonical points
+    #[serde(default = "default_text_box_width")]
+    pub width: f32,
+}
+
+impl TextBox {
+    /// Estimates height based on font size, width, and wrapped line count.
+    pub fn estimated_height(&self) -> f32 {
+        let chars_per_line = (self.width / (self.font_size * 0.52)).max(1.0);
+        let mut total_lines = 0.0;
+        for line in self.text.lines() {
+            let count = (line.chars().count() as f32 / chars_per_line)
+                .ceil()
+                .max(1.0);
+            total_lines += count;
+        }
+        if total_lines == 0.0 {
+            total_lines = 1.0;
+        }
+        let line_h = (self.font_size * 1.3).max(12.0);
+        total_lines * line_h + 8.0
+    }
+
+    /// Canonical bounding box for hit-testing and rendering.
+    pub fn bounding_rect(&self) -> CanonicalRect {
+        let h = self.estimated_height();
+        let w = self.width.max(40.0);
+        CanonicalRect::new(self.pos[0], self.pos[1], self.pos[0] + w, self.pos[1] + h)
+    }
+
+    /// Tests if a canonical point falls inside the text box rectangle (with a 4pt tolerance).
+    pub fn contains_canonical_point(&self, pt: Pos2) -> bool {
+        let rect = self.bounding_rect();
+        pt.x >= rect.min_x - 4.0
+            && pt.x <= rect.max_x + 4.0
+            && pt.y >= rect.min_y - 4.0
+            && pt.y <= rect.max_y + 4.0
+    }
+}
+
+static NEXT_TEXT_BOX_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(100_000);
+
+/// Generates a globally unique identifier for a new text box.
+pub fn generate_text_box_id() -> u64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    now.wrapping_mul(100_000)
+        .wrapping_add(NEXT_TEXT_BOX_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Transient state when actively typing in an inline text box.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EditingTextBox {
+    pub id: Option<u64>,
+    pub page: usize,
+    pub pos: [f32; 2],
+    pub text: String,
+    pub font_size: f32,
+    pub color: AnnotationColor,
+    pub width: f32,
+    pub is_new: bool,
+}
+
+impl EditingTextBox {
+    /// Estimates height based on font size, width, and wrapped line count.
+    pub fn estimated_height(&self) -> f32 {
+        let chars_per_line = (self.width / (self.font_size * 0.52)).max(1.0);
+        let mut total_lines = 0.0;
+        for line in self.text.lines() {
+            let count = (line.chars().count() as f32 / chars_per_line)
+                .ceil()
+                .max(1.0);
+            total_lines += count;
+        }
+        if total_lines == 0.0 {
+            total_lines = 1.0;
+        }
+        let line_h = (self.font_size * 1.3).max(12.0);
+        total_lines * line_h + 8.0
+    }
+
+    pub fn new(page: usize, pos: [f32; 2], font_size: f32, color: AnnotationColor) -> Self {
+        Self {
+            id: None,
+            page,
+            pos,
+            text: String::new(),
+            font_size,
+            color,
+            width: 180.0,
+            is_new: true,
+        }
+    }
+
+    pub fn from_existing(tb: &TextBox) -> Self {
+        Self {
+            id: Some(tb.id),
+            page: tb.page,
+            pos: tb.pos,
+            text: tb.text.clone(),
+            font_size: tb.font_size,
+            color: tb.color,
+            width: tb.width,
+            is_new: false,
+        }
+    }
+
+    pub fn to_text_box(&self) -> Option<TextBox> {
+        let trimmed = self.text.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(TextBox {
+                id: self.id.unwrap_or_else(generate_text_box_id),
+                page: self.page,
+                pos: self.pos,
+                text: self.text.clone(),
+                font_size: self.font_size,
+                color: self.color,
+                width: self.width,
+            })
+        }
+    }
+}
+
+/// Persisted document annotations schema (version 2 includes text_boxes).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DocumentAnnotations {
     pub version: u32,
     pub highlights: Vec<Highlight>,
+    #[serde(default)]
+    pub text_boxes: Vec<TextBox>,
 }
 
 impl Default for DocumentAnnotations {
     fn default() -> Self {
         Self {
-            version: 1,
+            version: 2,
             highlights: Vec::new(),
+            text_boxes: Vec::new(),
         }
     }
 }
@@ -192,6 +347,7 @@ impl DocumentAnnotations {
     }
 
     /// Loads annotations from disk for the given file key, returning empty annotations if not found.
+    #[allow(dead_code)]
     pub fn load_for_key(file_key: &str) -> Self {
         if let Some(path) = Self::storage_path(file_key) {
             if path.exists() {
@@ -238,6 +394,9 @@ pub fn adjust_rect_thickness(rect: CanonicalRect, thickness: f32) -> CanonicalRe
 pub enum AnnotationAction {
     AddHighlight(Highlight),
     DeleteHighlight(Highlight),
+    AddTextBox(TextBox),
+    DeleteTextBox(TextBox),
+    ModifyTextBox { old: TextBox, new: TextBox },
 }
 
 /// Bounded undo/redo stack for annotations per document tab.
@@ -266,6 +425,30 @@ impl UndoStack {
         self.redo.clear();
     }
 
+    pub fn push_add_text_box(&mut self, text_box: TextBox) {
+        self.undo.push(AnnotationAction::AddTextBox(text_box));
+        if self.undo.len() > Self::MAX_HISTORY {
+            self.undo.remove(0);
+        }
+        self.redo.clear();
+    }
+
+    pub fn push_delete_text_box(&mut self, text_box: TextBox) {
+        self.undo.push(AnnotationAction::DeleteTextBox(text_box));
+        if self.undo.len() > Self::MAX_HISTORY {
+            self.undo.remove(0);
+        }
+        self.redo.clear();
+    }
+
+    pub fn push_modify_text_box(&mut self, old: TextBox, new: TextBox) {
+        self.undo.push(AnnotationAction::ModifyTextBox { old, new });
+        if self.undo.len() > Self::MAX_HISTORY {
+            self.undo.remove(0);
+        }
+        self.redo.clear();
+    }
+
     pub fn undo(&mut self, annotations: &mut DocumentAnnotations) -> bool {
         if let Some(action) = self.undo.pop() {
             match action {
@@ -282,6 +465,28 @@ impl UndoStack {
                     annotations.highlights.push(hl.clone());
                     self.redo.push(AnnotationAction::DeleteHighlight(hl));
                     return true;
+                }
+                AnnotationAction::AddTextBox(tb) => {
+                    // Undo an add -> remove it
+                    if let Some(idx) = annotations.text_boxes.iter().position(|t| t.id == tb.id) {
+                        let removed = annotations.text_boxes.remove(idx);
+                        self.redo.push(AnnotationAction::AddTextBox(removed));
+                        return true;
+                    }
+                }
+                AnnotationAction::DeleteTextBox(tb) => {
+                    // Undo a delete -> restore it
+                    annotations.text_boxes.push(tb.clone());
+                    self.redo.push(AnnotationAction::DeleteTextBox(tb));
+                    return true;
+                }
+                AnnotationAction::ModifyTextBox { old, new } => {
+                    // Undo a modification -> restore old
+                    if let Some(idx) = annotations.text_boxes.iter().position(|t| t.id == new.id) {
+                        annotations.text_boxes[idx] = old.clone();
+                        self.redo.push(AnnotationAction::ModifyTextBox { old, new });
+                        return true;
+                    }
                 }
             }
         }
@@ -302,6 +507,28 @@ impl UndoStack {
                     if let Some(idx) = annotations.highlights.iter().position(|h| h.id == hl.id) {
                         let removed = annotations.highlights.remove(idx);
                         self.undo.push(AnnotationAction::DeleteHighlight(removed));
+                        return true;
+                    }
+                }
+                AnnotationAction::AddTextBox(tb) => {
+                    // Redo an add -> re-insert it
+                    annotations.text_boxes.push(tb.clone());
+                    self.undo.push(AnnotationAction::AddTextBox(tb));
+                    return true;
+                }
+                AnnotationAction::DeleteTextBox(tb) => {
+                    // Redo a delete -> remove it again
+                    if let Some(idx) = annotations.text_boxes.iter().position(|t| t.id == tb.id) {
+                        let removed = annotations.text_boxes.remove(idx);
+                        self.undo.push(AnnotationAction::DeleteTextBox(removed));
+                        return true;
+                    }
+                }
+                AnnotationAction::ModifyTextBox { old, new } => {
+                    // Redo a modification -> apply new
+                    if let Some(idx) = annotations.text_boxes.iter().position(|t| t.id == old.id) {
+                        annotations.text_boxes[idx] = new.clone();
+                        self.undo.push(AnnotationAction::ModifyTextBox { old, new });
                         return true;
                     }
                 }
@@ -396,14 +623,30 @@ mod tests {
             alpha: 0.35,
             thickness: 0.75,
         };
+        let tb = TextBox {
+            id: 88,
+            page: 3,
+            pos: [50.0, 100.0],
+            text: "Hello Rust".to_string(),
+            font_size: 16.0,
+            color: PRESET_TEXT_COLORS[0],
+            width: 180.0,
+        };
         let doc_ann = DocumentAnnotations {
-            version: 1,
+            version: 2,
             highlights: vec![hl],
+            text_boxes: vec![tb],
         };
 
         let json = serde_json::to_string(&doc_ann).expect("Serialize to JSON");
         let decoded: DocumentAnnotations = serde_json::from_str(&json).expect("Deserialize JSON");
         assert_eq!(doc_ann, decoded);
+
+        // Test backwards compatibility with v1 JSON without text_boxes
+        let v1_json = r#"{"version":1,"highlights":[]}"#;
+        let v1_decoded: DocumentAnnotations =
+            serde_json::from_str(v1_json).expect("Deserialize v1 JSON");
+        assert_eq!(v1_decoded.text_boxes, Vec::<TextBox>::new());
     }
 
     #[test]
@@ -450,6 +693,66 @@ mod tests {
     }
 
     #[test]
+    fn test_text_box_undo_redo() {
+        let mut ann = DocumentAnnotations::default();
+        let mut undo_stack = UndoStack::default();
+
+        let tb = TextBox {
+            id: 200,
+            page: 1,
+            pos: [30.0, 40.0],
+            text: "Initial text".to_string(),
+            font_size: 14.0,
+            color: PRESET_TEXT_COLORS[0],
+            width: 150.0,
+        };
+
+        // Add
+        ann.text_boxes.push(tb.clone());
+        undo_stack.push_add_text_box(tb.clone());
+        assert_eq!(ann.text_boxes.len(), 1);
+
+        // Undo Add
+        assert!(undo_stack.undo(&mut ann));
+        assert_eq!(ann.text_boxes.len(), 0);
+
+        // Redo Add
+        assert!(undo_stack.redo(&mut ann));
+        assert_eq!(ann.text_boxes.len(), 1);
+
+        // Modify (e.g. edit text or drag move)
+        let mut modified = tb.clone();
+        modified.pos = [60.0, 80.0];
+        modified.text = "Updated text".to_string();
+        ann.text_boxes[0] = modified.clone();
+        undo_stack.push_modify_text_box(tb.clone(), modified.clone());
+
+        // Undo Modify -> restored to original pos and text
+        assert!(undo_stack.undo(&mut ann));
+        assert_eq!(ann.text_boxes[0].pos, [30.0, 40.0]);
+        assert_eq!(ann.text_boxes[0].text, "Initial text");
+
+        // Redo Modify -> updated
+        assert!(undo_stack.redo(&mut ann));
+        assert_eq!(ann.text_boxes[0].pos, [60.0, 80.0]);
+        assert_eq!(ann.text_boxes[0].text, "Updated text");
+
+        // Delete
+        let removed = ann.text_boxes.remove(0);
+        undo_stack.push_delete_text_box(removed);
+        assert_eq!(ann.text_boxes.len(), 0);
+
+        // Undo Delete -> restored
+        assert!(undo_stack.undo(&mut ann));
+        assert_eq!(ann.text_boxes.len(), 1);
+        assert_eq!(ann.text_boxes[0].id, 200);
+
+        // Redo Delete -> empty again
+        assert!(undo_stack.redo(&mut ann));
+        assert_eq!(ann.text_boxes.len(), 0);
+    }
+
+    #[test]
     fn test_blake3_file_key_determinism() {
         let p = Path::new("/home/user/Documents/test.pdf");
         let key1 = DocumentAnnotations::compute_file_key(p, 123456);
@@ -458,5 +761,48 @@ mod tests {
         assert_eq!(key1, key2);
         assert_ne!(key1, key3);
         assert_eq!(key1.len(), 64);
+    }
+
+    #[test]
+    fn test_text_box_resize_and_wrapped_height() {
+        let tb_wide = TextBox {
+            id: 201,
+            page: 0,
+            pos: [50.0, 50.0],
+            text: "This is a long sentence that should reflow and wrap across multiple lines when width decreases".to_string(),
+            font_size: 14.0,
+            color: PRESET_TEXT_COLORS[0],
+            width: 400.0,
+        };
+
+        let mut tb_narrow = tb_wide.clone();
+        tb_narrow.width = 100.0;
+
+        // Narrow box must have greater estimated height than wide box because of line wrapping
+        let h_wide = tb_wide.estimated_height();
+        let h_narrow = tb_narrow.estimated_height();
+        assert!(
+            h_narrow > h_wide,
+            "Narrow box height ({h_narrow}) must be greater than wide box ({h_wide})"
+        );
+
+        // Width clamping
+        let clamped_w = (tb_narrow.width - 80.0).max(40.0);
+        assert_eq!(clamped_w, 40.0);
+
+        // Undo/Redo resize
+        let mut ann = DocumentAnnotations::default();
+        let mut undo_stack = UndoStack::default();
+        ann.text_boxes.push(tb_wide.clone());
+
+        ann.text_boxes[0].width = 200.0;
+        let tb_resized = ann.text_boxes[0].clone();
+        undo_stack.push_modify_text_box(tb_wide.clone(), tb_resized.clone());
+
+        assert_eq!(ann.text_boxes[0].width, 200.0);
+        assert!(undo_stack.undo(&mut ann));
+        assert_eq!(ann.text_boxes[0].width, 400.0);
+        assert!(undo_stack.redo(&mut ann));
+        assert_eq!(ann.text_boxes[0].width, 200.0);
     }
 }

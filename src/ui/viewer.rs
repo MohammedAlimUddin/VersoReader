@@ -4,8 +4,8 @@ use std::sync::Arc;
 use egui::{pos2, vec2, Color32, Rect, Stroke, StrokeKind};
 
 use crate::annotations::{
-    adjust_rect_thickness, generate_highlight_id, AnnotationColor, DocumentAnnotations, Highlight,
-    UndoStack,
+    adjust_rect_thickness, generate_highlight_id, generate_text_box_id, AnnotationColor,
+    DocumentAnnotations, EditingTextBox, Highlight, TextBox, UndoStack,
 };
 use crate::cache::{PageTextCache, TextureCache, TextureKey};
 use crate::pdf::transform::PageTransform;
@@ -86,6 +86,77 @@ pub fn compute_sharp_page_geometry(
     (sharp_width, bitmap_h_px as u32, screen_rect)
 }
 
+/// Helper to test if a canonical point hits the right-edge resize handle of a text box.
+fn hit_test_resize_handle(
+    pos: [f32; 2],
+    width: f32,
+    height: f32,
+    can_pt: egui::Pos2,
+    tol: f32,
+) -> bool {
+    let right = pos[0] + width.max(40.0);
+    (can_pt.x - right).abs() <= tol && can_pt.y >= pos[1] - 4.0 && can_pt.y <= pos[1] + height + 4.0
+}
+
+/// Helper to commit active text box editing. Returns true if annotations were modified.
+fn commit_active_text_box(
+    editing: &mut Option<EditingTextBox>,
+    annotations: &mut DocumentAnnotations,
+    undo_stack: &mut UndoStack,
+    annotations_dirty: &mut bool,
+) -> bool {
+    if let Some(etb) = editing.take() {
+        let trimmed = etb.text.trim();
+        if trimmed.is_empty() {
+            if let Some(old_id) = etb.id {
+                if let Some(pos) = annotations.text_boxes.iter().position(|tb| tb.id == old_id) {
+                    let removed = annotations.text_boxes.remove(pos);
+                    undo_stack.push_delete_text_box(removed);
+                    *annotations_dirty = true;
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        if let Some(old_id) = etb.id {
+            if let Some(existing) = annotations.text_boxes.iter_mut().find(|tb| tb.id == old_id) {
+                if existing.text != etb.text
+                    || (existing.font_size - etb.font_size).abs() > 0.01
+                    || existing.color != etb.color
+                    || existing.pos != etb.pos
+                    || (existing.width - etb.width).abs() > 0.01
+                {
+                    let old_copy = existing.clone();
+                    existing.text = etb.text;
+                    existing.font_size = etb.font_size;
+                    existing.color = etb.color;
+                    existing.pos = etb.pos;
+                    existing.width = etb.width;
+                    undo_stack.push_modify_text_box(old_copy, existing.clone());
+                    *annotations_dirty = true;
+                    return true;
+                }
+            }
+        } else {
+            let tb = TextBox {
+                id: generate_text_box_id(),
+                page: etb.page,
+                pos: etb.pos,
+                text: etb.text,
+                font_size: etb.font_size,
+                color: etb.color,
+                width: etb.width,
+            };
+            annotations.text_boxes.push(tb.clone());
+            undo_stack.push_add_text_box(tb);
+            *annotations_dirty = true;
+            return true;
+        }
+    }
+    false
+}
+
 /// Computes virtualized layout and paints intersecting pages (+1 prefetch).
 #[allow(clippy::needless_range_loop, clippy::too_many_arguments)]
 pub fn render_viewer(
@@ -115,6 +186,12 @@ pub fn render_viewer(
     undo_stack: &mut UndoStack,
     annotations_dirty: &mut bool,
     freehand_stroke: &mut Option<(usize, Vec<[f32; 2]>)>,
+    editing_text_box: &mut Option<EditingTextBox>,
+    selected_text_box_id: &mut Option<u64>,
+    dragging_text_box: &mut Option<(u64, egui::Pos2, [f32; 2])>,
+    resizing_text_box: &mut Option<(Option<u64>, egui::Pos2, f32)>,
+    text_font_size: f32,
+    text_color: AnnotationColor,
 ) -> ViewerOutput {
     let mut action: Option<ViewerAction> = None;
     let mut render_requests = Vec::new();
@@ -231,7 +308,7 @@ pub fn render_viewer(
         let start_page = first_visible.saturating_sub(1);
         let end_page = (last_visible + 1).min(page_count - 1);
 
-        let painter = ui.painter();
+        let painter = ui.painter().clone();
         let content_origin = ui.min_rect().min.to_vec2();
         let ppp = ui.ctx().pixels_per_point().max(1.0);
         let snap = |v: f32| (v * ppp).round() / ppp;
@@ -312,6 +389,7 @@ pub fn render_viewer(
                     menu_consumed_pointer = true;
                 } else if is_primary_pressed || is_secondary_clicked {
                     close_menu = true;
+                    menu_consumed_pointer = true;
                 }
             }
 
@@ -324,11 +402,40 @@ pub fn render_viewer(
             }
         }
 
+        let mut clicked_inside_editing = false;
+        if let Some(ref etb) = *editing_text_box {
+            if let Some(pos) = pointer_pos {
+                if let Some(info) = visible_info.iter().find(|i| i.page == etb.page) {
+                    let screen_top_left = info
+                        .transform
+                        .canonical_to_screen(pos2(etb.pos[0], etb.pos[1]));
+                    let screen_w = (etb.width * zoom * PageTransform::DPI_SCALE).max(40.0);
+                    let screen_h =
+                        (etb.estimated_height() * zoom * PageTransform::DPI_SCALE).max(36.0);
+                    let edit_screen_rect =
+                        Rect::from_min_size(screen_top_left, vec2(screen_w, screen_h));
+                    if edit_screen_rect.expand(8.0).contains(pos) {
+                        clicked_inside_editing = true;
+                    }
+                }
+            }
+        }
+
         if let Some(pos) = pointer_pos {
             let in_viewer = ui.clip_rect().contains(pos);
+            let is_over_overlay = ui
+                .ctx()
+                .layer_id_at(pos)
+                .is_some_and(|l| l != ui.layer_id() && l.order != egui::Order::Background);
+            let any_popup_open = ui.memory(|m| m.any_popup_open());
+            let pointer_consumed = menu_consumed_pointer || is_over_overlay || any_popup_open;
 
-            // Surrender focus from any text inputs if pointer interacts with viewer
-            if in_viewer && (is_primary_pressed || is_secondary_clicked || is_primary_down) {
+            // Surrender focus from any text inputs if pointer interacts with viewer outside active inline editing
+            if in_viewer
+                && !pointer_consumed
+                && (is_primary_pressed || is_secondary_clicked || is_primary_down)
+                && !clicked_inside_editing
+            {
                 ui.ctx().memory_mut(|m| {
                     if let Some(id) = m.focused() {
                         m.surrender_focus(id);
@@ -337,7 +444,7 @@ pub fn render_viewer(
             }
 
             // Right-click context menu trigger (when clicking outside existing menu)
-            if in_viewer && is_secondary_clicked && !menu_consumed_pointer {
+            if in_viewer && is_secondary_clicked && !pointer_consumed {
                 let clicked_page = visible_info
                     .iter()
                     .find(|info| info.screen_rect.contains(pos))
@@ -349,15 +456,23 @@ pub fn render_viewer(
                 });
             }
 
-            // Only process annotations / text selection if context menu didn't consume this interaction
-            if in_viewer && !menu_consumed_pointer {
+            // Only process annotations / text selection if context menu or overlay didn't consume this interaction
+            if in_viewer && !pointer_consumed {
                 if active_tool == ActiveTool::Eraser {
                     // Eraser cursor
                     ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
                     *selection = None;
                     *drag_start = None;
+                    if commit_active_text_box(
+                        editing_text_box,
+                        annotations,
+                        undo_stack,
+                        annotations_dirty,
+                    ) {
+                        annotations_changed = true;
+                    }
 
-                    // Click or drag across highlights to delete them
+                    // Click or drag across highlights or text boxes to delete them
                     if is_primary_down || is_primary_pressed {
                         for info in &visible_info {
                             if info.screen_rect.contains(pos) {
@@ -382,6 +497,20 @@ pub fn render_viewer(
                                         true
                                     }
                                 });
+                                annotations.text_boxes.retain(|tb| {
+                                    if tb.page == info.page
+                                        && test_pts.iter().any(|&p| tb.contains_canonical_point(p))
+                                    {
+                                        undo_stack.push_delete_text_box(tb.clone());
+                                        removed_any = true;
+                                        if *selected_text_box_id == Some(tb.id) {
+                                            *selected_text_box_id = None;
+                                        }
+                                        false
+                                    } else {
+                                        true
+                                    }
+                                });
                                 if removed_any {
                                     annotations_changed = true;
                                     *annotations_dirty = true;
@@ -391,23 +520,109 @@ pub fn render_viewer(
                         }
                     }
                 } else {
-                    // 1. Hover cursor: set Text (I-beam) cursor when hovering over text
+                    // 1. Hover cursor
                     if !is_primary_down {
-                        for info in &visible_info {
-                            if info.screen_rect.contains(pos) {
-                                if let Some(ref text) = info.text {
+                        let tol = 8.0 / (zoom * PageTransform::DPI_SCALE);
+                        let mut is_over_resize_handle = false;
+                        if let Some(ref etb) = *editing_text_box {
+                            if let Some(info) = visible_info.iter().find(|i| i.page == etb.page) {
+                                let can_pt = info.transform.screen_to_canonical(pos);
+                                if hit_test_resize_handle(
+                                    etb.pos,
+                                    etb.width,
+                                    etb.estimated_height(),
+                                    can_pt,
+                                    tol,
+                                ) {
+                                    is_over_resize_handle = true;
+                                }
+                            }
+                        }
+                        if !is_over_resize_handle {
+                            if let Some(sel_id) = *selected_text_box_id {
+                                if let Some(tb) =
+                                    annotations.text_boxes.iter().find(|tb| tb.id == sel_id)
+                                {
+                                    if let Some(info) =
+                                        visible_info.iter().find(|i| i.page == tb.page)
+                                    {
+                                        let can_pt = info.transform.screen_to_canonical(pos);
+                                        if hit_test_resize_handle(
+                                            tb.pos,
+                                            tb.width,
+                                            tb.estimated_height(),
+                                            can_pt,
+                                            tol,
+                                        ) {
+                                            is_over_resize_handle = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        if is_over_resize_handle {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                        } else {
+                            for info in &visible_info {
+                                if info.screen_rect.contains(pos) {
                                     let can_pt = info.transform.screen_to_canonical(pos);
-                                    if text.is_hovering_text(can_pt) {
-                                        ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
+                                    if annotations.text_boxes.iter().any(|tb| {
+                                        tb.page == info.page && tb.contains_canonical_point(can_pt)
+                                    }) {
+                                        ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
                                         break;
+                                    }
+                                    if active_tool == ActiveTool::Text {
+                                        ui.ctx().set_cursor_icon(egui::CursorIcon::Default);
+                                        break;
+                                    }
+                                    if active_tool == ActiveTool::None {
+                                        if let Some(ref text) = info.text {
+                                            if text.is_hovering_text(can_pt) {
+                                                ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
+                                                break;
+                                            }
+                                        }
                                     }
                                 }
                             }
                         }
                     }
 
-                    // 2. Double-click word selection: selects entire word (or directly highlights it in highlighter mode)
+                    // 2. Double-click on existing text box opens it for editing, or selects word
+                    let mut double_clicked_tb = None;
                     if is_double_click {
+                        for info in &visible_info {
+                            if info.screen_rect.contains(pos) {
+                                let can_pt = info.transform.screen_to_canonical(pos);
+                                if let Some(tb) = annotations.text_boxes.iter().find(|tb| {
+                                    tb.page == info.page && tb.contains_canonical_point(can_pt)
+                                }) {
+                                    double_clicked_tb = Some(tb.clone());
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    if let Some(tb) = double_clicked_tb {
+                        if commit_active_text_box(
+                            editing_text_box,
+                            annotations,
+                            undo_stack,
+                            annotations_dirty,
+                        ) {
+                            annotations_changed = true;
+                        }
+                        *selected_text_box_id = Some(tb.id);
+                        *editing_text_box = Some(EditingTextBox::from_existing(&tb));
+                        *drag_start = None;
+                        *selection = None;
+                        *dragging_text_box = None;
+                        *resizing_text_box = None;
+                        ui.ctx().request_repaint();
+                    } else if is_double_click {
                         *drag_start = None;
                         for info in &visible_info {
                             if info.screen_rect.contains(pos) {
@@ -457,47 +672,147 @@ pub fn render_viewer(
                     }
 
                     // 3. Primary press down (single click):
-                    // Clears selection and starts drag anchor if over text, or freehand stroke if in whitespace/margin.
                     if is_primary_pressed && !is_double_click {
-                        *selection = None;
-                        *drag_start = None;
-                        *freehand_stroke = None;
+                        let tol = 8.0 / (zoom * PageTransform::DPI_SCALE);
+                        let mut hit_resize = None;
+                        if let Some(ref etb) = *editing_text_box {
+                            if let Some(info) = visible_info.iter().find(|i| i.page == etb.page) {
+                                let can_pt = info.transform.screen_to_canonical(pos);
+                                if hit_test_resize_handle(
+                                    etb.pos,
+                                    etb.width,
+                                    etb.estimated_height(),
+                                    can_pt,
+                                    tol,
+                                ) {
+                                    hit_resize = Some((None, etb.width.max(40.0)));
+                                }
+                            }
+                        }
+                        if hit_resize.is_none() {
+                            if let Some(sel_id) = *selected_text_box_id {
+                                if let Some(tb) =
+                                    annotations.text_boxes.iter().find(|tb| tb.id == sel_id)
+                                {
+                                    if let Some(info) =
+                                        visible_info.iter().find(|i| i.page == tb.page)
+                                    {
+                                        let can_pt = info.transform.screen_to_canonical(pos);
+                                        if hit_test_resize_handle(
+                                            tb.pos,
+                                            tb.width,
+                                            tb.estimated_height(),
+                                            can_pt,
+                                            tol,
+                                        ) {
+                                            hit_resize = Some((Some(sel_id), tb.width.max(40.0)));
+                                        }
+                                    }
+                                }
+                            }
+                        }
 
-                        if active_tool == ActiveTool::Highlighter {
+                        if let Some((target, start_w)) = hit_resize {
+                            *resizing_text_box = Some((target, pos, start_w));
+                            *dragging_text_box = None;
+                            *drag_start = None;
+                            ui.ctx().request_repaint();
+                        } else if !clicked_inside_editing {
+                            if commit_active_text_box(
+                                editing_text_box,
+                                annotations,
+                                undo_stack,
+                                annotations_dirty,
+                            ) {
+                                annotations_changed = true;
+                            }
+
+                            *selection = None;
+                            *drag_start = None;
+                            *freehand_stroke = None;
+                            *resizing_text_box = None;
+
+                            // Check if click hit an existing text box
+                            let mut hit_tb = None;
                             for info in &visible_info {
                                 if info.screen_rect.contains(pos) {
                                     let can_pt = info.transform.screen_to_canonical(pos);
-                                    let mut on_text = false;
-                                    if let Some(ref text) = info.text {
-                                        if text.is_hovering_text(can_pt) {
-                                            if let Some(char_idx) = text.hit_test(can_pt) {
-                                                *drag_start =
-                                                    Some(TextLocation::new(info.page, char_idx));
-                                                ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
-                                                on_text = true;
-                                            }
-                                        }
+                                    if let Some(tb) = annotations.text_boxes.iter().find(|tb| {
+                                        tb.page == info.page && tb.contains_canonical_point(can_pt)
+                                    }) {
+                                        hit_tb = Some((tb.id, tb.pos));
+                                        break;
                                     }
-                                    if !on_text {
-                                        // Freehand highlight drawing begins in non-text areas!
-                                        *freehand_stroke =
-                                            Some((info.page, vec![[can_pt.x, can_pt.y]]));
-                                        ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
-                                    }
-                                    break;
                                 }
                             }
-                        } else {
-                            for info in &visible_info {
-                                if info.screen_rect.contains(pos) {
-                                    if let Some(ref text) = info.text {
-                                        let can_pt = info.transform.screen_to_canonical(pos);
-                                        if text.is_hovering_text(can_pt) {
-                                            if let Some(char_idx) = text.hit_test(can_pt) {
-                                                *drag_start =
-                                                    Some(TextLocation::new(info.page, char_idx));
-                                                ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
-                                                break;
+
+                            if let Some((tb_id, tb_pos)) = hit_tb {
+                                *selected_text_box_id = Some(tb_id);
+                                *dragging_text_box = Some((tb_id, pos, tb_pos));
+                                ui.ctx().request_repaint();
+                            } else {
+                                *selected_text_box_id = None;
+                                *dragging_text_box = None;
+
+                                if active_tool == ActiveTool::Text {
+                                    for info in &visible_info {
+                                        if info.screen_rect.contains(pos) {
+                                            let can_pt = info.transform.screen_to_canonical(pos);
+                                            *editing_text_box = Some(EditingTextBox::new(
+                                                info.page,
+                                                [can_pt.x, can_pt.y],
+                                                text_font_size,
+                                                text_color,
+                                            ));
+                                            ui.ctx().request_repaint();
+                                            break;
+                                        }
+                                    }
+                                } else if active_tool == ActiveTool::Highlighter {
+                                    for info in &visible_info {
+                                        if info.screen_rect.contains(pos) {
+                                            let can_pt = info.transform.screen_to_canonical(pos);
+                                            let mut on_text = false;
+                                            if let Some(ref text) = info.text {
+                                                if text.is_hovering_text(can_pt) {
+                                                    if let Some(char_idx) = text.hit_test(can_pt) {
+                                                        *drag_start = Some(TextLocation::new(
+                                                            info.page, char_idx,
+                                                        ));
+                                                        ui.ctx().set_cursor_icon(
+                                                            egui::CursorIcon::Text,
+                                                        );
+                                                        on_text = true;
+                                                    }
+                                                }
+                                            }
+                                            if !on_text {
+                                                // Freehand highlight drawing begins in non-text areas!
+                                                *freehand_stroke =
+                                                    Some((info.page, vec![[can_pt.x, can_pt.y]]));
+                                                ui.ctx()
+                                                    .set_cursor_icon(egui::CursorIcon::Crosshair);
+                                            }
+                                            break;
+                                        }
+                                    }
+                                } else {
+                                    for info in &visible_info {
+                                        if info.screen_rect.contains(pos) {
+                                            if let Some(ref text) = info.text {
+                                                let can_pt =
+                                                    info.transform.screen_to_canonical(pos);
+                                                if text.is_hovering_text(can_pt) {
+                                                    if let Some(char_idx) = text.hit_test(can_pt) {
+                                                        *drag_start = Some(TextLocation::new(
+                                                            info.page, char_idx,
+                                                        ));
+                                                        ui.ctx().set_cursor_icon(
+                                                            egui::CursorIcon::Text,
+                                                        );
+                                                        break;
+                                                    }
+                                                }
                                             }
                                         }
                                     }
@@ -506,9 +821,65 @@ pub fn render_viewer(
                         }
                     }
 
-                    // 4. Dragging: extends text selection or appends to freehand stroke
+                    // 4. Dragging: translates moving text box, resizes text box, extends text selection, or appends to freehand stroke
                     if is_primary_down && !is_primary_pressed && !is_double_click {
-                        if let Some((fh_page, ref mut fh_pts)) = *freehand_stroke {
+                        if let Some((target, start_screen_pos, start_width)) = *resizing_text_box {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                            let target_page = match target {
+                                Some(id) => annotations
+                                    .text_boxes
+                                    .iter()
+                                    .find(|tb| tb.id == id)
+                                    .map(|tb| tb.page),
+                                None => editing_text_box.as_ref().map(|etb| etb.page),
+                            };
+                            if let Some(page) = target_page {
+                                if let Some(info) = visible_info.iter().find(|i| i.page == page) {
+                                    let screen_delta = pos - start_screen_pos;
+                                    let can_delta =
+                                        info.transform.screen_to_canonical_delta(screen_delta);
+                                    let new_width = (start_width + can_delta.x).max(40.0);
+                                    match target {
+                                        Some(id) => {
+                                            if let Some(tb) = annotations
+                                                .text_boxes
+                                                .iter_mut()
+                                                .find(|tb| tb.id == id)
+                                            {
+                                                tb.width = new_width;
+                                            }
+                                        }
+                                        None => {
+                                            if let Some(ref mut etb) = *editing_text_box {
+                                                etb.width = new_width;
+                                            }
+                                        }
+                                    }
+                                    ui.ctx().request_repaint();
+                                }
+                            }
+                        } else if let Some((drag_id, start_screen_pos, start_can_pos)) =
+                            *dragging_text_box
+                        {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                            if let Some(tb) = annotations
+                                .text_boxes
+                                .iter_mut()
+                                .find(|tb| tb.id == drag_id)
+                            {
+                                if let Some(info) = visible_info.iter().find(|i| i.page == tb.page)
+                                {
+                                    let screen_delta = pos - start_screen_pos;
+                                    let can_delta =
+                                        info.transform.screen_to_canonical_delta(screen_delta);
+                                    tb.pos = [
+                                        start_can_pos[0] + can_delta.x,
+                                        start_can_pos[1] + can_delta.y,
+                                    ];
+                                    ui.ctx().request_repaint();
+                                }
+                            }
+                        } else if let Some((fh_page, ref mut fh_pts)) = *freehand_stroke {
                             ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
                             for info in &visible_info {
                                 if info.page == fh_page {
@@ -569,10 +940,38 @@ pub fn render_viewer(
                         }
                     }
 
-                    // 5. Primary release: finish drag
+                    // 5. Primary release: finish drag or resize
                     if is_primary_released && !is_double_click {
                         *drag_start = None;
-                        if let Some((fh_page, fh_pts)) = freehand_stroke.take() {
+                        if let Some((target, _, start_width)) = resizing_text_box.take() {
+                            if let Some(id) = target {
+                                if let Some(tb) =
+                                    annotations.text_boxes.iter().find(|tb| tb.id == id)
+                                {
+                                    if (tb.width - start_width).abs() > 0.5 {
+                                        let mut old_tb = tb.clone();
+                                        old_tb.width = start_width;
+                                        undo_stack.push_modify_text_box(old_tb, tb.clone());
+                                        annotations_changed = true;
+                                        *annotations_dirty = true;
+                                        ui.ctx().request_repaint();
+                                    }
+                                }
+                            }
+                        } else if let Some((drag_id, _, start_can_pos)) = dragging_text_box.take() {
+                            if let Some(tb) =
+                                annotations.text_boxes.iter().find(|tb| tb.id == drag_id)
+                            {
+                                if tb.pos != start_can_pos {
+                                    let mut old_tb = tb.clone();
+                                    old_tb.pos = start_can_pos;
+                                    undo_stack.push_modify_text_box(old_tb, tb.clone());
+                                    annotations_changed = true;
+                                    *annotations_dirty = true;
+                                    ui.ctx().request_repaint();
+                                }
+                            }
+                        } else if let Some((fh_page, fh_pts)) = freehand_stroke.take() {
                             if fh_pts.len() >= 2 {
                                 let id = generate_highlight_id();
                                 let stroke_thickness =
@@ -889,6 +1288,129 @@ pub fn render_viewer(
                         }
                     }
                 }
+
+                // 6. Draw text boxes on this page through PageTransform
+                for tb in &annotations.text_boxes {
+                    if tb.page == idx {
+                        if editing_text_box
+                            .as_ref()
+                            .is_some_and(|etb| etb.id == Some(tb.id))
+                        {
+                            continue;
+                        }
+
+                        let is_selected = *selected_text_box_id == Some(tb.id);
+                        let is_dragging = dragging_text_box
+                            .as_ref()
+                            .is_some_and(|(id, ..)| *id == tb.id);
+                        let is_resizing = resizing_text_box
+                            .as_ref()
+                            .is_some_and(|(target, ..)| *target == Some(tb.id));
+
+                        let font_size_px =
+                            (tb.font_size * zoom * PageTransform::DPI_SCALE).max(8.0);
+                        let text_col = Color32::from_rgb(tb.color.r, tb.color.g, tb.color.b);
+                        let screen_pos = transform.canonical_to_screen(pos2(tb.pos[0], tb.pos[1]));
+                        let screen_w = (tb.width * zoom * PageTransform::DPI_SCALE).max(40.0);
+
+                        let font_id = egui::FontId::proportional(font_size_px);
+                        let galley = painter.layout(tb.text.clone(), font_id, text_col, screen_w);
+                        let galley_size = galley.size();
+                        let box_h = (galley_size.y + 4.0).max(font_size_px * 1.3);
+                        let box_screen_rect =
+                            Rect::from_min_size(screen_pos, vec2(screen_w, box_h));
+
+                        if is_selected || is_dragging || is_resizing {
+                            let stroke_col = Color32::from_rgb(0, 120, 215);
+                            painter.rect_stroke(
+                                box_screen_rect,
+                                2.0,
+                                Stroke::new(1.5_f32, stroke_col),
+                                StrokeKind::Outside,
+                            );
+
+                            let handle_center =
+                                pos2(box_screen_rect.right(), box_screen_rect.center().y);
+                            painter.circle(
+                                handle_center,
+                                4.5,
+                                Color32::WHITE,
+                                Stroke::new(1.5_f32, stroke_col),
+                            );
+                        }
+
+                        // ALWAYS draw text using galley with font color over transparent background
+                        painter.galley(screen_pos, galley, text_col);
+                    }
+                }
+
+                // 7. Active inline EditingTextBox widget on this page
+                if let Some(ref mut etb) = *editing_text_box {
+                    if etb.page == idx {
+                        let screen_top_left =
+                            transform.canonical_to_screen(pos2(etb.pos[0], etb.pos[1]));
+                        let screen_w = (etb.width * zoom * PageTransform::DPI_SCALE).max(40.0);
+                        let screen_font_size =
+                            (etb.font_size * zoom * PageTransform::DPI_SCALE).max(10.0);
+                        let text_col = Color32::from_rgb(etb.color.r, etb.color.g, etb.color.b);
+                        let galley = painter.layout(
+                            if etb.text.is_empty() {
+                                " ".to_string()
+                            } else {
+                                etb.text.clone()
+                            },
+                            egui::FontId::proportional(screen_font_size),
+                            text_col,
+                            (screen_w - 8.0).max(10.0),
+                        );
+                        let screen_h = (galley.size().y + 16.0).max(screen_font_size * 1.35 + 16.0);
+                        let edit_rect =
+                            Rect::from_min_size(screen_top_left, vec2(screen_w, screen_h));
+
+                        painter.rect_filled(
+                            edit_rect,
+                            3.0,
+                            Color32::from_rgba_unmultiplied(255, 255, 255, 245),
+                        );
+                        let stroke_col = Color32::from_rgb(0, 120, 215);
+                        painter.rect_stroke(
+                            edit_rect,
+                            3.0,
+                            Stroke::new(1.5_f32, stroke_col),
+                            StrokeKind::Outside,
+                        );
+
+                        // Draw resize handle on right edge of editing text box
+                        let handle_center = pos2(edit_rect.right(), edit_rect.center().y);
+                        painter.circle(
+                            handle_center,
+                            4.5,
+                            Color32::WHITE,
+                            Stroke::new(1.5_f32, stroke_col),
+                        );
+
+                        let response = ui
+                            .allocate_new_ui(
+                                egui::UiBuilder::new().max_rect(edit_rect.shrink(4.0)),
+                                |child_ui| {
+                                    child_ui.add(
+                                        egui::TextEdit::multiline(&mut etb.text)
+                                            .font(egui::FontId::proportional(screen_font_size))
+                                            .text_color(text_col)
+                                            .frame(false)
+                                            .hint_text("Type text here...")
+                                            .desired_width(screen_w - 8.0),
+                                    )
+                                },
+                            )
+                            .inner;
+
+                        if etb.is_new {
+                            response.request_focus();
+                            etb.is_new = false;
+                        }
+                    }
+                }
             } else {
                 // Prefetch page outside viewport: only prefetch if the texture size is reasonable (<= 45 MB)
                 // to prevent cache thrashing at high zoom levels where prefetching would evict the visible page.
@@ -915,7 +1437,9 @@ pub fn render_viewer(
     render_requests.sort_by_key(|r| r.priority);
 
     // If user clicked or dragged inside the viewer area, surrender focus from text inputs so arrow navigation immediately controls document scrolling
-    if ui.input(|i| i.pointer.primary_down() || i.pointer.secondary_clicked()) {
+    if editing_text_box.is_none()
+        && ui.input(|i| i.pointer.primary_down() || i.pointer.secondary_clicked())
+    {
         if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
             if scroll_output.inner_rect.contains(pos) {
                 ui.ctx().memory_mut(|m| {
@@ -1170,5 +1694,57 @@ mod tests {
         // 3. Annotations just changed on frame 0: immediately stale (zero vanishing gap!)
         let is_stale_immediate = (gen < current_gen) || true;
         assert!(is_stale_immediate);
+    }
+
+    #[test]
+    fn test_hit_test_resize_handle() {
+        let pos = [100.0, 150.0];
+        let width = 180.0;
+        let height = 40.0;
+        let tol = 6.0;
+
+        // Exactly on right edge center -> must hit
+        let pt_on_handle = egui::pos2(280.0, 170.0);
+        assert!(hit_test_resize_handle(
+            pos,
+            width,
+            height,
+            pt_on_handle,
+            tol
+        ));
+
+        // Slightly to the left or right of right edge within tolerance -> must hit
+        let pt_near_edge = egui::pos2(284.0, 160.0);
+        assert!(hit_test_resize_handle(
+            pos,
+            width,
+            height,
+            pt_near_edge,
+            tol
+        ));
+
+        // Far outside horizontally -> must not hit
+        let pt_far_right = egui::pos2(295.0, 170.0);
+        assert!(!hit_test_resize_handle(
+            pos,
+            width,
+            height,
+            pt_far_right,
+            tol
+        ));
+
+        // Inside the box center -> must not hit resize handle (this is for dragging or typing, not resize)
+        let pt_box_center = egui::pos2(190.0, 170.0);
+        assert!(!hit_test_resize_handle(
+            pos,
+            width,
+            height,
+            pt_box_center,
+            tol
+        ));
+
+        // Outside vertically -> must not hit
+        let pt_above = egui::pos2(280.0, 130.0);
+        assert!(!hit_test_resize_handle(pos, width, height, pt_above, tol));
     }
 }
