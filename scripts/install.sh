@@ -61,8 +61,9 @@ Keywords=PDF;Viewer;Reader;Documents;Verso;
 StartupWMClass=verso-reader
 EOF
 
-cp "$APPS_DIR/verso-reader.desktop" "$APPS_DIR/pdfview.desktop"
-chmod +x "$APPS_DIR/verso-reader.desktop" "$APPS_DIR/pdfview.desktop"
+# Remove legacy desktop file if present to prevent duplicate launcher icons
+rm -f "$APPS_DIR/pdfview.desktop" "$HOME/Desktop/pdfview.desktop" 2>/dev/null || true
+chmod +x "$APPS_DIR/verso-reader.desktop"
 
 # 6. Update desktop & icon databases
 if command -v update-desktop-database >/dev/null 2>&1; then

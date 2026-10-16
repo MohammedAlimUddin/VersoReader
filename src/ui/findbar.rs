@@ -1,8 +1,12 @@
 //! Find/search bar UI component (Milestone 6).
 
-use egui::{Color32, RichText, Ui};
+use egui::{vec2, Color32, RichText, Sense, Ui};
 
 use crate::pdf::types::SearchMatch;
+use crate::ui::icons::{
+    paint_chevron_down, paint_chevron_up, paint_close, paint_search, render_icon_button,
+};
+use crate::ui::theme::Theme;
 
 /// Actions emitted by the Find bar.
 #[derive(Debug, Clone, PartialEq)]
@@ -76,11 +80,15 @@ pub fn render_find_bar(
     let mut action = None;
 
     ui.horizontal(|ui| {
-        ui.label(RichText::new("🔍").size(13.0));
+        // Vector search icon
+        let (icon_rect, _) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::hover());
+        paint_search(ui.painter(), icon_rect, Theme::TEXT_SECONDARY);
 
         let text_edit = egui::TextEdit::singleline(query)
             .hint_text("Find in document...")
-            .desired_width(180.0);
+            .desired_width(140.0)
+            .margin(egui::Margin::symmetric(8, 6))
+            .min_size(vec2(140.0, 28.0));
         let response = ui.add(text_edit);
 
         if *focus_requested {
@@ -111,52 +119,64 @@ pub fn render_find_bar(
         };
 
         if !count_text.is_empty() {
+            ui.add_space(2.0);
             ui.label(
                 RichText::new(count_text)
                     .size(12.0)
                     .color(Color32::from_rgb(180, 180, 185)),
             );
+            ui.add_space(2.0);
         }
 
-        // Prev and Next navigation buttons
+        // Prev and Next navigation buttons with vector chevrons
         let has_matches = match_count > 0;
 
-        let prev_btn = ui
-            .add_enabled(
-                has_matches,
-                egui::Button::new(RichText::new("▲").size(11.0)),
-            )
-            .on_hover_cursor(egui::CursorIcon::PointingHand)
-            .on_hover_text("Previous match (Shift+Enter)");
+        let prev_btn = render_icon_button(
+            ui,
+            vec2(26.0, 26.0),
+            false,
+            has_matches,
+            "Previous match (Shift+Enter)",
+            paint_chevron_up,
+        );
         if prev_btn.clicked() {
             action = Some(FindBarAction::PrevMatch);
         }
 
-        let next_btn = ui
-            .add_enabled(
-                has_matches,
-                egui::Button::new(RichText::new("▼").size(11.0)),
-            )
-            .on_hover_cursor(egui::CursorIcon::PointingHand)
-            .on_hover_text("Next match (Enter)");
+        let next_btn = render_icon_button(
+            ui,
+            vec2(26.0, 26.0),
+            false,
+            has_matches,
+            "Next match (Enter)",
+            paint_chevron_down,
+        );
         if next_btn.clicked() {
             action = Some(FindBarAction::NextMatch);
         }
 
-        // Keyboard navigation while search input is focused
-        if response.has_focus() {
-            if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                if ui.input(|i| i.modifiers.shift) {
-                    action = Some(FindBarAction::PrevMatch);
-                } else {
-                    action = Some(FindBarAction::NextMatch);
-                }
-            } else if ui.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
+        // Keyboard navigation: Enter moves to next match (Shift+Enter to previous), and retains focus
+        let enter_pressed = (response.has_focus()
+            || (response.lost_focus() && !ui.input(|i| i.key_pressed(egui::Key::Escape))))
+            && ui.input(|i| i.key_pressed(egui::Key::Enter));
+
+        if enter_pressed {
+            response.request_focus();
+            if ui.input(|i| i.modifiers.shift) {
+                action = Some(FindBarAction::PrevMatch);
+            } else {
+                action = Some(FindBarAction::NextMatch);
+            }
+        } else if response.has_focus() {
+            if ui.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
                 action = Some(FindBarAction::NextMatch);
             } else if ui.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
                 action = Some(FindBarAction::PrevMatch);
+            } else if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                action = Some(FindBarAction::Close);
             }
         }
+
         if ui.input(|i| i.key_pressed(egui::Key::F3)) {
             if ui.input(|i| i.modifiers.shift) {
                 action = Some(FindBarAction::PrevMatch);
@@ -165,20 +185,22 @@ pub fn render_find_bar(
             }
         }
 
-        // Close button on the right
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let close_btn = ui
-                .add(
-                    egui::Button::new(RichText::new("×").size(14.0))
-                        .frame(false)
-                        .min_size(egui::vec2(18.0, 18.0)),
-                )
-                .on_hover_cursor(egui::CursorIcon::PointingHand)
-                .on_hover_text("Close find bar (Esc)");
-            if close_btn.clicked() {
-                action = Some(FindBarAction::Close);
-            }
-        });
+        ui.add_space(4.0);
+        ui.separator();
+        ui.add_space(2.0);
+
+        // Close button with vector cross
+        let close_btn = render_icon_button(
+            ui,
+            vec2(24.0, 24.0),
+            false,
+            true,
+            "Close find bar (Esc)",
+            paint_close,
+        );
+        if close_btn.clicked() {
+            action = Some(FindBarAction::Close);
+        }
     });
 
     action
@@ -244,5 +266,17 @@ mod tests {
         assert!(state.matches.is_empty());
         assert_eq!(state.current_match_idx, None);
         assert!(!state.is_searching);
+    }
+
+    #[test]
+    fn test_find_bar_action_variants() {
+        assert_eq!(FindBarAction::NextMatch, FindBarAction::NextMatch);
+        assert_eq!(FindBarAction::PrevMatch, FindBarAction::PrevMatch);
+        assert_eq!(FindBarAction::Close, FindBarAction::Close);
+        assert_eq!(
+            FindBarAction::QueryChanged("search".to_string()),
+            FindBarAction::QueryChanged("search".to_string())
+        );
+        assert_ne!(FindBarAction::NextMatch, FindBarAction::PrevMatch);
     }
 }

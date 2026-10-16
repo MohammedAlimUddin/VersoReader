@@ -3,6 +3,7 @@ name: VersoReader CI
 on:
   push:
     branches: [ "main", "master" ]
+    tags: [ "v*" ]
   pull_request:
     branches: [ "main", "master" ]
 
@@ -12,6 +13,8 @@ env:
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout repository
@@ -54,4 +57,15 @@ jobs:
           name: verso-reader-linux-x86_64
           path: dist/verso-reader-linux-x86_64.tar.gz
           retention-days: 30
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/verso-reader-linux-x86_64.tar.gz
+            dist/verso-reader-linux-x86_64.tar.gz.sha256
+          draft: false
+          prerelease: false
+          generate_release_notes: true
 

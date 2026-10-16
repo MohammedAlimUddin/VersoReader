@@ -114,14 +114,14 @@ pub fn render_sidebar_toc(
     ui.horizontal(|ui| {
         ui.label(RichText::new("Table of Contents").strong().size(13.5));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let close_btn = ui
-                .add(
-                    egui::Button::new(RichText::new("×").size(14.0))
-                        .frame(false)
-                        .min_size(egui::vec2(18.0, 18.0)),
-                )
-                .on_hover_cursor(egui::CursorIcon::PointingHand)
-                .on_hover_text("Close sidebar");
+            let close_btn = crate::ui::icons::render_icon_button(
+                ui,
+                egui::vec2(22.0, 22.0),
+                false,
+                true,
+                "Close sidebar",
+                crate::ui::icons::paint_close,
+            );
             if close_btn.clicked() {
                 output.close_requested = true;
             }

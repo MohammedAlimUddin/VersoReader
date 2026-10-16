@@ -124,6 +124,12 @@ impl TextureCache {
         }
     }
 
+    /// Dynamically updates the maximum cache memory budget in bytes, evicting textures if needed.
+    pub fn set_max_bytes(&mut self, max_bytes: usize) {
+        self.max_bytes = max_bytes;
+        self.evict_to_cap();
+    }
+
     /// Drops all cached textures for a given document.
     #[allow(dead_code)]
     pub fn clear_doc(&mut self, doc_id: DocId) {
@@ -409,5 +415,13 @@ mod tests {
         // Clear doc
         cache.clear_doc(1);
         assert_eq!(cache.len(), 0);
+    }
+
+    #[test]
+    fn test_cache_set_max_bytes() {
+        let mut cache = TextureCache::new(50_000);
+        assert_eq!(cache.max_bytes(), 50_000);
+        cache.set_max_bytes(100_000);
+        assert_eq!(cache.max_bytes(), 100_000);
     }
 }

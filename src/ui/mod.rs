@@ -1,4 +1,5 @@
 pub mod findbar;
+pub mod icons;
 pub mod pathbar;
 pub mod settings_tab;
 pub mod sidebar_toc;

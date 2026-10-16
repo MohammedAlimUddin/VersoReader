@@ -427,6 +427,12 @@ pub enum Event {
         doc_id: DocId,
         items: Vec<OutlineItem>,
     },
+    /// Background extracted annotations from document pages.
+    AnnotationsExtracted {
+        doc_id: DocId,
+        annotations: Vec<crate::annotations::Highlight>,
+        text_boxes: Vec<crate::annotations::TextBox>,
+    },
     /// Search results streamed per page.
     SearchResults {
         doc_id: DocId,

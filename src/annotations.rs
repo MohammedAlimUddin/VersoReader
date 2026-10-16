@@ -103,6 +103,7 @@ impl Highlight {
     }
 
     /// Enclosing bounding rectangle in canonical points.
+    #[allow(dead_code)]
     pub fn bounding_rect(&self) -> Option<CanonicalRect> {
         let mut min_x = f32::MAX;
         let mut min_y = f32::MAX;

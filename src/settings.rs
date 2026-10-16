@@ -17,7 +17,7 @@ fn default_highlighter_thickness() -> f32 {
 }
 
 fn default_touchpad_scroll_speed() -> f32 {
-    3.5
+    4.5
 }
 
 fn default_mouse_wheel_speed() -> f32 {
@@ -30,6 +30,10 @@ fn default_text_font_size() -> f32 {
 
 fn default_text_color() -> AnnotationColor {
     AnnotationColor::new(0, 0, 0)
+}
+
+fn default_cache_size_mb() -> usize {
+    150
 }
 
 /// Persistent user settings saved in ~/.config/pdfview/settings.toml.
@@ -51,6 +55,8 @@ pub struct Settings {
     pub touchpad_scroll_speed: f32,
     #[serde(default = "default_mouse_wheel_speed")]
     pub mouse_wheel_speed: f32,
+    #[serde(default = "default_cache_size_mb")]
+    pub cache_size_mb: usize,
 }
 
 impl Default for Settings {
@@ -64,6 +70,7 @@ impl Default for Settings {
             pathbar_collapsed: false,
             touchpad_scroll_speed: default_touchpad_scroll_speed(),
             mouse_wheel_speed: default_mouse_wheel_speed(),
+            cache_size_mb: default_cache_size_mb(),
         }
     }
 }
@@ -122,8 +129,9 @@ mod tests {
         assert_eq!(s.text_color, AnnotationColor::new(0, 0, 0));
         assert!(!s.sidebar_open);
         assert!(!s.pathbar_collapsed);
-        assert_eq!(s.touchpad_scroll_speed, 3.5);
+        assert_eq!(s.touchpad_scroll_speed, 4.5);
         assert_eq!(s.mouse_wheel_speed, 1.0);
+        assert_eq!(s.cache_size_mb, 150);
     }
 
     #[test]
@@ -137,6 +145,7 @@ mod tests {
             pathbar_collapsed: true,
             touchpad_scroll_speed: 3.0,
             mouse_wheel_speed: 1.5,
+            cache_size_mb: 200,
         };
         let serialized = toml::to_string_pretty(&s).expect("serialize settings");
         let deserialized: Settings = toml::from_str(&serialized).expect("deserialize settings");

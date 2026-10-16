@@ -31,9 +31,11 @@ pub struct ContextMenuState {
 }
 
 /// Actions dispatched from the viewer context menu.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ViewerAction {
     Copy,
+    HighlightSelection,
+    AddTextNote(usize, [f32; 2]),
     SelectAllPage(usize),
     SelectAllDocument,
 }
@@ -84,6 +86,42 @@ pub fn compute_sharp_page_geometry(
     };
     let screen_rect = Rect::from_min_size(screen_origin, vec2(screen_w, screen_h));
     (sharp_width, bitmap_h_px as u32, screen_rect)
+}
+
+/// Draws a vertical dotted-line rectangle centered at the cursor for the highlighter tool over non-text whitespace.
+pub fn draw_dotted_vertical_rect(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    width: f32,
+    height: f32,
+) {
+    let rect = Rect::from_center_size(center, vec2(width, height));
+    // Subtle background tint ensures interior stands out cleanly over any document content
+    painter.rect_filled(
+        rect,
+        0.0,
+        Color32::from_rgba_unmultiplied(255, 255, 255, 120),
+    );
+    // Prominent black border with thick dashed segments for maximum visibility on white pages
+    let stroke = Stroke::new(2.0_f32, Color32::BLACK);
+    let dash = 4.0;
+    let gap = 2.0;
+    let step = dash + gap;
+
+    let mut x = rect.min.x;
+    while x < rect.max.x {
+        let x2 = (x + dash).min(rect.max.x);
+        painter.line_segment([pos2(x, rect.min.y), pos2(x2, rect.min.y)], stroke);
+        painter.line_segment([pos2(x, rect.max.y), pos2(x2, rect.max.y)], stroke);
+        x += step;
+    }
+    let mut y = rect.min.y;
+    while y < rect.max.y {
+        let y2 = (y + dash).min(rect.max.y);
+        painter.line_segment([pos2(rect.min.x, y), pos2(rect.min.x, y2)], stroke);
+        painter.line_segment([pos2(rect.max.x, y), pos2(rect.max.x, y2)], stroke);
+        y += step;
+    }
 }
 
 /// Helper to test if a canonical point hits the right-edge resize handle of a text box.
@@ -348,6 +386,7 @@ pub fn render_viewer(
                 .button_double_clicked(egui::PointerButton::Primary)
         });
         let mut autoscroll_delta: f32 = 0.0;
+        let mut show_highlighter_rect_cursor: Option<egui::Pos2> = None;
 
         // Render right-click context menu popup if open
         let mut menu_consumed_pointer = false;
@@ -364,6 +403,31 @@ pub fn render_viewer(
                         let copy_btn = egui::Button::new("Copy\tCtrl+C");
                         if ui.add_enabled(has_sel, copy_btn).clicked() {
                             action = Some(ViewerAction::Copy);
+                            close_menu = true;
+                        }
+
+                        let hl_btn = egui::Button::new("Highlight Selection");
+                        if ui.add_enabled(has_sel, hl_btn).clicked() {
+                            action = Some(ViewerAction::HighlightSelection);
+                            close_menu = true;
+                        }
+
+                        if ui.button("Add Text Note Here").clicked() {
+                            let can_pt = visible_info
+                                .iter()
+                                .find(|info| info.page == menu.page)
+                                .map(|info| info.transform.screen_to_canonical(menu.pos))
+                                .unwrap_or_else(|| {
+                                    let transform = PageTransform::new(
+                                        page_sizes[menu.page],
+                                        zoom,
+                                        rotation,
+                                        menu.pos,
+                                    );
+                                    transform.screen_to_canonical(menu.pos)
+                                });
+                            action =
+                                Some(ViewerAction::AddTextNote(menu.page, [can_pt.x, can_pt.y]));
                             close_menu = true;
                         }
 
@@ -564,8 +628,10 @@ pub fn render_viewer(
                         if is_over_resize_handle {
                             ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
                         } else {
+                            let mut cursor_handled = false;
                             for info in &visible_info {
                                 if info.screen_rect.contains(pos) {
+                                    cursor_handled = true;
                                     let can_pt = info.transform.screen_to_canonical(pos);
                                     if annotations.text_boxes.iter().any(|tb| {
                                         tb.page == info.page && tb.contains_canonical_point(can_pt)
@@ -577,6 +643,25 @@ pub fn render_viewer(
                                         ui.ctx().set_cursor_icon(egui::CursorIcon::Default);
                                         break;
                                     }
+                                    if active_tool == ActiveTool::Highlighter {
+                                        let force_freehand = ui.input(|i| i.modifiers.shift);
+                                        let over_text = if !force_freehand {
+                                            if let Some(ref text) = info.text {
+                                                text.is_hovering_text(can_pt)
+                                            } else {
+                                                false
+                                            }
+                                        } else {
+                                            false
+                                        };
+                                        if over_text {
+                                            ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
+                                        } else {
+                                            ui.ctx().set_cursor_icon(egui::CursorIcon::None);
+                                            show_highlighter_rect_cursor = Some(pos);
+                                        }
+                                        break;
+                                    }
                                     if active_tool == ActiveTool::None {
                                         if let Some(ref text) = info.text {
                                             if text.is_hovering_text(can_pt) {
@@ -586,6 +671,10 @@ pub fn render_viewer(
                                         }
                                     }
                                 }
+                            }
+                            if !cursor_handled && active_tool == ActiveTool::Highlighter {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::None);
+                                show_highlighter_rect_cursor = Some(pos);
                             }
                         }
                     }
@@ -772,26 +861,31 @@ pub fn render_viewer(
                                     for info in &visible_info {
                                         if info.screen_rect.contains(pos) {
                                             let can_pt = info.transform.screen_to_canonical(pos);
+                                            let force_freehand = ui.input(|i| i.modifiers.shift);
                                             let mut on_text = false;
-                                            if let Some(ref text) = info.text {
-                                                if text.is_hovering_text(can_pt) {
-                                                    if let Some(char_idx) = text.hit_test(can_pt) {
-                                                        *drag_start = Some(TextLocation::new(
-                                                            info.page, char_idx,
-                                                        ));
-                                                        ui.ctx().set_cursor_icon(
-                                                            egui::CursorIcon::Text,
-                                                        );
-                                                        on_text = true;
+                                            if !force_freehand {
+                                                if let Some(ref text) = info.text {
+                                                    if text.is_hovering_text(can_pt) {
+                                                        if let Some(char_idx) =
+                                                            text.hit_test(can_pt)
+                                                        {
+                                                            *drag_start = Some(TextLocation::new(
+                                                                info.page, char_idx,
+                                                            ));
+                                                            ui.ctx().set_cursor_icon(
+                                                                egui::CursorIcon::Text,
+                                                            );
+                                                            on_text = true;
+                                                        }
                                                     }
                                                 }
                                             }
                                             if !on_text {
-                                                // Freehand highlight drawing begins in non-text areas!
+                                                // Freehand highlight drawing begins in non-text areas (or when holding Shift)!
                                                 *freehand_stroke =
                                                     Some((info.page, vec![[can_pt.x, can_pt.y]]));
-                                                ui.ctx()
-                                                    .set_cursor_icon(egui::CursorIcon::Crosshair);
+                                                ui.ctx().set_cursor_icon(egui::CursorIcon::None);
+                                                show_highlighter_rect_cursor = Some(pos);
                                             }
                                             break;
                                         }
@@ -880,7 +974,8 @@ pub fn render_viewer(
                                 }
                             }
                         } else if let Some((fh_page, ref mut fh_pts)) = *freehand_stroke {
-                            ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::None);
+                            show_highlighter_rect_cursor = Some(pos);
                             for info in &visible_info {
                                 if info.page == fh_page {
                                     let can_pt = info.transform.screen_to_canonical(pos);
@@ -971,7 +1066,11 @@ pub fn render_viewer(
                                     ui.ctx().request_repaint();
                                 }
                             }
-                        } else if let Some((fh_page, fh_pts)) = freehand_stroke.take() {
+                        } else if let Some((fh_page, mut fh_pts)) = freehand_stroke.take() {
+                            if fh_pts.len() == 1 {
+                                // Single-click dot: duplicate point so path rendering draws it
+                                fh_pts.push(fh_pts[0]);
+                            }
                             if fh_pts.len() >= 2 {
                                 let id = generate_highlight_id();
                                 let stroke_thickness =
@@ -982,7 +1081,7 @@ pub fn render_viewer(
                                     rects: Vec::new(),
                                     points: fh_pts,
                                     color: highlighter_color,
-                                    alpha: 0.35,
+                                    alpha: 0.42,
                                     thickness: stroke_thickness,
                                 };
                                 annotations.highlights.push(hl.clone());
@@ -1132,61 +1231,45 @@ pub fn render_viewer(
                     }
                 }
 
-                // 1. Draw persistent freehand ink strokes on this page
-                for hl in &annotations.highlights {
-                    if hl.page == idx && !hl.points.is_empty() {
-                        let stroke_color = Color32::from_rgba_unmultiplied(
-                            hl.color.r,
-                            hl.color.g,
-                            hl.color.b,
-                            (0.35_f32 * 255.0_f32).round() as u8,
-                        );
-                        let stroke_thickness = (hl.thickness * zoom).max(1.5);
-                        let screen_points: Vec<egui::Pos2> = hl
-                            .points
-                            .iter()
-                            .map(|p| transform.canonical_to_screen(pos2(p[0], p[1])))
-                            .collect();
-                        if screen_points.len() >= 2 {
-                            painter.add(egui::epaint::PathShape::line(
-                                screen_points,
-                                Stroke::new(stroke_thickness, stroke_color),
-                            ));
-                        } else if let Some(&pt) = screen_points.first() {
-                            painter.circle_filled(pt, stroke_thickness * 0.5, stroke_color);
-                        }
-                    }
-                }
-
-                // 2. When texture is stale (e.g. pending worker re-render after highlight/erase/undo),
-                // render text highlights via egui overlay so the highlight never blinks or vanishes.
-                // Once the sharp texture arrives with generation >= render_generation, it contains
-                // native ISO 32000 multiply blending (FXDIB_BLEND_MULTIPLY) with 100% pitch-black text.
+                // 1. If the texture is stale (pending worker re-render after annotation change/undo),
+                // render temporary freehand stroke preview so there is zero vanishing gap.
+                // Once the sharp texture arrives with generation >= render_generation, it displays
+                // native ISO 32000 multiply blending directly from PDFium with 100% pitch-black text.
                 if is_stale {
                     for hl in &annotations.highlights {
-                        if hl.page == idx && !hl.rects.is_empty() {
-                            let hl_color = Color32::from_rgba_unmultiplied(
+                        if hl.page == idx && !hl.points.is_empty() {
+                            let stroke_color = Color32::from_rgba_unmultiplied(
                                 hl.color.r,
                                 hl.color.g,
                                 hl.color.b,
-                                (0.28_f32 * 255.0_f32).round() as u8,
+                                (0.42_f32 * 255.0_f32).round() as u8,
                             );
-                            for r in &hl.rects {
-                                let screen_r = transform.canonical_to_screen_rect(r.to_egui_rect());
-                                painter.rect_filled(screen_r, 0.0, hl_color);
+                            let stroke_thickness = (hl.thickness * zoom).max(1.5);
+                            let screen_points: Vec<egui::Pos2> = hl
+                                .points
+                                .iter()
+                                .map(|p| transform.canonical_to_screen(pos2(p[0], p[1])))
+                                .collect();
+                            if screen_points.len() >= 2 {
+                                painter.add(egui::epaint::PathShape::line(
+                                    screen_points,
+                                    Stroke::new(stroke_thickness, stroke_color),
+                                ));
+                            } else if let Some(&pt) = screen_points.first() {
+                                painter.circle_filled(pt, stroke_thickness * 0.5, stroke_color);
                             }
                         }
                     }
                 }
 
-                // 3. Draw live freehand stroke preview if currently drawing on this page
+                // 2. Draw live freehand stroke preview if currently drawing on this page
                 if let Some((stroke_page, ref stroke_pts)) = *freehand_stroke {
                     if stroke_page == idx && !stroke_pts.is_empty() {
                         let live_color = Color32::from_rgba_unmultiplied(
                             highlighter_color.r,
                             highlighter_color.g,
                             highlighter_color.b,
-                            (0.35_f32 * 255.0_f32).round() as u8,
+                            (0.42_f32 * 255.0_f32).round() as u8,
                         );
                         let stroke_thickness = (12.0 * highlighter_thickness * zoom).max(1.5);
                         let screen_points: Vec<egui::Pos2> = stroke_pts
@@ -1267,7 +1350,7 @@ pub fn render_viewer(
                                                 highlighter_color.r,
                                                 highlighter_color.g,
                                                 highlighter_color.b,
-                                                (0.28_f32 * 255.0_f32).round() as u8,
+                                                (0.42_f32 * 255.0_f32).round() as u8,
                                             )
                                         } else {
                                             Color32::from_rgba_unmultiplied(245, 90, 40, 115)
@@ -1428,6 +1511,16 @@ pub fn render_viewer(
                     });
                 }
             }
+        }
+
+        // Draw custom dotted vertical rectangle cursor in Foreground layer so it is guaranteed to be drawn on top of all page textures
+        if let Some(cursor_pos) = show_highlighter_rect_cursor {
+            let fg_painter = ui.ctx().layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("highlighter_custom_cursor"),
+            ));
+            let clipped = fg_painter.with_clip_rect(ui.clip_rect());
+            draw_dotted_vertical_rect(&clipped, cursor_pos, 8.0, 22.0);
         }
 
         autoscroll_delta
@@ -1596,6 +1689,13 @@ mod tests {
         let action = ViewerAction::SelectAllPage(2);
         assert_eq!(action, ViewerAction::SelectAllPage(2));
         assert_ne!(action, ViewerAction::SelectAllDocument);
+        assert_eq!(
+            ViewerAction::HighlightSelection,
+            ViewerAction::HighlightSelection
+        );
+        let note = ViewerAction::AddTextNote(1, [100.0, 200.0]);
+        assert_eq!(note, ViewerAction::AddTextNote(1, [100.0, 200.0]));
+        assert_ne!(note, ViewerAction::HighlightSelection);
     }
 
     #[test]
@@ -1746,5 +1846,15 @@ mod tests {
         // Outside vertically -> must not hit
         let pt_above = egui::pos2(280.0, 130.0);
         assert!(!hit_test_resize_handle(pos, width, height, pt_above, tol));
+    }
+
+    #[test]
+    fn test_draw_dotted_vertical_rect() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                draw_dotted_vertical_rect(ui.painter(), pos2(100.0, 100.0), 8.0, 22.0);
+            });
+        });
     }
 }

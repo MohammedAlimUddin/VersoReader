@@ -31,7 +31,7 @@ impl Theme {
     // Tab Specific
     pub const TAB_ACTIVE_BG: Color32 = Color32::from_rgb(42, 42, 45);
     pub const TAB_INACTIVE_BG: Color32 = Color32::from_rgb(30, 30, 30);
-    pub const TAB_INACTIVE_HOVER_BG: Color32 = Color32::from_rgb(38, 38, 42);
+    pub const TAB_INACTIVE_HOVER_BG: Color32 = Color32::from_rgb(58, 60, 68);
     pub const TAB_INDICATOR: Color32 = Color32::from_rgb(0, 120, 212);
 
     // Action Colors
@@ -95,8 +95,8 @@ impl Theme {
         visuals.widgets.open.bg_stroke = Stroke::new(1.0_f32, Self::ACCENT_PRIMARY);
         visuals.widgets.open.corner_radius = Self::RADIUS;
 
-        // Selection styling
-        visuals.selection.bg_fill = Color32::from_rgba_premultiplied(0, 120, 212, 120);
+        // Selection styling (soft light-blue tinted background matching Fluent active state)
+        visuals.selection.bg_fill = Color32::from_rgba_premultiplied(0, 120, 212, 55);
         visuals.selection.stroke = Stroke::new(1.0_f32, Self::ACCENT_PRIMARY);
 
         ctx.set_visuals(visuals);

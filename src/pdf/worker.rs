@@ -122,9 +122,18 @@ fn worker_main(ctx: egui::Context, rx_cmd: Receiver<Command>, tx_evt: Sender<Eve
         total_pages: usize,
     }
 
+    struct ActiveAnnotationScan {
+        doc_id: DocId,
+        current_page: usize,
+        total_pages: usize,
+    }
+
     let mut documents: HashMap<DocId, PdfDocument<'static>> = HashMap::new();
     let mut latest_generations: HashMap<DocId, u64> = HashMap::new();
+    let mut doc_annotated_pages: HashMap<DocId, HashSet<usize>> = HashMap::new();
+    let mut doc_freehand_highlights: HashMap<DocId, Vec<Highlight>> = HashMap::new();
     let mut active_search: Option<ActiveSearch> = None;
+    let mut active_annotation_scan: Option<ActiveAnnotationScan> = None;
     let mut cmd_queue: std::collections::VecDeque<Command> = std::collections::VecDeque::new();
 
     // Command loop: processes incoming UI requests sequentially on the worker thread.
@@ -132,7 +141,7 @@ fn worker_main(ctx: egui::Context, rx_cmd: Receiver<Command>, tx_evt: Sender<Eve
     loop {
         // If local queue is empty, wait for next command from channel
         if cmd_queue.is_empty() {
-            let next = if active_search.is_some() {
+            let next = if active_search.is_some() || active_annotation_scan.is_some() {
                 match rx_cmd.try_recv() {
                     Ok(cmd) => Some(cmd),
                     Err(crossbeam_channel::TryRecvError::Empty) => None,
@@ -206,12 +215,11 @@ fn worker_main(ctx: egui::Context, rx_cmd: Receiver<Command>, tx_evt: Sender<Eve
                                 let page_count = doc.pages().len() as usize;
                                 let mut page_sizes = Vec::with_capacity(page_count);
 
-                                for idx in 0..doc.pages().len() {
-                                    if let Ok(page) = doc.pages().get(idx) {
-                                        // Canonical points: origin top-left, unrotated page
+                                for idx in 0..page_count {
+                                    if let Ok(rect) = doc.pages().page_size(idx as i32) {
                                         page_sizes.push(PageSize {
-                                            width: page.width().value,
-                                            height: page.height().value,
+                                            width: rect.width().value,
+                                            height: rect.height().value,
                                         });
                                     } else {
                                         page_sizes.push(PageSize {
@@ -221,8 +229,28 @@ fn worker_main(ctx: egui::Context, rx_cmd: Receiver<Command>, tx_evt: Sender<Eve
                                     }
                                 }
 
-                                let (annotations, text_boxes) = extract_annotations_from_doc(&doc);
-                                let _ = apply_highlights_to_doc(&doc, &annotations);
+                                let mut annotations = Vec::new();
+                                let mut text_boxes = Vec::new();
+                                if page_count > 0 {
+                                    if let Ok(mut page0) = doc.pages().get(0) {
+                                        extract_annotations_from_page(
+                                            &mut page0,
+                                            0,
+                                            &mut annotations,
+                                            &mut text_boxes,
+                                        );
+                                    }
+                                }
+
+                                doc_annotated_pages.insert(doc_id, HashSet::new());
+                                doc_freehand_highlights.insert(
+                                    doc_id,
+                                    annotations
+                                        .iter()
+                                        .filter(|h| !h.points.is_empty())
+                                        .cloned()
+                                        .collect(),
+                                );
                                 documents.insert(doc_id, doc);
                                 let _ = tx_evt.send(Event::Opened {
                                     doc_id,
@@ -232,6 +260,16 @@ fn worker_main(ctx: egui::Context, rx_cmd: Receiver<Command>, tx_evt: Sender<Eve
                                     text_boxes,
                                 });
                                 ctx.request_repaint();
+
+                                if page_count > 1 {
+                                    active_annotation_scan = Some(ActiveAnnotationScan {
+                                        doc_id,
+                                        current_page: 1,
+                                        total_pages: page_count,
+                                    });
+                                } else {
+                                    active_annotation_scan = None;
+                                }
                             }
                             Err(err) => {
                                 let _ = tx_evt.send(Event::OpenError {
@@ -291,7 +329,36 @@ fn worker_main(ctx: egui::Context, rx_cmd: Receiver<Command>, tx_evt: Sender<Eve
                                         Ok(bitmap) => {
                                             let w = bitmap.width() as u32;
                                             let h = bitmap.height() as u32;
-                                            let rgba = bitmap.as_rgba_bytes();
+                                            let mut rgba = bitmap.as_rgba_bytes();
+
+                                            if let Some(fhs) =
+                                                doc_freehand_highlights.get(&render_cmd.doc_id)
+                                            {
+                                                let page_fhs: Vec<&Highlight> = fhs
+                                                    .iter()
+                                                    .filter(|hl| hl.page == render_cmd.page)
+                                                    .collect();
+                                                if !page_fhs.is_empty() {
+                                                    let (canon_w, canon_h) = doc
+                                                        .pages()
+                                                        .page_size(render_cmd.page as i32)
+                                                        .map(|r| {
+                                                            (r.width().value, r.height().value)
+                                                        })
+                                                        .unwrap_or((612.0, 792.0));
+                                                    for hl in page_fhs {
+                                                        rasterize_freehand_highlight(
+                                                            &mut rgba,
+                                                            w as usize,
+                                                            h as usize,
+                                                            hl,
+                                                            canon_w,
+                                                            canon_h,
+                                                            render_cmd.rotation,
+                                                        );
+                                                    }
+                                                }
+                                            }
 
                                             let _ = tx_evt.send(Event::Rendered(RenderResult {
                                                 doc_id: render_cmd.doc_id,
@@ -341,6 +408,13 @@ fn worker_main(ctx: egui::Context, rx_cmd: Receiver<Command>, tx_evt: Sender<Eve
                             active_search = None;
                         }
                     }
+                    if let Some(ref s) = active_annotation_scan {
+                        if s.doc_id == doc_id {
+                            active_annotation_scan = None;
+                        }
+                    }
+                    doc_annotated_pages.remove(&doc_id);
+                    doc_freehand_highlights.remove(&doc_id);
                     documents.remove(&doc_id);
                     latest_generations.remove(&doc_id);
                 }
@@ -493,8 +567,27 @@ fn worker_main(ctx: egui::Context, rx_cmd: Receiver<Command>, tx_evt: Sender<Eve
                     highlights,
                     text_boxes: _,
                 } => {
+                    let fh: Vec<Highlight> = highlights
+                        .iter()
+                        .filter(|h| !h.points.is_empty())
+                        .cloned()
+                        .collect();
+                    doc_freehand_highlights.insert(doc_id, fh);
+
                     if let Some(doc) = documents.get(&doc_id) {
-                        let _ = apply_highlights_to_doc(doc, &highlights);
+                        let mut target_pages =
+                            doc_annotated_pages.remove(&doc_id).unwrap_or_default();
+                        for hl in &highlights {
+                            target_pages.insert(hl.page);
+                        }
+                        let _ = apply_annotations_to_doc_on_pages(
+                            doc,
+                            &highlights,
+                            &[],
+                            target_pages.iter().copied(),
+                        );
+                        let new_pages: HashSet<usize> = highlights.iter().map(|h| h.page).collect();
+                        doc_annotated_pages.insert(doc_id, new_pages);
                     }
                 }
                 Command::SaveDoc {
@@ -504,11 +597,35 @@ fn worker_main(ctx: egui::Context, rx_cmd: Receiver<Command>, tx_evt: Sender<Eve
                     text_boxes,
                 } => {
                     if let Some(doc) = documents.get(&doc_id) {
-                        match apply_annotations_to_doc(doc, &highlights, &text_boxes) {
+                        let mut target_pages =
+                            doc_annotated_pages.remove(&doc_id).unwrap_or_default();
+                        for hl in &highlights {
+                            target_pages.insert(hl.page);
+                        }
+                        for tb in &text_boxes {
+                            target_pages.insert(tb.page);
+                        }
+                        match apply_annotations_to_doc_on_pages(
+                            doc,
+                            &highlights,
+                            &text_boxes,
+                            target_pages.iter().copied(),
+                        ) {
                             Ok(_) => {
                                 let save_res = doc.save_to_bytes();
                                 // Keep in-memory document clean of FreeText annotations so PDFium won't render black boxes
-                                let _ = apply_highlights_to_doc(doc, &highlights);
+                                let _ = apply_annotations_to_doc_on_pages(
+                                    doc,
+                                    &highlights,
+                                    &[],
+                                    target_pages.iter().copied(),
+                                );
+                                let new_pages: HashSet<usize> = highlights
+                                    .iter()
+                                    .map(|h| h.page)
+                                    .chain(text_boxes.iter().map(|t| t.page))
+                                    .collect();
+                                doc_annotated_pages.insert(doc_id, new_pages);
                                 match save_res {
                                     Ok(bytes) => {
                                         let tmp_path = path.with_extension("pdf.tmp_pdfview");
@@ -553,7 +670,12 @@ fn worker_main(ctx: egui::Context, rx_cmd: Receiver<Command>, tx_evt: Sender<Eve
                                 }
                             }
                             Err(err) => {
-                                let _ = apply_highlights_to_doc(doc, &highlights);
+                                let _ = apply_annotations_to_doc_on_pages(
+                                    doc,
+                                    &highlights,
+                                    &[],
+                                    target_pages.iter().copied(),
+                                );
                                 let _ = tx_evt.send(Event::Saved {
                                     doc_id,
                                     success: false,
@@ -599,7 +721,85 @@ fn worker_main(ctx: egui::Context, rx_cmd: Receiver<Command>, tx_evt: Sender<Eve
             } else {
                 search.current_page += 1;
             }
+        } else if let Some(ref mut scan) = active_annotation_scan {
+            let start = scan.current_page;
+            let end = (scan.current_page + 10).min(scan.total_pages);
+            let mut found_hl = Vec::new();
+            let mut found_tb = Vec::new();
+
+            if let Some(doc) = documents.get(&scan.doc_id) {
+                for p_idx in start..end {
+                    if let Ok(mut page) = doc.pages().get(p_idx as i32) {
+                        extract_annotations_from_page(
+                            &mut page,
+                            p_idx,
+                            &mut found_hl,
+                            &mut found_tb,
+                        );
+                    }
+                }
+            }
+
+            if !found_hl.is_empty() || !found_tb.is_empty() {
+                let fh_found: Vec<Highlight> = found_hl
+                    .iter()
+                    .filter(|h| !h.points.is_empty())
+                    .cloned()
+                    .collect();
+                if !fh_found.is_empty() {
+                    doc_freehand_highlights
+                        .entry(scan.doc_id)
+                        .or_default()
+                        .extend(fh_found);
+                }
+
+                let _ = tx_evt.send(Event::AnnotationsExtracted {
+                    doc_id: scan.doc_id,
+                    annotations: found_hl,
+                    text_boxes: found_tb,
+                });
+                ctx.request_repaint();
+            }
+
+            scan.current_page = end;
+            if scan.current_page >= scan.total_pages {
+                active_annotation_scan = None;
+            }
         }
+    }
+}
+
+pub fn get_page_crop_and_rotation(page: &PdfPage) -> (PdfRect, PdfPageRenderRotation) {
+    let crop_box = if let Ok(crop) = page.boundaries().crop() {
+        crop.bounds
+    } else if let Ok(media) = page.boundaries().media() {
+        media.bounds
+    } else {
+        PdfRect::new(
+            PdfPoints::ZERO,
+            PdfPoints::ZERO,
+            page.height(),
+            page.width(),
+        )
+    };
+    let rotation = page.rotation().unwrap_or(PdfPageRenderRotation::None);
+    (crop_box, rotation)
+}
+
+pub fn canonical_point_to_user(
+    can_x: f32,
+    can_y: f32,
+    cl: f32,
+    cr: f32,
+    cb: f32,
+    ct: f32,
+    rotation: PdfPageRenderRotation,
+) -> (f32, f32) {
+    match rotation {
+        PdfPageRenderRotation::None => (can_x + cl, ct - can_y),
+        PdfPageRenderRotation::Degrees90 => (can_y + cl, can_x + cb),
+        PdfPageRenderRotation::Degrees180 => (cr - can_x, can_y + cb),
+        PdfPageRenderRotation::Degrees270 => (cr - can_y, ct - can_x),
     }
 }
 
@@ -806,186 +1006,377 @@ fn safe_extract_annot_font_size(
     default_font_size
 }
 
+/// Rasterizes a smooth, continuous, anti-aliased freehand highlight stroke directly
+/// onto an RGBA page bitmap using authentic ISO 32000 Multiply blend mode.
+///
+/// Features:
+/// - Continuous polyline pathing with round joints and round caps: zero gaps, seams, or discrete sticks.
+/// - Coverage-based anti-aliasing: smooth sub-pixel borders.
+/// - Authentic Multiply blending: white paper becomes saturated highlight ink,
+///   while black text remains 100% pitch-black and razor sharp.
+pub fn rasterize_freehand_highlight(
+    rgba: &mut [u8],
+    w: usize,
+    h: usize,
+    hl: &Highlight,
+    canon_w: f32,
+    canon_h: f32,
+    rotation: u16,
+) {
+    if hl.points.is_empty() || w == 0 || h == 0 {
+        return;
+    }
+
+    let rot = rotation % 360;
+    let (visual_w, visual_h) = match rot {
+        90 | 270 => (canon_h, canon_w),
+        _ => (canon_w, canon_h),
+    };
+
+    if visual_w <= 0.0 || visual_h <= 0.0 {
+        return;
+    }
+
+    let scale_x = w as f32 / visual_w;
+    let scale_y = h as f32 / visual_h;
+
+    // Convert canonical points (top-left unrotated) to bitmap pixel coordinates
+    let pixel_points: Vec<[f32; 2]> = hl
+        .points
+        .iter()
+        .map(|pt| {
+            let px = pt[0];
+            let py = pt[1];
+            let (rx, ry) = match rot {
+                90 => (canon_h - py, px),
+                180 => (canon_w - px, canon_h - py),
+                270 => (py, canon_w - px),
+                _ => (px, py),
+            };
+            [rx * scale_x, ry * scale_y]
+        })
+        .collect();
+
+    let stroke_radius = (hl.thickness * ((scale_x + scale_y) * 0.5) * 0.5).max(1.0);
+    let color_r = hl.color.r as f32;
+    let color_g = hl.color.g as f32;
+    let color_b = hl.color.b as f32;
+
+    // Bounding box of the entire stroke in bitmap pixel coordinates
+    let mut min_px = f32::MAX;
+    let mut max_px = f32::MIN;
+    let mut min_py = f32::MAX;
+    let mut max_py = f32::MIN;
+
+    for p in &pixel_points {
+        min_px = min_px.min(p[0]);
+        max_px = max_px.max(p[0]);
+        min_py = min_py.min(p[1]);
+        max_py = max_py.max(p[1]);
+    }
+
+    let pad = stroke_radius + 2.0;
+    let bb_min_x = ((min_px - pad).floor() as isize).clamp(0, w as isize - 1) as usize;
+    let bb_max_x = ((max_px + pad).ceil() as isize).clamp(0, w as isize - 1) as usize;
+    let bb_min_y = ((min_py - pad).floor() as isize).clamp(0, h as isize - 1) as usize;
+    let bb_max_y = ((max_py + pad).ceil() as isize).clamp(0, h as isize - 1) as usize;
+
+    if bb_max_x < bb_min_x || bb_max_y < bb_min_y {
+        return;
+    }
+
+    let box_w = bb_max_x - bb_min_x + 1;
+    let box_h = bb_max_y - bb_min_y + 1;
+    let mut coverage = vec![0.0_f32; box_w * box_h];
+
+    if pixel_points.len() == 1 {
+        // Single-click round dot
+        let cx = pixel_points[0][0];
+        let cy = pixel_points[0][1];
+        let outer_r = stroke_radius + 0.5;
+        let outer_r2 = outer_r * outer_r;
+
+        let dot_min_x = ((cx - stroke_radius - 1.0).floor() as isize)
+            .clamp(bb_min_x as isize, bb_max_x as isize) as usize;
+        let dot_max_x = ((cx + stroke_radius + 1.0).ceil() as isize)
+            .clamp(bb_min_x as isize, bb_max_x as isize) as usize;
+        let dot_min_y = ((cy - stroke_radius - 1.0).floor() as isize)
+            .clamp(bb_min_y as isize, bb_max_y as isize) as usize;
+        let dot_max_y = ((cy + stroke_radius + 1.0).ceil() as isize)
+            .clamp(bb_min_y as isize, bb_max_y as isize) as usize;
+
+        for py in dot_min_y..=dot_max_y {
+            let dy = py as f32 + 0.5 - cy;
+            let dy2 = dy * dy;
+            let row_offset = (py - bb_min_y) * box_w;
+            for px in dot_min_x..=dot_max_x {
+                let dx = px as f32 + 0.5 - cx;
+                let d2 = dx * dx + dy2;
+                if d2 <= outer_r2 {
+                    let d = d2.sqrt();
+                    let alpha = (stroke_radius + 0.5 - d).clamp(0.0, 1.0);
+                    let idx = row_offset + (px - bb_min_x);
+                    coverage[idx] = coverage[idx].max(alpha);
+                }
+            }
+        }
+    } else {
+        // Continuous polyline with round joins and round caps
+        let outer_r = stroke_radius + 0.5;
+        let outer_r2 = outer_r * outer_r;
+
+        for i in 0..pixel_points.len() - 1 {
+            let p1 = pixel_points[i];
+            let p2 = pixel_points[i + 1];
+
+            let seg_min_x = ((p1[0].min(p2[0]) - pad).floor() as isize)
+                .clamp(bb_min_x as isize, bb_max_x as isize) as usize;
+            let seg_max_x = ((p1[0].max(p2[0]) + pad).ceil() as isize)
+                .clamp(bb_min_x as isize, bb_max_x as isize) as usize;
+            let seg_min_y = ((p1[1].min(p2[1]) - pad).floor() as isize)
+                .clamp(bb_min_y as isize, bb_max_y as isize) as usize;
+            let seg_max_y = ((p1[1].max(p2[1]) + pad).ceil() as isize)
+                .clamp(bb_min_y as isize, bb_max_y as isize) as usize;
+
+            let vx = p2[0] - p1[0];
+            let vy = p2[1] - p1[1];
+            let len_sq = vx * vx + vy * vy;
+            let inv_len_sq = if len_sq > 0.0001 { 1.0 / len_sq } else { 0.0 };
+
+            for py in seg_min_y..=seg_max_y {
+                let my = py as f32 + 0.5;
+                let row_offset = (py - bb_min_y) * box_w;
+                for px in seg_min_x..=seg_max_x {
+                    let mx = px as f32 + 0.5;
+
+                    let d2 = if inv_len_sq > 0.0 {
+                        let t =
+                            (((mx - p1[0]) * vx + (my - p1[1]) * vy) * inv_len_sq).clamp(0.0, 1.0);
+                        let cx = p1[0] + t * vx;
+                        let cy = p1[1] + t * vy;
+                        let dx = mx - cx;
+                        let dy = my - cy;
+                        dx * dx + dy * dy
+                    } else {
+                        let dx = mx - p1[0];
+                        let dy = my - p1[1];
+                        dx * dx + dy * dy
+                    };
+
+                    if d2 <= outer_r2 {
+                        let d = d2.sqrt();
+                        let alpha = (stroke_radius + 0.5 - d).clamp(0.0, 1.0);
+                        let idx = row_offset + (px - bb_min_x);
+                        coverage[idx] = coverage[idx].max(alpha);
+                    }
+                }
+            }
+        }
+    }
+
+    // Blend into rgba buffer using ISO 32000 Multiply blend mode
+    for by in 0..box_h {
+        let py = bb_min_y + by;
+        let row_offset = by * box_w;
+        let img_row_offset = py * w * 4;
+        for bx in 0..box_w {
+            let cov = coverage[row_offset + bx];
+            if cov > 0.001 {
+                let px = bb_min_x + bx;
+                let pixel_idx = img_row_offset + px * 4;
+                if pixel_idx + 2 < rgba.len() {
+                    let r_bg = rgba[pixel_idx] as f32;
+                    let g_bg = rgba[pixel_idx + 1] as f32;
+                    let b_bg = rgba[pixel_idx + 2] as f32;
+
+                    // ISO 32000 Multiply formula: (bg * hl) / 255.0
+                    let r_mult = (r_bg * color_r) / 255.0;
+                    let g_mult = (g_bg * color_g) / 255.0;
+                    let b_mult = (b_bg * color_b) / 255.0;
+
+                    rgba[pixel_idx] = ((1.0 - cov) * r_bg + cov * r_mult).round() as u8;
+                    rgba[pixel_idx + 1] = ((1.0 - cov) * g_bg + cov * g_mult).round() as u8;
+                    rgba[pixel_idx + 2] = ((1.0 - cov) * b_bg + cov * b_mult).round() as u8;
+                }
+            }
+        }
+    }
+}
+
+/// Extracts existing Highlight, Ink, and FreeText annotations from a single PdfPage into canonical models.
+pub fn extract_annotations_from_page(
+    page: &mut PdfPage,
+    page_idx: usize,
+    highlights: &mut Vec<Highlight>,
+    text_boxes: &mut Vec<TextBox>,
+) {
+    let (crop_box, rotation) = get_page_crop_and_rotation(page);
+    let cl = crop_box.left().value;
+    let cr = crop_box.right().value;
+    let cb = crop_box.bottom().value;
+    let ct = crop_box.top().value;
+    let annots = page.annotations_mut();
+    let annot_count = annots.len();
+
+    for i in 0..annot_count {
+        let Ok(mut annot) = annots.get(i) else {
+            continue;
+        };
+
+        if let Some(hl_annot) = annot.as_highlight_annotation_mut() {
+            let annot_color =
+                safe_extract_annot_color(hl_annot.objects(), AnnotationColor::new(255, 235, 59));
+
+            let mut rects = Vec::new();
+            let pts = hl_annot.attachment_points_mut();
+            let pt_count = pts.len();
+            for p_idx in 0..pt_count {
+                if let Ok(q) = pts.get(p_idx) {
+                    let (p1_x, p1_y) =
+                        map_point(q.x1().value, q.y1().value, cl, cr, cb, ct, rotation);
+                    let (p2_x, p2_y) =
+                        map_point(q.x2().value, q.y2().value, cl, cr, cb, ct, rotation);
+                    let (p3_x, p3_y) =
+                        map_point(q.x3().value, q.y3().value, cl, cr, cb, ct, rotation);
+                    let (p4_x, p4_y) =
+                        map_point(q.x4().value, q.y4().value, cl, cr, cb, ct, rotation);
+
+                    let min_x = p1_x.min(p2_x).min(p3_x).min(p4_x);
+                    let max_x = p1_x.max(p2_x).max(p3_x).max(p4_x);
+                    let min_y = p1_y.min(p2_y).min(p3_y).min(p4_y);
+                    let max_y = p1_y.max(p2_y).max(p3_y).max(p4_y);
+
+                    if max_x > min_x && max_y > min_y {
+                        rects.push(CanonicalRect::new(min_x, min_y, max_x, max_y));
+                    }
+                }
+            }
+
+            if rects.is_empty() {
+                if let Ok(b) = hl_annot.bounds() {
+                    let canon = user_rect_to_canonical(&b, &crop_box, rotation);
+                    if canon.max_x > canon.min_x && canon.max_y > canon.min_y {
+                        rects.push(canon);
+                    }
+                }
+            }
+
+            if !rects.is_empty() {
+                highlights.push(Highlight {
+                    id: crate::annotations::generate_highlight_id(),
+                    page: page_idx,
+                    rects,
+                    points: Vec::new(),
+                    color: annot_color,
+                    alpha: 0.35,
+                    thickness: 1.0,
+                });
+            }
+        } else if let Some(ink_annot) = annot.as_ink_annotation_mut() {
+            let mut annot_color = AnnotationColor::new(255, 235, 59);
+            let mut stroke_width = 12.0_f32;
+            let mut points = Vec::new();
+
+            let objects = ink_annot.objects_mut();
+            for obj in objects.iter() {
+                if let Some(path_obj) = obj.as_path_object() {
+                    if let Ok(c) = path_obj.stroke_color() {
+                        annot_color = AnnotationColor::new(c.red(), c.green(), c.blue());
+                    }
+                    if let Ok(w) = path_obj.stroke_width() {
+                        if w.value > 0.0 {
+                            stroke_width = w.value;
+                        }
+                    }
+                    let segs = path_obj.segments();
+                    for s_idx in 0..segs.len() {
+                        if let Ok(seg) = segs.get(s_idx) {
+                            let (px, py) = seg.point();
+                            let (can_x, can_y) =
+                                map_point(px.value, py.value, cl, cr, cb, ct, rotation);
+                            points.push([can_x, can_y]);
+                        }
+                    }
+                }
+            }
+
+            if points.is_empty() {
+                if let Ok(b) = ink_annot.bounds() {
+                    let canon = user_rect_to_canonical(&b, &crop_box, rotation);
+                    points.push([canon.min_x, canon.min_y]);
+                    points.push([canon.max_x, canon.max_y]);
+                }
+            }
+
+            if !points.is_empty() {
+                highlights.push(Highlight {
+                    id: crate::annotations::generate_highlight_id(),
+                    page: page_idx,
+                    rects: Vec::new(),
+                    points,
+                    color: annot_color,
+                    alpha: 0.35,
+                    thickness: stroke_width,
+                });
+            }
+        } else if annot.annotation_type() == PdfPageAnnotationType::FreeText {
+            let text = annot.contents().unwrap_or_default();
+            if !text.is_empty() {
+                let annot_color = if !annot.objects().is_empty() {
+                    safe_extract_annot_color(annot.objects(), AnnotationColor::new(0, 0, 0))
+                } else {
+                    annot
+                        .stroke_color()
+                        .or_else(|_| annot.fill_color())
+                        .map(|c| AnnotationColor::new(c.red(), c.green(), c.blue()))
+                        .unwrap_or(AnnotationColor::new(0, 0, 0))
+                };
+                let (pos, width) = if let Ok(b) = annot.bounds() {
+                    let canon = user_rect_to_canonical(&b, &crop_box, rotation);
+                    (
+                        [canon.min_x, canon.min_y],
+                        (canon.max_x - canon.min_x).max(40.0),
+                    )
+                } else {
+                    ([50.0, 50.0], 180.0)
+                };
+                let font_size = safe_extract_annot_font_size(&annot, annot.objects(), &text, 16.0);
+                text_boxes.push(TextBox {
+                    id: crate::annotations::generate_text_box_id(),
+                    page: page_idx,
+                    pos,
+                    text,
+                    font_size,
+                    color: annot_color,
+                    width,
+                });
+            }
+        }
+    }
+}
+
 /// Extracts all existing Highlight, Ink, and FreeText annotations from a PdfDocument's pages into canonical models.
+#[allow(dead_code)]
 pub fn extract_annotations_from_doc(doc: &PdfDocument) -> (Vec<Highlight>, Vec<TextBox>) {
     let mut highlights = Vec::new();
     let mut text_boxes = Vec::new();
     let page_count = doc.pages().len() as usize;
 
     for page_idx in 0..page_count {
-        let Ok(mut page) = doc.pages().get(page_idx as i32) else {
-            continue;
-        };
-        let page_h = page.height().value;
-        let annots = page.annotations_mut();
-        let annot_count = annots.len();
-
-        for i in 0..annot_count {
-            let Ok(mut annot) = annots.get(i) else {
-                continue;
-            };
-
-            if let Some(hl_annot) = annot.as_highlight_annotation_mut() {
-                let annot_color = safe_extract_annot_color(
-                    hl_annot.objects(),
-                    AnnotationColor::new(255, 235, 59),
-                );
-
-                let mut rects = Vec::new();
-                let pts = hl_annot.attachment_points_mut();
-                let pt_count = pts.len();
-                for p_idx in 0..pt_count {
-                    if let Ok(q) = pts.get(p_idx) {
-                        let x_min = q
-                            .x1()
-                            .value
-                            .min(q.x2().value)
-                            .min(q.x3().value)
-                            .min(q.x4().value);
-                        let x_max = q
-                            .x1()
-                            .value
-                            .max(q.x2().value)
-                            .max(q.x3().value)
-                            .max(q.x4().value);
-                        let y_bot = q
-                            .y1()
-                            .value
-                            .min(q.y2().value)
-                            .min(q.y3().value)
-                            .min(q.y4().value);
-                        let y_top = q
-                            .y1()
-                            .value
-                            .max(q.y2().value)
-                            .max(q.y3().value)
-                            .max(q.y4().value);
-                        let min_y = (page_h - y_top).max(0.0);
-                        let max_y = (page_h - y_bot).min(page_h);
-                        if x_max > x_min && max_y > min_y {
-                            rects.push(CanonicalRect::new(x_min, min_y, x_max, max_y));
-                        }
-                    }
-                }
-
-                if rects.is_empty() {
-                    if let Ok(b) = hl_annot.bounds() {
-                        let x_min = b.left().value;
-                        let x_max = b.right().value;
-                        let min_y = (page_h - b.top().value).max(0.0);
-                        let max_y = (page_h - b.bottom().value).min(page_h);
-                        if x_max > x_min && max_y > min_y {
-                            rects.push(CanonicalRect::new(x_min, min_y, x_max, max_y));
-                        }
-                    }
-                }
-
-                if !rects.is_empty() {
-                    highlights.push(Highlight {
-                        id: crate::annotations::generate_highlight_id(),
-                        page: page_idx,
-                        rects,
-                        points: Vec::new(),
-                        color: annot_color,
-                        alpha: 0.35,
-                        thickness: 1.0,
-                    });
-                }
-            } else if let Some(ink_annot) = annot.as_ink_annotation_mut() {
-                let mut annot_color = AnnotationColor::new(255, 235, 59);
-                let mut stroke_width = 12.0_f32;
-                let mut points = Vec::new();
-
-                let objects = ink_annot.objects_mut();
-                for obj in objects.iter() {
-                    if let Some(path_obj) = obj.as_path_object() {
-                        if let Ok(c) = path_obj.stroke_color() {
-                            annot_color = AnnotationColor::new(c.red(), c.green(), c.blue());
-                        }
-                        if let Ok(w) = path_obj.stroke_width() {
-                            if w.value > 0.0 {
-                                stroke_width = w.value;
-                            }
-                        }
-                        let segs = path_obj.segments();
-                        for s_idx in 0..segs.len() {
-                            if let Ok(seg) = segs.get(s_idx) {
-                                let (px, py) = seg.point();
-                                let can_x = px.value;
-                                let can_y = (page_h - py.value).clamp(0.0, page_h);
-                                points.push([can_x, can_y]);
-                            }
-                        }
-                    }
-                }
-
-                if points.is_empty() {
-                    if let Ok(b) = ink_annot.bounds() {
-                        let x_min = b.left().value;
-                        let x_max = b.right().value;
-                        let min_y = (page_h - b.top().value).max(0.0);
-                        let max_y = (page_h - b.bottom().value).min(page_h);
-                        points.push([x_min, min_y]);
-                        points.push([x_max, max_y]);
-                    }
-                }
-
-                if !points.is_empty() {
-                    highlights.push(Highlight {
-                        id: crate::annotations::generate_highlight_id(),
-                        page: page_idx,
-                        rects: Vec::new(),
-                        points,
-                        color: annot_color,
-                        alpha: 0.35,
-                        thickness: stroke_width,
-                    });
-                }
-            } else if annot.annotation_type() == PdfPageAnnotationType::FreeText {
-                let text = annot.contents().unwrap_or_default();
-                if !text.is_empty() {
-                    let annot_color = if !annot.objects().is_empty() {
-                        safe_extract_annot_color(annot.objects(), AnnotationColor::new(0, 0, 0))
-                    } else {
-                        annot
-                            .stroke_color()
-                            .or_else(|_| annot.fill_color())
-                            .map(|c| AnnotationColor::new(c.red(), c.green(), c.blue()))
-                            .unwrap_or(AnnotationColor::new(0, 0, 0))
-                    };
-                    let (pos, width) = if let Ok(b) = annot.bounds() {
-                        let min_x = b.left().value;
-                        let min_y = (page_h - b.top().value).max(0.0);
-                        let w = (b.right().value - b.left().value).abs();
-                        ([min_x, min_y], w.max(40.0))
-                    } else {
-                        ([50.0, 50.0], 180.0)
-                    };
-                    let font_size =
-                        safe_extract_annot_font_size(&annot, annot.objects(), &text, 16.0);
-                    text_boxes.push(TextBox {
-                        id: crate::annotations::generate_text_box_id(),
-                        page: page_idx,
-                        pos,
-                        text,
-                        font_size,
-                        color: annot_color,
-                        width,
-                    });
-                }
-            }
+        if let Ok(mut page) = doc.pages().get(page_idx as i32) {
+            extract_annotations_from_page(&mut page, page_idx, &mut highlights, &mut text_boxes);
         }
     }
 
     (highlights, text_boxes)
 }
 
-/// Applies highlights and text boxes directly to a PdfDocument's pages in PDFium.
-/// Removes previous highlight, ink, and free text annotations and regenerates them.
-pub fn apply_annotations_to_doc(
+/// Applies highlights and text boxes directly to specified pages in PDFium.
+pub fn apply_annotations_to_doc_on_pages(
     doc: &PdfDocument,
     highlights: &[Highlight],
     text_boxes: &[TextBox],
+    pages: impl IntoIterator<Item = usize>,
 ) -> Result<(), String> {
     let mut page_map: HashMap<usize, Vec<&Highlight>> = HashMap::new();
     for hl in highlights {
@@ -997,13 +1388,22 @@ pub fn apply_annotations_to_doc(
         text_box_map.entry(tb.page).or_default().push(tb);
     }
 
-    let page_count = doc.pages().len() as usize;
-    for page_idx in 0..page_count {
+    let total_pages = doc.pages().len() as usize;
+
+    for page_idx in pages {
+        if page_idx >= total_pages {
+            continue;
+        }
         let mut page = doc
             .pages()
             .get(page_idx as i32)
             .map_err(|e| e.to_string())?;
-        let page_h = page.height().value;
+
+        let (crop_box, rotation) = get_page_crop_and_rotation(&page);
+        let cl = crop_box.left().value;
+        let cr = crop_box.right().value;
+        let cb = crop_box.bottom().value;
+        let ct = crop_box.top().value;
 
         let annots = page.annotations_mut();
         let mut i = annots.len();
@@ -1024,40 +1424,63 @@ pub fn apply_annotations_to_doc(
         if let Some(page_highlights) = page_map.get(&page_idx) {
             for hl in page_highlights {
                 if !hl.points.is_empty() {
-                    // Freehand ink annotation
+                    // Freehand ink annotation for persistence, round-trip extraction, and standard PDF viewers
                     if let Ok(mut annot) = annots.create_ink_annotation() {
                         let _ = annot.set_stroke_color(PdfColor::new(
                             hl.color.r, hl.color.g, hl.color.b, 255,
                         ));
                         if hl.points.len() >= 2 {
-                            let start_x = hl.points[0][0];
-                            let start_y = (page_h - hl.points[0][1]).max(0.0);
-                            let stroke_width = hl.thickness.max(1.0);
+                            let (p0_x, p0_y) = canonical_point_to_user(
+                                hl.points[0][0],
+                                hl.points[0][1],
+                                cl,
+                                cr,
+                                cb,
+                                ct,
+                                rotation,
+                            );
+                            let stroke_w = hl.thickness.max(1.0);
                             if let Ok(mut path) = PdfPagePathObject::new(
                                 doc,
-                                PdfPoints::new(start_x),
-                                PdfPoints::new(start_y),
+                                PdfPoints::new(p0_x),
+                                PdfPoints::new(p0_y),
                                 Some(PdfColor::new(hl.color.r, hl.color.g, hl.color.b, 255)),
-                                Some(PdfPoints::new(stroke_width)),
+                                Some(PdfPoints::new(stroke_w)),
                                 None,
                             ) {
-                                let _ = path.set_blend_mode(PdfPageObjectBlendMode::Multiply);
                                 for pt in &hl.points[1..] {
-                                    let x = pt[0];
-                                    let y = (page_h - pt[1]).max(0.0);
-                                    let _ = path.line_to(PdfPoints::new(x), PdfPoints::new(y));
+                                    let (px, py) = canonical_point_to_user(
+                                        pt[0], pt[1], cl, cr, cb, ct, rotation,
+                                    );
+                                    let _ = path.line_to(PdfPoints::new(px), PdfPoints::new(py));
                                 }
                                 let _ = annot.objects_mut().add_path_object(path);
                             }
                         }
                         if let Some(bounds) = hl.bounding_rect() {
-                            let pdf_bottom = (page_h - bounds.max_y).max(0.0);
-                            let pdf_top = (page_h - bounds.min_y).min(page_h);
-                            let pdf_rect = PdfRect::new_from_values(
-                                pdf_bottom,
+                            let p_bl = canonical_point_to_user(
                                 bounds.min_x,
-                                pdf_top,
+                                bounds.max_y,
+                                cl,
+                                cr,
+                                cb,
+                                ct,
+                                rotation,
+                            );
+                            let p_tr = canonical_point_to_user(
                                 bounds.max_x,
+                                bounds.min_y,
+                                cl,
+                                cr,
+                                cb,
+                                ct,
+                                rotation,
+                            );
+                            let pdf_rect = PdfRect::new_from_values(
+                                p_bl.1.min(p_tr.1),
+                                p_bl.0.min(p_tr.0),
+                                p_bl.1.max(p_tr.1),
+                                p_bl.0.max(p_tr.0),
                             );
                             let _ = annot.set_bounds(pdf_rect);
                         }
@@ -1068,28 +1491,57 @@ pub fn apply_annotations_to_doc(
                         let _ = annot.set_stroke_color(PdfColor::new(
                             hl.color.r, hl.color.g, hl.color.b, 255,
                         ));
+                        let mut all_user_min_x = f32::MAX;
+                        let mut all_user_max_x = f32::MIN;
+                        let mut all_user_min_y = f32::MAX;
+                        let mut all_user_max_y = f32::MIN;
+
                         for r in &hl.rects {
-                            let pdf_bottom = (page_h - r.max_y).max(0.0);
-                            let pdf_top = (page_h - r.min_y).min(page_h);
-                            let pdf_left = r.min_x;
-                            let pdf_right = r.max_x;
-                            // ISO 32000 quadpoints order in PDFium: top-left, top-right, bottom-left, bottom-right
+                            let p_tl =
+                                canonical_point_to_user(r.min_x, r.min_y, cl, cr, cb, ct, rotation);
+                            let p_tr =
+                                canonical_point_to_user(r.max_x, r.min_y, cl, cr, cb, ct, rotation);
+                            let p_bl =
+                                canonical_point_to_user(r.min_x, r.max_y, cl, cr, cb, ct, rotation);
+                            let p_br =
+                                canonical_point_to_user(r.max_x, r.max_y, cl, cr, cb, ct, rotation);
+
+                            all_user_min_x = all_user_min_x
+                                .min(p_tl.0)
+                                .min(p_tr.0)
+                                .min(p_bl.0)
+                                .min(p_br.0);
+                            all_user_max_x = all_user_max_x
+                                .max(p_tl.0)
+                                .max(p_tr.0)
+                                .max(p_bl.0)
+                                .max(p_br.0);
+                            all_user_min_y = all_user_min_y
+                                .min(p_tl.1)
+                                .min(p_tr.1)
+                                .min(p_bl.1)
+                                .min(p_br.1);
+                            all_user_max_y = all_user_max_y
+                                .max(p_tl.1)
+                                .max(p_tr.1)
+                                .max(p_bl.1)
+                                .max(p_br.1);
+
+                            // Quadpoints in PDFium: top-left, top-right, bottom-left, bottom-right
                             let quad = PdfQuadPoints::new_from_values(
-                                pdf_left, pdf_top, pdf_right, pdf_top, pdf_left, pdf_bottom,
-                                pdf_right, pdf_bottom,
+                                p_tl.0, p_tl.1, p_tr.0, p_tr.1, p_bl.0, p_bl.1, p_br.0, p_br.1,
                             );
                             let _ = annot
                                 .attachment_points_mut()
                                 .create_attachment_point_at_end(quad);
                         }
-                        if let Some(bounds) = hl.bounding_rect() {
-                            let pdf_bottom = (page_h - bounds.max_y).max(0.0);
-                            let pdf_top = (page_h - bounds.min_y).min(page_h);
+
+                        if all_user_max_x > all_user_min_x && all_user_max_y > all_user_min_y {
                             let pdf_rect = PdfRect::new_from_values(
-                                pdf_bottom,
-                                bounds.min_x,
-                                pdf_top,
-                                bounds.max_x,
+                                all_user_min_y,
+                                all_user_min_x,
+                                all_user_max_y,
+                                all_user_max_x,
                             );
                             let _ = annot.set_bounds(pdf_rect);
                         }
@@ -1101,11 +1553,22 @@ pub fn apply_annotations_to_doc(
         if let Some(page_boxes) = text_box_map.get(&page_idx) {
             for tb in page_boxes {
                 if let Ok(mut annot) = annots.create_free_text_annotation(&tb.text) {
-                    let pdf_left = tb.pos[0];
-                    let pdf_right = tb.pos[0] + tb.width.max(40.0);
                     let box_h = tb.estimated_height();
-                    let pdf_bottom = (page_h - (tb.pos[1] + box_h)).max(0.0);
-                    let pdf_top = (page_h - tb.pos[1]).min(page_h);
+                    let p_tl =
+                        canonical_point_to_user(tb.pos[0], tb.pos[1], cl, cr, cb, ct, rotation);
+                    let p_br = canonical_point_to_user(
+                        tb.pos[0] + tb.width.max(40.0),
+                        tb.pos[1] + box_h,
+                        cl,
+                        cr,
+                        cb,
+                        ct,
+                        rotation,
+                    );
+                    let pdf_left = p_tl.0.min(p_br.0);
+                    let pdf_right = p_tl.0.max(p_br.0);
+                    let pdf_bottom = p_tl.1.min(p_br.1);
+                    let pdf_top = p_tl.1.max(p_br.1);
                     let pdf_rect =
                         PdfRect::new_from_values(pdf_bottom, pdf_left, pdf_top, pdf_right);
                     let _ = annot.set_bounds(pdf_rect);
@@ -1123,6 +1586,25 @@ pub fn apply_annotations_to_doc(
     }
 
     Ok(())
+}
+
+/// Applies highlights and text boxes directly to a PdfDocument's pages in PDFium.
+/// Removes previous highlight, ink, and free text annotations and regenerates them.
+pub fn apply_annotations_to_doc(
+    doc: &PdfDocument,
+    highlights: &[Highlight],
+    text_boxes: &[TextBox],
+) -> Result<(), String> {
+    let pages: HashSet<usize> = highlights
+        .iter()
+        .map(|h| h.page)
+        .chain(text_boxes.iter().map(|t| t.page))
+        .collect();
+    if pages.is_empty() {
+        let page_count = doc.pages().len() as usize;
+        return apply_annotations_to_doc_on_pages(doc, highlights, text_boxes, 0..page_count);
+    }
+    apply_annotations_to_doc_on_pages(doc, highlights, text_boxes, pages)
 }
 
 /// Helper wrapper for applying only highlights.
@@ -1913,6 +2395,137 @@ mod tests {
     }
 
     #[test]
+    fn test_worker_freehand_highlight_multiply_blending() {
+        let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let pdfium = bind_pdfium().expect("Pdfium must be available for fixture test");
+        let path = PathBuf::from("fixtures/MLE.pdf");
+        if !path.exists() {
+            return;
+        }
+
+        let doc = pdfium
+            .load_pdf_from_file(&path, None)
+            .expect("load MLE.pdf");
+        let page = doc.pages().get(0).expect("get page 0");
+        let first_rect = {
+            let text = page.text().expect("get text page");
+            let c = text.chars().get(0).expect("first char");
+            c.loose_bounds().expect("char loose bounds")
+        };
+
+        let render_config = PdfRenderConfig::new()
+            .set_target_width(800)
+            .render_annotations(true);
+        let orig_bitmap = page
+            .render_with_config(&render_config)
+            .expect("render orig");
+        let orig_rgba = orig_bitmap.as_rgba_bytes();
+        let w = orig_bitmap.width() as usize;
+        let h = orig_bitmap.height() as usize;
+
+        let (crop_box, rotation) = get_page_crop_and_rotation(&page);
+        let canon_rect = user_rect_to_canonical(&first_rect, &crop_box, rotation);
+        let mid_y = (canon_rect.min_y + canon_rect.max_y) / 2.0;
+
+        // Apply a freehand highlight stroke that passes across the first character in canonical space
+        let hl = Highlight {
+            id: 9999,
+            page: 0,
+            rects: Vec::new(),
+            points: vec![
+                [canon_rect.min_x - 10.0, mid_y],
+                [canon_rect.max_x + 10.0, mid_y],
+            ],
+            color: AnnotationColor::new(255, 235, 59),
+            alpha: 0.35,
+            thickness: 12.0,
+        };
+
+        let mut hl_rgba = orig_rgba.clone();
+        rasterize_freehand_highlight(
+            &mut hl_rgba,
+            w,
+            h,
+            &hl,
+            page.width().value,
+            page.height().value,
+            0,
+        );
+
+        assert_eq!(orig_rgba.len(), hl_rgba.len());
+        let mut changed = 0;
+        let mut black_text_stayed_dark = 0;
+        for i in (0..orig_rgba.len()).step_by(4) {
+            let o_r = orig_rgba[i];
+            let o_g = orig_rgba[i + 1];
+            let o_b = orig_rgba[i + 2];
+            let h_r = hl_rgba[i];
+            let h_g = hl_rgba[i + 1];
+            let h_b = hl_rgba[i + 2];
+            if o_r != h_r || o_g != h_g || o_b != h_b {
+                changed += 1;
+                // Under Multiply blend, black text must remain black/dark (< 40)
+                if o_r < 30 && o_g < 30 && o_b < 30 && h_r < 40 && h_g < 40 && h_b < 40 {
+                    black_text_stayed_dark += 1;
+                }
+            }
+        }
+        assert!(
+            changed > 0,
+            "Freehand highlight must affect rendered bitmap"
+        );
+        assert!(
+            black_text_stayed_dark > 0,
+            "Freehand highlight must use Multiply blend: black text must remain black"
+        );
+    }
+
+    #[test]
+    fn test_rasterize_freehand_highlight_continuity() {
+        let w = 200;
+        let h = 200;
+        let mut canvas = vec![255_u8; w * h * 4];
+
+        // Curved polyline with multiple control points
+        let hl = Highlight {
+            id: 1234,
+            page: 0,
+            rects: Vec::new(),
+            points: vec![
+                [20.0, 30.0],
+                [40.0, 60.0],
+                [70.0, 90.0],
+                [110.0, 110.0],
+                [150.0, 140.0],
+                [180.0, 170.0],
+            ],
+            color: AnnotationColor::new(255, 235, 59),
+            alpha: 0.35,
+            thickness: 16.0,
+        };
+
+        rasterize_freehand_highlight(&mut canvas, w, h, &hl, 200.0, 200.0, 0);
+
+        // Verify that every vertex along the path is filled with pure highlight color
+        for pt in &hl.points {
+            let px = pt[0] as usize;
+            let py = pt[1] as usize;
+            let idx = (py * w + px) * 4;
+            assert_eq!(canvas[idx], 255);
+            assert_eq!(canvas[idx + 1], 235);
+            assert_eq!(canvas[idx + 2], 59);
+        }
+
+        // Verify midpoint of segment (20,30)->(40,60) is continuous without any gap
+        let mid_x = 30;
+        let mid_y = 45;
+        let mid_idx = (mid_y * w + mid_x) * 4;
+        assert_eq!(canvas[mid_idx], 255, "Midpoint must be continuous");
+        assert_eq!(canvas[mid_idx + 1], 235, "Midpoint must be continuous");
+        assert_eq!(canvas[mid_idx + 2], 59, "Midpoint must be continuous");
+    }
+
+    #[test]
     fn test_worker_queue_priority_and_generation_pruning() {
         let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let path = PathBuf::from("fixtures/MLE.pdf");
@@ -2516,5 +3129,183 @@ mod tests {
             tx_cmd.send(Command::Close { doc_id: 778 }).unwrap();
         }
         tx_cmd.send(Command::Shutdown).unwrap();
+    }
+
+    #[test]
+    fn test_dragon_book_worker_instant_open_and_render() {
+        let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let path = PathBuf::from("fixtures/Dragon-book.pdf");
+        if !path.exists() {
+            return;
+        }
+
+        let ctx = egui::Context::default();
+        let (tx_cmd, rx_evt) = start_worker(ctx);
+        let ready = rx_evt
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .expect("Worker must send PdfiumReady");
+        assert!(matches!(ready, Event::PdfiumReady));
+
+        let doc_id = 991;
+        let t_start = std::time::Instant::now();
+        tx_cmd
+            .send(Command::Open {
+                doc_id,
+                path: path.clone(),
+            })
+            .unwrap();
+
+        let evt = rx_evt
+            .recv_timeout(std::time::Duration::from_millis(600))
+            .expect("Worker must open Dragon-book in under 600ms");
+        let t_open = t_start.elapsed();
+        println!("Dragon-book Open -> Event::Opened took: {:?}", t_open);
+
+        match evt {
+            Event::Opened {
+                doc_id: d,
+                page_count,
+                page_sizes,
+                ..
+            } => {
+                assert_eq!(d, doc_id);
+                assert_eq!(page_count, 1038);
+                assert_eq!(page_sizes.len(), 1038);
+            }
+            other => panic!("Expected Opened event, got {:?}", other),
+        }
+
+        // Request page 0 render
+        use crate::pdf::types::RenderCommand;
+        let t_render_start = std::time::Instant::now();
+        tx_cmd
+            .send(Command::Render(RenderCommand {
+                doc_id,
+                page: 0,
+                width_px: 1200,
+                rotation: 0,
+                generation: 1,
+                priority: 1,
+            }))
+            .unwrap();
+
+        let mut res_opt = None;
+        while let Ok(evt) = rx_evt.recv_timeout(std::time::Duration::from_millis(1500)) {
+            match evt {
+                Event::Rendered(res) => {
+                    res_opt = Some(res);
+                    break;
+                }
+                Event::AnnotationsExtracted { .. } => {}
+                other => panic!("Expected Rendered event, got {:?}", other),
+            }
+        }
+        let res = res_opt.expect("Page 0 render must arrive");
+        assert_eq!(res.doc_id, doc_id);
+        assert_eq!(res.page, 0);
+        assert!(res.bitmap_width_px > 0);
+        let t_rendered = t_render_start.elapsed();
+        println!("Dragon-book Page 0 Render took: {:?}", t_rendered);
+        println!("TOTAL Cold Start to Rendered: {:?}", t_start.elapsed());
+
+        tx_cmd.send(Command::Close { doc_id }).unwrap();
+        tx_cmd.send(Command::Shutdown).unwrap();
+    }
+
+    #[test]
+    fn test_tanenbaum_book_coordinates() {
+        let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let path =
+            PathBuf::from("fixtures/Modern Operating Systems 4th Edition--Andrew Tanenbaum.pdf");
+        if !path.exists() {
+            return;
+        }
+
+        let pdfium = bind_pdfium().unwrap();
+        let doc = pdfium.load_pdf_from_file(&path, None).unwrap();
+        println!("Tanenbaum page count: {}", doc.pages().len());
+        for p in 0..5.min(doc.pages().len()) {
+            let page = doc.pages().get(p).unwrap();
+            let rot = page.rotation().unwrap_or(PdfPageRenderRotation::None);
+            let size = doc.pages().page_size(p).unwrap();
+            let w = page.width().value;
+            let h = page.height().value;
+            let crop = page.boundaries().crop().map(|b| {
+                (
+                    b.bounds.left().value,
+                    b.bounds.bottom().value,
+                    b.bounds.right().value,
+                    b.bounds.top().value,
+                )
+            });
+            let media = page.boundaries().media().map(|b| {
+                (
+                    b.bounds.left().value,
+                    b.bounds.bottom().value,
+                    b.bounds.right().value,
+                    b.bounds.top().value,
+                )
+            });
+            println!(
+                "Page {}: size=({:?}, {:?}), page.w/h=({}, {}), rot={:?}, crop={:?}, media={:?}",
+                p,
+                size.width().value,
+                size.height().value,
+                w,
+                h,
+                rot,
+                crop,
+                media
+            );
+
+            if let Ok(text_page) = page.text() {
+                println!("Page {} text len: {}", p, text_page.len());
+                let chars = text_page.chars();
+                for (ci, c) in chars.iter().take(5).enumerate() {
+                    let ch = c.unicode_char().unwrap_or(' ');
+                    let b = c.loose_bounds().or_else(|_| c.tight_bounds());
+                    println!(
+                        "  Char {}: '{}' bounds: {:?}",
+                        ci,
+                        ch,
+                        b.map(|r| (
+                            r.left().value,
+                            r.bottom().value,
+                            r.right().value,
+                            r.top().value
+                        ))
+                    );
+                }
+            };
+        }
+
+        // Test applying and extracting an annotation on Page 1 (which has crop box offset)
+        let orig_hl = Highlight {
+            id: 12345,
+            page: 1,
+            rects: vec![CanonicalRect::new(200.0, 150.0, 250.0, 180.0)],
+            points: Vec::new(),
+            color: AnnotationColor::new(255, 235, 59),
+            alpha: 0.35,
+            thickness: 1.0,
+        };
+        apply_annotations_to_doc_on_pages(&doc, std::slice::from_ref(&orig_hl), &[], Some(1))
+            .unwrap();
+
+        let mut extracted_hl = Vec::new();
+        let mut extracted_tb = Vec::new();
+        let mut page1 = doc.pages().get(1).unwrap();
+        extract_annotations_from_page(&mut page1, 1, &mut extracted_hl, &mut extracted_tb);
+        assert_eq!(extracted_hl.len(), 1, "Must extract the applied highlight");
+        assert_eq!(extracted_hl[0].rects.len(), 1);
+        let ext_r = extracted_hl[0].rects[0];
+        println!(
+            "Original rect: {:?}, Extracted rect: {:?}",
+            orig_hl.rects[0], ext_r
+        );
+        assert!((ext_r.min_x - 200.0).abs() < 1.0);
+        assert!((ext_r.min_y - 150.0).abs() < 1.0);
+        assert!((ext_r.max_x - 250.0).abs() < 1.0);
+        assert!((ext_r.max_y - 180.0).abs() < 1.0);
     }
 }
