@@ -36,10 +36,12 @@ Comment=Modern, lightweight, high-performance desktop PDF reader
 Exec=$BIN_DIR/pdfview %U
 Icon=verso-reader
 Terminal=false
-Categories=Office;Viewer;Graphics;
+Categories=Office;Viewer;
 MimeType=application/pdf;application/x-pdf;
 Keywords=PDF;Viewer;Reader;Documents;Verso;
 StartupWMClass=verso-reader
+DESKTOP
+
 # Remove legacy desktop file if present to prevent duplicate launcher icons
 rm -f "$APPS_DIR/pdfview.desktop" "$HOME/Desktop/pdfview.desktop" 2>/dev/null || true
 chmod +x "$APPS_DIR/verso-reader.desktop"

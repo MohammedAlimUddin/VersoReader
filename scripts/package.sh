@@ -90,10 +90,12 @@ Comment=Modern, lightweight, high-performance desktop PDF reader
 Exec=$BIN_DIR/pdfview %U
 Icon=verso-reader
 Terminal=false
-Categories=Office;Viewer;Graphics;
+Categories=Office;Viewer;
 MimeType=application/pdf;application/x-pdf;
 Keywords=PDF;Viewer;Reader;Documents;Verso;
 StartupWMClass=verso-reader
+DESKTOP
+
 # Remove legacy desktop file if present to prevent duplicate launcher icons
 rm -f "$APPS_DIR/pdfview.desktop" "$HOME/Desktop/pdfview.desktop" 2>/dev/null || true
 chmod +x "$APPS_DIR/verso-reader.desktop"
@@ -111,7 +113,48 @@ echo "You can now launch Verso Reader from your application launcher or run 'ver
 EOF
 chmod +x "$STAGE_DIR/install.sh"
 
-# 7. Create README.txt in the bundle
+# 7. Create portable uninstaller script for the end-user
+cat <<'EOF' > "$STAGE_DIR/uninstall.sh"
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "=== Uninstalling Verso Reader (pdfview) ==="
+
+BIN_DIR="$HOME/.local/bin"
+LIB_DIR="$HOME/.local/lib/pdfview"
+APPS_DIR="$HOME/.local/share/applications"
+ICON_BASE="$HOME/.local/share/icons/hicolor"
+
+echo "Removing binary and symlinks..."
+rm -f "$BIN_DIR/pdfview" "$BIN_DIR/verso-reader"
+
+echo "Removing engine libraries..."
+rm -rf "$LIB_DIR"
+
+echo "Removing desktop menu entries..."
+rm -f "$APPS_DIR/verso-reader.desktop" "$APPS_DIR/pdfview.desktop"
+rm -f "$HOME/Desktop/verso-reader.desktop" "$HOME/Desktop/pdfview.desktop" 2>/dev/null || true
+
+echo "Removing icons..."
+for size in 32x32 48x48 64x64 128x128 256x256; do
+    rm -f "$ICON_BASE/$size/apps/verso-reader.png" "$ICON_BASE/$size/apps/pdfview.png"
+done
+
+if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database "$APPS_DIR" 2>/dev/null || true
+fi
+
+if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+    gtk-update-icon-cache -f -t "$ICON_BASE" 2>/dev/null || true
+fi
+
+echo "✓ Verso Reader has been completely uninstalled from your system."
+echo "Note: User settings and annotations in ~/.config/pdfview and ~/.local/share/pdfview were preserved."
+echo "To also delete them, run: rm -rf ~/.config/pdfview ~/.local/share/pdfview"
+EOF
+chmod +x "$STAGE_DIR/uninstall.sh"
+
+# 8. Create README.txt in the bundle
 cat <<EOF > "$STAGE_DIR/README.txt"
 VersoReader — Minimalistic, Fast, Low-RAM PDF Reader for Linux
 ============================================================
@@ -126,6 +169,11 @@ Option 2: Install to System Menu
 -------------------------------
 To add VersoReader to your desktop application menu and file manager "Open With" list:
     ./install.sh
+
+Option 3: Uninstall from System
+------------------------------
+To completely remove VersoReader from your desktop menus and system:
+    ./uninstall.sh
 
 Shortcuts:
 - Ctrl+O / Ctrl+L : Open file / focus path bar
@@ -142,18 +190,29 @@ Shortcuts:
 - F11             : Toggle fullscreen mode
 EOF
 
-# 8. Create archive
-ARCHIVE_NAME="verso-reader-linux-x86_64.tar.gz"
-echo "Creating $ARCHIVE_NAME..."
+# 9. Create archives (tar.gz and zip)
 cd "$DIST_DIR"
-tar -czf "$ARCHIVE_NAME" "verso-reader"
+ARCHIVE_TAR="verso-reader-linux-x86_64.tar.gz"
+echo "Creating $ARCHIVE_TAR..."
+tar -czf "$ARCHIVE_TAR" "verso-reader"
 
-# 9. Compute SHA256 checksum
+ARCHIVE_ZIP="verso-reader-linux-x86_64.zip"
+if command -v zip >/dev/null 2>&1; then
+    echo "Creating $ARCHIVE_ZIP..."
+    rm -f "$ARCHIVE_ZIP"
+    zip -q -r "$ARCHIVE_ZIP" "verso-reader"
+fi
+
+# 10. Compute SHA256 checksums
 if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$ARCHIVE_NAME" > "$ARCHIVE_NAME.sha256"
+    sha256sum "$ARCHIVE_TAR" > "$ARCHIVE_TAR.sha256"
+    if [ -f "$ARCHIVE_ZIP" ]; then
+        sha256sum "$ARCHIVE_ZIP" > "$ARCHIVE_ZIP.sha256"
+    fi
 fi
 
 echo "=== Packaging complete! ==="
-echo "Distribution archive: $DIST_DIR/$ARCHIVE_NAME"
-ls -lh "$DIST_DIR/$ARCHIVE_NAME"
+echo "Distribution archives in $DIST_DIR:"
+ls -lh "$DIST_DIR"/verso-reader-linux-x86_64.*
+
 

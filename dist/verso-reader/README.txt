@@ -12,6 +12,11 @@ Option 2: Install to System Menu
 To add VersoReader to your desktop application menu and file manager "Open With" list:
     ./install.sh
 
+Option 3: Uninstall from System
+------------------------------
+To completely remove VersoReader from your desktop menus and system:
+    ./uninstall.sh
+
 Shortcuts:
 - Ctrl+O / Ctrl+L : Open file / focus path bar
 - Ctrl+T / Ctrl+W : New tab / Close tab

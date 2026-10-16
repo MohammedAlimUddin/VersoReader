@@ -51,11 +51,13 @@ jobs:
       - name: Package standalone distribution bundle
         run: bash scripts/package.sh
 
-      - name: Upload distribution tarball artifact
+      - name: Upload distribution artifacts
         uses: actions/upload-artifact@v4
         with:
           name: verso-reader-linux-x86_64
-          path: dist/verso-reader-linux-x86_64.tar.gz
+          path: |
+            dist/verso-reader-linux-x86_64.tar.gz
+            dist/verso-reader-linux-x86_64.zip
           retention-days: 30
 
       - name: Publish GitHub Release
@@ -65,6 +67,8 @@ jobs:
           files: |
             dist/verso-reader-linux-x86_64.tar.gz
             dist/verso-reader-linux-x86_64.tar.gz.sha256
+            dist/verso-reader-linux-x86_64.zip
+            dist/verso-reader-linux-x86_64.zip.sha256
           draft: false
           prerelease: false
           generate_release_notes: true

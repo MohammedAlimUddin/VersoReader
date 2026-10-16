@@ -1041,6 +1041,7 @@
   - [x] **Authentic Multiply Blending**: Draw freehand directly over printed text: black letters stay 100% pitch-black and razor sharp, with zero cloudy or muddy overlay.
   - [x] **Single-Click Dots**: Click once with Highlighter: a clean, rounded circular dot persists with multiply blending.
   - [x] **Zoom and Rotation**: Zoom in/out and rotate: the smooth stroke stays crisp and continuous at all zoom levels.
+  - [x] **Desktop Launcher & Installer**: Fixed here-document delimiter in `package.sh`, cleaned categories to `Office;Viewer;` passing `desktop-file-validate` with 0 warnings, and updated distribution bundle.
 
 
 
