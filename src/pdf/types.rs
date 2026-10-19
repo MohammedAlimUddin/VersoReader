@@ -97,17 +97,54 @@ pub struct LineBox {
     pub char_range: std::ops::Range<usize>,
 }
 
+/// Target destination of an interactive PDF link.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LinkTarget {
+    /// 0-based page index within the same document.
+    Page(usize),
+    /// External Web URI (e.g. https://... or mailto:...).
+    Uri(String),
+}
+
+/// An interactive hyperlink on a page with its bounding box in canonical points.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PageLink {
+    pub rect: CanonicalRect,
+    pub target: LinkTarget,
+}
+
 /// Extracted text data and layout information for a single page.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PageTextData {
     pub page: usize,
     pub chars: Vec<CharBox>,
     pub lines: Vec<LineBox>,
+    pub links: Vec<PageLink>,
 }
 
 impl PageTextData {
-    pub fn new(page: usize, chars: Vec<CharBox>, lines: Vec<LineBox>) -> Self {
-        Self { page, chars, lines }
+    pub fn new(
+        page: usize,
+        chars: Vec<CharBox>,
+        lines: Vec<LineBox>,
+        links: Vec<PageLink>,
+    ) -> Self {
+        Self {
+            page,
+            chars,
+            lines,
+            links,
+        }
+    }
+
+    /// Finds the link containing the given canonical point, if any.
+    pub fn hit_test_link(&self, pt: egui::Pos2) -> Option<&PageLink> {
+        self.links.iter().find(|link| {
+            pt.x >= link.rect.min_x
+                && pt.x <= link.rect.max_x
+                && pt.y >= link.rect.min_y
+                && pt.y <= link.rect.max_y
+        })
     }
 
     /// Finds the character index closest to or containing the given canonical point.
@@ -356,6 +393,8 @@ pub enum Command {
     /// Close an open document handle.
     #[allow(dead_code)]
     Close { doc_id: DocId },
+    /// Unload an inactive document from worker memory (dormant tab deactivation).
+    UnloadDoc { doc_id: DocId },
     /// Render a requested page.
     Render(RenderCommand),
     /// Request document outline / bookmarks tree.
@@ -509,7 +548,7 @@ mod tests {
             rect: CanonicalRect::new(10.0, 10.0, 24.0, 24.0),
             char_range: 0..2,
         }];
-        let data = PageTextData::new(0, chars, lines);
+        let data = PageTextData::new(0, chars, lines, Vec::new());
 
         // Hover
         assert!(data.is_hovering_text(egui::pos2(12.0, 15.0)));
@@ -556,7 +595,7 @@ mod tests {
                 char_range: 2..4,
             },
         ];
-        let data = PageTextData::new(0, chars, lines);
+        let data = PageTextData::new(0, chars, lines, Vec::new());
 
         // Clicking in Column 1 at y = 110 selects Column 1 char
         assert_eq!(data.hit_test(egui::pos2(60.0, 110.0)), Some(0));
@@ -631,7 +670,7 @@ mod tests {
                 char_range: 7..10,
             },
         ];
-        let data = PageTextData::new(0, chars, lines);
+        let data = PageTextData::new(0, chars, lines, Vec::new());
 
         // Word range for 'Hello' (char index 2 is 'l')
         let (w_start, w_end) = data.get_word_range(2);
@@ -646,5 +685,36 @@ mod tests {
         // Extract text range with sensible newline
         let text = data.extract_text_range(0, 9);
         assert_eq!(text, "Hello W\nbye");
+    }
+
+    #[test]
+    fn test_page_link_hit_test() {
+        let links = vec![
+            PageLink {
+                rect: CanonicalRect::new(50.0, 100.0, 150.0, 120.0),
+                target: LinkTarget::Page(4),
+            },
+            PageLink {
+                rect: CanonicalRect::new(200.0, 300.0, 350.0, 320.0),
+                target: LinkTarget::Uri("https://example.com/doc.pdf".to_string()),
+            },
+        ];
+        let data = PageTextData::new(0, Vec::new(), Vec::new(), links);
+
+        // Internal page link hit test
+        let hit1 = data.hit_test_link(egui::pos2(75.0, 110.0));
+        assert!(hit1.is_some());
+        assert_eq!(hit1.unwrap().target, LinkTarget::Page(4));
+
+        // External URI link hit test
+        let hit2 = data.hit_test_link(egui::pos2(250.0, 310.0));
+        assert!(hit2.is_some());
+        assert_eq!(
+            hit2.unwrap().target,
+            LinkTarget::Uri("https://example.com/doc.pdf".to_string())
+        );
+
+        // Miss
+        assert!(data.hit_test_link(egui::pos2(10.0, 10.0)).is_none());
     }
 }

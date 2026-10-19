@@ -23,6 +23,10 @@ impl Theme {
     pub const ACCENT_HOVER: Color32 = Color32::from_rgb(24, 140, 235);
     pub const ACCENT_TINT: Color32 = Color32::from_rgba_premultiplied(0, 120, 212, 35);
 
+    // PDF Text Selection Color (Multiply Blend)
+    // Radiant, modern electric amber (#FFA028) that keeps underlying text pitch-black and razor sharp.
+    pub const TEXT_SELECTION_MULTIPLY: Color32 = Color32::from_rgb(255, 160, 40);
+
     // Text & Foregrounds
     pub const TEXT_PRIMARY: Color32 = Color32::from_rgb(235, 235, 235);
     pub const TEXT_SECONDARY: Color32 = Color32::from_rgb(170, 170, 175);

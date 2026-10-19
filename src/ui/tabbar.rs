@@ -55,6 +55,7 @@ pub struct TabItem<'a> {
     pub is_loading: bool,
     pub is_dirty: bool,
     pub is_settings: bool,
+    pub is_dormant: bool,
 }
 
 /// Draws a crisp vector PDF document icon with a folded corner.
@@ -183,9 +184,14 @@ pub fn render_tab_bar(
                     }
 
                     // Tab document title
-                    let title_label = egui::RichText::new(&truncated_title)
+                    let mut title_label = egui::RichText::new(&truncated_title)
                         .color(text_color)
                         .size(12.5);
+                    if tab.is_dormant && !tab.is_active {
+                        title_label = title_label
+                            .color(Color32::from_rgb(130, 130, 135))
+                            .italics();
+                    }
                     ui.label(title_label);
 
                     // Unsaved changes subtle dot badge
@@ -279,7 +285,15 @@ pub fn render_tab_bar(
                 }
 
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                tab_response.response.on_hover_text(tab.tooltip);
+                let tip = if tab.is_dormant && !tab.is_active {
+                    format!(
+                        "{} (Sleeping tab to save memory — click to wake)",
+                        tab.tooltip
+                    )
+                } else {
+                    tab.tooltip.to_string()
+                };
+                tab_response.response.on_hover_text(tip);
 
                 if ui.input(|i| i.pointer.button_clicked(egui::PointerButton::Middle)) {
                     action = Some(TabBarAction::Close(idx));

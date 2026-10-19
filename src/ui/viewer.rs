@@ -10,8 +10,10 @@ use crate::annotations::{
 use crate::cache::{PageTextCache, TextureCache, TextureKey};
 use crate::pdf::transform::PageTransform;
 use crate::pdf::types::{
-    CanonicalRect, DocId, PageSize, PageTextData, SearchMatch, TextLocation, TextSelection,
+    CanonicalRect, DocId, LinkTarget, PageSize, PageTextData, SearchMatch, TextLocation,
+    TextSelection,
 };
+use crate::ui::theme::Theme;
 use crate::ui::toolbar::ActiveTool;
 
 /// A render request emitted by the virtualized viewer.
@@ -30,14 +32,16 @@ pub struct ContextMenuState {
     pub page: usize,
 }
 
-/// Actions dispatched from the viewer context menu.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// Actions dispatched from the viewer (context menu or link clicks).
+#[derive(Debug, Clone, PartialEq)]
 pub enum ViewerAction {
     Copy,
     HighlightSelection,
     AddTextNote(usize, [f32; 2]),
     SelectAllPage(usize),
     SelectAllDocument,
+    JumpToPage(usize),
+    OpenUrl(String),
 }
 
 /// Results of a viewer pass.
@@ -86,6 +90,23 @@ pub fn compute_sharp_page_geometry(
     };
     let screen_rect = Rect::from_min_size(screen_origin, vec2(screen_w, screen_h));
     (sharp_width, bitmap_h_px as u32, screen_rect)
+}
+
+/// Computes normalized UV coordinates [0.0, 1.0] for a screen sub-rectangle within a page's screen rectangle.
+pub fn compute_page_subrect_uv(screen_rect: Rect, sub_rect: Rect) -> Option<(Rect, Rect)> {
+    if screen_rect.width() <= 0.0 || screen_rect.height() <= 0.0 {
+        return None;
+    }
+    let visible_rect = sub_rect.intersect(screen_rect);
+    if !visible_rect.is_positive() {
+        return None;
+    }
+    let u_min = ((visible_rect.min.x - screen_rect.min.x) / screen_rect.width()).clamp(0.0, 1.0);
+    let u_max = ((visible_rect.max.x - screen_rect.min.x) / screen_rect.width()).clamp(0.0, 1.0);
+    let v_min = ((visible_rect.min.y - screen_rect.min.y) / screen_rect.height()).clamp(0.0, 1.0);
+    let v_max = ((visible_rect.max.y - screen_rect.min.y) / screen_rect.height()).clamp(0.0, 1.0);
+    let uv = Rect::from_min_max(pos2(u_min, v_min), pos2(u_max, v_max));
+    Some((visible_rect, uv))
 }
 
 /// Draws a vertical dotted-line rectangle centered at the cursor for the highlighter tool over non-text whitespace.
@@ -380,6 +401,7 @@ pub fn render_viewer(
         let is_primary_down = ui.input(|i| i.pointer.primary_down());
         let is_primary_pressed = ui.input(|i| i.pointer.primary_pressed());
         let is_primary_released = ui.input(|i| i.pointer.primary_released());
+        let is_primary_clicked = ui.input(|i| i.pointer.primary_clicked());
         let is_secondary_clicked = ui.input(|i| i.pointer.secondary_clicked());
         let is_double_click = ui.input(|i| {
             i.pointer
@@ -664,6 +686,30 @@ pub fn render_viewer(
                                     }
                                     if active_tool == ActiveTool::None {
                                         if let Some(ref text) = info.text {
+                                            if let Some(link) = text.hit_test_link(can_pt) {
+                                                ui.ctx().set_cursor_icon(
+                                                    egui::CursorIcon::PointingHand,
+                                                );
+                                                match &link.target {
+                                                    LinkTarget::Uri(url) => {
+                                                        egui::show_tooltip_text(
+                                                            ui.ctx(),
+                                                            ui.layer_id(),
+                                                            egui::Id::new("link_tooltip"),
+                                                            url,
+                                                        );
+                                                    }
+                                                    LinkTarget::Page(p) => {
+                                                        egui::show_tooltip_text(
+                                                            ui.ctx(),
+                                                            ui.layer_id(),
+                                                            egui::Id::new("link_tooltip"),
+                                                            format!("Go to page {}", p + 1),
+                                                        );
+                                                    }
+                                                }
+                                                break;
+                                            }
                                             if text.is_hovering_text(can_pt) {
                                                 ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
                                                 break;
@@ -1090,6 +1136,37 @@ pub fn render_viewer(
                                 *annotations_dirty = true;
                                 ui.ctx().request_repaint();
                             }
+                        } else if is_primary_clicked && active_tool == ActiveTool::None {
+                            let mut hit_link = false;
+                            for info in &visible_info {
+                                if info.screen_rect.contains(pos) {
+                                    if let Some(ref text) = info.text {
+                                        let can_pt = info.transform.screen_to_canonical(pos);
+                                        if let Some(link) = text.hit_test_link(can_pt) {
+                                            match &link.target {
+                                                LinkTarget::Uri(url) => {
+                                                    action =
+                                                        Some(ViewerAction::OpenUrl(url.clone()));
+                                                }
+                                                LinkTarget::Page(p) => {
+                                                    action = Some(ViewerAction::JumpToPage(*p));
+                                                }
+                                            }
+                                            *selection = None;
+                                            hit_link = true;
+                                            ui.ctx().request_repaint();
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            if !hit_link {
+                                if let Some(cur_sel) = *selection {
+                                    if cur_sel.is_empty() {
+                                        *selection = None;
+                                    }
+                                }
+                            }
                         } else if let Some(cur_sel) = *selection {
                             if cur_sel.is_empty() {
                                 *selection = None;
@@ -1171,17 +1248,30 @@ pub fn render_viewer(
                 rotation,
             };
 
-            let (entry_opt, is_stale) = if let Some((tex, gen)) = cache.get_entry(&sharp_key) {
-                (Some(tex), gen < render_generation || annotations_changed)
+            let (sharp_tex_id, is_stale) = if let Some((tex, gen)) = cache.get_entry(&sharp_key) {
+                (
+                    Some(tex.id()),
+                    gen < render_generation || annotations_changed,
+                )
             } else {
                 (None, true)
             };
 
+            let fallback_tex_id = if sharp_tex_id.is_none() {
+                cache
+                    .get_best_for_page(doc_id, idx, rotation)
+                    .map(|t| t.id())
+            } else {
+                None
+            };
+
+            let active_tex_id = sharp_tex_id.or(fallback_tex_id);
+
             if is_in_viewport {
                 // Sharp render available -> paint sharp (and request refresh if stale)
-                if let Some(sharp_tex) = entry_opt {
+                if let Some(tex_id) = sharp_tex_id {
                     painter.image(
-                        sharp_tex.id(),
+                        tex_id,
                         screen_rect,
                         Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
                         Color32::WHITE,
@@ -1194,10 +1284,10 @@ pub fn render_viewer(
                             priority: 1,
                         });
                     }
-                } else if let Some(fallback_tex) = cache.get_best_for_page(doc_id, idx, rotation) {
+                } else if let Some(tex_id) = fallback_tex_id {
                     // Fallback to previous zoom level texture so zooming is smooth and never flashes blank
                     painter.image(
-                        fallback_tex.id(),
+                        tex_id,
                         screen_rect,
                         Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
                         Color32::WHITE,
@@ -1345,15 +1435,31 @@ pub fn render_viewer(
                                         let raw_rects =
                                             text_data.get_selection_rects(p_start, p_end);
                                         let is_hl = active_tool == ActiveTool::Highlighter;
-                                        let sel_color = if is_hl {
-                                            Color32::from_rgba_unmultiplied(
-                                                highlighter_color.r,
-                                                highlighter_color.g,
-                                                highlighter_color.b,
-                                                (0.42_f32 * 255.0_f32).round() as u8,
+                                        let (multiply_color, fallback_color) = if is_hl {
+                                            (
+                                                Color32::from_rgb(
+                                                    highlighter_color.r,
+                                                    highlighter_color.g,
+                                                    highlighter_color.b,
+                                                ),
+                                                Color32::from_rgba_unmultiplied(
+                                                    highlighter_color.r,
+                                                    highlighter_color.g,
+                                                    highlighter_color.b,
+                                                    (0.42_f32 * 255.0_f32).round() as u8,
+                                                ),
                                             )
                                         } else {
-                                            Color32::from_rgba_unmultiplied(245, 90, 40, 115)
+                                            let c = Theme::TEXT_SELECTION_MULTIPLY;
+                                            (
+                                                c,
+                                                Color32::from_rgba_unmultiplied(
+                                                    c.r(),
+                                                    c.g(),
+                                                    c.b(),
+                                                    120,
+                                                ),
+                                            )
                                         };
                                         for r in raw_rects {
                                             let adj_r = if is_hl {
@@ -1363,7 +1469,19 @@ pub fn render_viewer(
                                             };
                                             let screen_r = transform
                                                 .canonical_to_screen_rect(adj_r.to_egui_rect());
-                                            painter.rect_filled(screen_r, 0.0, sel_color);
+                                            if let (Some(tex_id), Some((visible_r, uv))) = (
+                                                active_tex_id,
+                                                compute_page_subrect_uv(screen_rect, screen_r),
+                                            ) {
+                                                painter.image(
+                                                    tex_id,
+                                                    visible_r,
+                                                    uv,
+                                                    multiply_color,
+                                                );
+                                            } else {
+                                                painter.rect_filled(screen_r, 0.0, fallback_color);
+                                            }
                                         }
                                     }
                                 }
@@ -1856,5 +1974,87 @@ mod tests {
                 draw_dotted_vertical_rect(ui.painter(), pos2(100.0, 100.0), 8.0, 22.0);
             });
         });
+    }
+
+    #[test]
+    fn test_compute_page_subrect_uv_boundaries() {
+        let page_rect = Rect::from_min_max(pos2(100.0, 200.0), pos2(500.0, 800.0));
+
+        // 1. Exact match -> UV (0, 0) to (1, 1)
+        let (vis1, uv1) = compute_page_subrect_uv(page_rect, page_rect).expect("exact match uv");
+        assert_eq!(vis1, page_rect);
+        assert!((uv1.min.x - 0.0).abs() < 1e-4);
+        assert!((uv1.min.y - 0.0).abs() < 1e-4);
+        assert!((uv1.max.x - 1.0).abs() < 1e-4);
+        assert!((uv1.max.y - 1.0).abs() < 1e-4);
+
+        // 2. Centered sub-rect (half width, half height)
+        let sub2 = Rect::from_min_max(pos2(200.0, 350.0), pos2(400.0, 650.0));
+        let (vis2, uv2) = compute_page_subrect_uv(page_rect, sub2).expect("centered subrect uv");
+        assert_eq!(vis2, sub2);
+        assert!((uv2.min.x - 0.25).abs() < 1e-4);
+        assert!((uv2.min.y - 0.25).abs() < 1e-4);
+        assert!((uv2.max.x - 0.75).abs() < 1e-4);
+        assert!((uv2.max.y - 0.75).abs() < 1e-4);
+
+        // 3. Sub-rect extending outside bounds is clipped to positive intersection
+        let sub3 = Rect::from_min_max(pos2(50.0, 150.0), pos2(300.0, 500.0));
+        let (vis3, uv3) = compute_page_subrect_uv(page_rect, sub3).expect("clamped subrect uv");
+        assert_eq!(vis3.min, page_rect.min);
+        assert!((uv3.min.x - 0.0).abs() < 1e-4);
+        assert!((uv3.min.y - 0.0).abs() < 1e-4);
+        assert!((uv3.max.x - 0.5).abs() < 1e-4);
+        assert!((uv3.max.y - 0.5).abs() < 1e-4);
+
+        // 4. Disjoint outside rect -> None
+        let sub_outside = Rect::from_min_max(pos2(600.0, 200.0), pos2(700.0, 300.0));
+        assert!(compute_page_subrect_uv(page_rect, sub_outside).is_none());
+
+        // 5. Zero or negative page dimensions -> None
+        let degenerate = Rect::from_min_max(pos2(100.0, 100.0), pos2(100.0, 200.0));
+        assert!(compute_page_subrect_uv(degenerate, sub2).is_none());
+    }
+
+    #[test]
+    fn test_text_selection_multiply_overlay_color_contrast() {
+        let sel_color = Theme::TEXT_SELECTION_MULTIPLY;
+        // Verify shade RGB: radiant electric amber (#FFA028)
+        assert_eq!(sel_color.r(), 255);
+        assert_eq!(sel_color.g(), 160);
+        assert_eq!(sel_color.b(), 40);
+
+        let blend = |tex: u8, tint: u8| -> u8 { ((tex as u32 * tint as u32) / 255) as u8 };
+
+        // Case A: Pure white page background (255, 255, 255)
+        assert_eq!(
+            (
+                blend(255, sel_color.r()),
+                blend(255, sel_color.g()),
+                blend(255, sel_color.b())
+            ),
+            (255, 160, 40)
+        );
+
+        // Case B: Pure pitch-black document text (0, 0, 0)
+        assert_eq!(
+            (
+                blend(0, sel_color.r()),
+                blend(0, sel_color.g()),
+                blend(0, sel_color.b())
+            ),
+            (0, 0, 0),
+            "Multiply blend over black text must remain 100% pitch-black!"
+        );
+
+        // Case C: Standard relative luminance of selection background:
+        // L = 0.2126 * (R/255) + 0.7152 * (G/255) + 0.0722 * (B/255)
+        let luma = 0.2126 * (255.0 / 255.0) + 0.7152 * (160.0 / 255.0) + 0.0722 * (40.0 / 255.0);
+        // Contrast ratio against pitch black (0.0): (L + 0.05) / (0.0 + 0.05)
+        let contrast_ratio = (luma + 0.05) / 0.05;
+        assert!(
+            contrast_ratio > 10.0,
+            "Contrast ratio with black text ({:.1}:1) must easily surpass WCAG AAA (7:1)",
+            contrast_ratio
+        );
     }
 }

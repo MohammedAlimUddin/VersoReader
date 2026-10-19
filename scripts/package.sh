@@ -18,8 +18,9 @@ mkdir -p "$STAGE_DIR/lib" "$STAGE_DIR/assets"
 
 # 3. Copy binary and libraries
 echo "Copying binary and libraries..."
-cp "$REPO_DIR/target/release/pdfview" "$STAGE_DIR/pdfview"
-chmod +x "$STAGE_DIR/pdfview"
+cp "$REPO_DIR/target/release/verso-reader" "$STAGE_DIR/verso-reader"
+chmod +x "$STAGE_DIR/verso-reader"
+ln -sf "verso-reader" "$STAGE_DIR/pdfview"
 
 if [ -f "$REPO_DIR/lib/libpdfium.so" ]; then
     cp "$REPO_DIR/lib/libpdfium.so" "$STAGE_DIR/lib/libpdfium.so"
@@ -46,7 +47,7 @@ cat <<'EOF' > "$STAGE_DIR/run.sh"
 #!/usr/bin/env bash
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export LD_LIBRARY_PATH="$DIR/lib:$DIR:${LD_LIBRARY_PATH:-}"
-exec "$DIR/pdfview" "$@"
+exec "$DIR/verso-reader" "$@"
 EOF
 chmod +x "$STAGE_DIR/run.sh"
 
@@ -66,10 +67,10 @@ for size in 32x32 48x48 64x64 128x128 256x256; do
     mkdir -p "$ICON_BASE/$size/apps"
 done
 
-echo "Installing Verso Reader to $BIN_DIR/pdfview..."
-cp "$DIR/pdfview" "$BIN_DIR/pdfview"
-chmod +x "$BIN_DIR/pdfview"
-ln -sf "$BIN_DIR/pdfview" "$BIN_DIR/verso-reader"
+echo "Installing Verso Reader to $BIN_DIR/verso-reader..."
+cp "$DIR/verso-reader" "$BIN_DIR/verso-reader"
+chmod +x "$BIN_DIR/verso-reader"
+ln -sf "$BIN_DIR/verso-reader" "$BIN_DIR/pdfview"
 
 echo "Installing Pdfium engine to $LIB_DIR/libpdfium.so..."
 cp "$DIR/lib/libpdfium.so" "$LIB_DIR/libpdfium.so"
@@ -87,7 +88,7 @@ Type=Application
 Name=Verso Reader
 GenericName=PDF Reader
 Comment=Modern, lightweight, high-performance desktop PDF reader
-Exec=$BIN_DIR/pdfview %U
+Exec=$BIN_DIR/verso-reader %U
 Icon=verso-reader
 Terminal=false
 Categories=Office;Viewer;

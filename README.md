@@ -2,7 +2,7 @@
 
 > A minimalistic, blazing-fast, low-RAM desktop PDF reader for Linux written in Rust, engineered to replicate the clean reading experience of Microsoft Edge without bloatware or telemetry.
 
-![VersoReader Icon](assets/icon.svg)
+![Verso Reader Icon](assets/icon.png)
 
 ---
 
@@ -38,7 +38,7 @@ To install VersoReader into your system launcher and register it as a PDF viewer
 cd verso-reader
 ./install.sh
 ```
-This installs the binary to `~/.local/bin/pdfview`, Pdfium to `~/.local/lib/pdfview/`, installs the desktop launcher, and registers file associations.
+This installs the binary to `~/.local/bin/verso-reader`, Pdfium to `~/.local/lib/pdfview/`, installs the desktop launcher, and registers file associations.
 
 ---
 

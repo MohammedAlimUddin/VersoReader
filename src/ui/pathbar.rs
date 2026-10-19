@@ -266,6 +266,26 @@ impl PathBar {
             if self.request_focus {
                 response.request_focus();
                 self.request_focus = false;
+                let mut state =
+                    egui::text_edit::TextEditState::load(ui.ctx(), response.id).unwrap_or_default();
+                let len = self.text.chars().count();
+                state
+                    .cursor
+                    .set_char_range(Some(egui::text_selection::CCursorRange::two(
+                        egui::text::CCursor::new(0),
+                        egui::text::CCursor::new(len),
+                    )));
+                state.store(ui.ctx(), response.id);
+                let mut state =
+                    egui::text_edit::TextEditState::load(ui.ctx(), response.id).unwrap_or_default();
+                let len = self.text.chars().count();
+                state
+                    .cursor
+                    .set_char_range(Some(egui::text_selection::CCursorRange::two(
+                        egui::text::CCursor::new(0),
+                        egui::text::CCursor::new(len),
+                    )));
+                state.store(ui.ctx(), response.id);
             }
 
             // Quick clear button (vector cross)
@@ -293,17 +313,12 @@ impl PathBar {
                 }
             }
 
-            // Open button with vector folder icon: opens entered path if present, or opens file chooser if empty
+            // Open button with vector folder icon: opens file chooser dialog
             let (open_rect, open_resp) =
                 ui.allocate_exact_size(Vec2::new(76.0, 26.0), Sense::click());
-            let open_tooltip = if self.text.trim().is_empty() {
-                "Open file chooser (browse for PDF files)"
-            } else {
-                "Open entered PDF file"
-            };
             let open_resp = open_resp
                 .on_hover_cursor(egui::CursorIcon::PointingHand)
-                .on_hover_text(open_tooltip);
+                .on_hover_text("Open file chooser (browse for PDF files)");
             let open_bg = if open_resp.hovered() {
                 Theme::ACCENT_HOVER
             } else {
@@ -325,21 +340,7 @@ impl PathBar {
             );
 
             if open_resp.clicked() {
-                if self.text.trim().is_empty() {
-                    action = Some(PathBarAction::LaunchFileChooser);
-                } else {
-                    match parse_pdf_path(&self.text) {
-                        Ok(path) => {
-                            self.inline_error = None;
-                            action = Some(PathBarAction::OpenPath(path));
-                            ui.ctx().request_repaint();
-                        }
-                        Err(err) => {
-                            self.inline_error = Some(err);
-                            ui.ctx().request_repaint();
-                        }
-                    }
-                }
+                action = Some(PathBarAction::LaunchFileChooser);
             }
 
             let enter_pressed = (response.has_focus() || response.lost_focus())

@@ -7,7 +7,7 @@ REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 echo "=== Installing VersoReader (pdfview) ==="
 
 # 1. Build release binary if not present
-if [ ! -f "$REPO_DIR/target/release/pdfview" ]; then
+if [ ! -f "$REPO_DIR/target/release/verso-reader" ]; then
     echo "Building release binary..."
     cargo build --release --manifest-path "$REPO_DIR/Cargo.toml"
 fi
@@ -25,10 +25,10 @@ for size in 32x32 48x48 64x64 128x128 256x256; do
 done
 
 # 3. Copy binary and library
-echo "Installing binary to $BIN_DIR/pdfview..."
-cp "$REPO_DIR/target/release/pdfview" "$BIN_DIR/pdfview"
-chmod +x "$BIN_DIR/pdfview"
-ln -sf "$BIN_DIR/pdfview" "$BIN_DIR/verso-reader"
+echo "Installing binary to $BIN_DIR/verso-reader..."
+cp "$REPO_DIR/target/release/verso-reader" "$BIN_DIR/verso-reader"
+chmod +x "$BIN_DIR/verso-reader"
+ln -sf "$BIN_DIR/verso-reader" "$BIN_DIR/pdfview"
 
 if [ -f "$REPO_DIR/lib/libpdfium.so" ]; then
     echo "Installing Pdfium engine to $LIB_DIR/libpdfium.so..."
@@ -52,7 +52,7 @@ Type=Application
 Name=Verso Reader
 GenericName=PDF Reader
 Comment=Modern, lightweight, high-performance desktop PDF reader
-Exec=$BIN_DIR/pdfview %U
+Exec=$BIN_DIR/verso-reader %U
 Icon=verso-reader
 Terminal=false
 Categories=Office;Viewer;
@@ -75,7 +75,7 @@ if command -v gtk-update-icon-cache >/dev/null 2>&1; then
 fi
 
 echo "=== Verso Reader installed successfully! ==="
-echo "• Binary:  $BIN_DIR/pdfview (also symlinked as $BIN_DIR/verso-reader)"
+echo "• Binary:  $BIN_DIR/verso-reader (also symlinked as $BIN_DIR/pdfview)"
 echo "• Engine:  $LIB_DIR/libpdfium.so"
 echo "• Launcher: $APPS_DIR/verso-reader.desktop"
 echo ""

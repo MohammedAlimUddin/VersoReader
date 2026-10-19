@@ -112,6 +112,7 @@ src/
     transform.rs   Canonical <-> screen coordinate transforms (PageTransform)
   platform/
     mod.rs         Platform-specific abstractions
+    ipc.rs         Single-instance Unix domain socket IPC listener and client
     wayland.rs     Native Wayland touchpad pinch gesture listener (zwp_pointer_gestures_v1)
   ui/
     mod.rs         UI components export
@@ -130,7 +131,36 @@ PROGRESS.md        Milestone checklist and verification status
 
 ---
 
-## 7. Annotation Storage & Lifecycle
+## 7. Single-Instance IPC Architecture (`src/platform/ipc.rs`)
+* **Socket Path**: Unix domain socket at `$XDG_RUNTIME_DIR/verso-reader.sock` (fallback: `/tmp/verso-reader-<uid>.sock`).
+* **CLI Interception**: On launch, `main.rs` inspects whether an IPC socket is actively listening:
+  - If a file path is provided: sends `OPEN <canonical_path>`.
+  - If no path is provided: sends `FOCUS`.
+  - If the socket responds with `OK`, the secondary process exits immediately (`0`), handing off the request to the active instance.
+  - If `ConnectionRefused` occurs, the stale socket file is unlinked automatically, allowing the current process to claim server ownership.
+* **Server Lifecycle**:
+  - The background IPC thread runs an accept loop on the socket, forwarding incoming `IpcMessage::Open(PathBuf)` and `IpcMessage::Focus` commands to the UI thread over a crossbeam channel.
+  - On shutdown, `IpcServer::drop` automatically unlinks the socket file.
+* **Window Activation & Tab Management**:
+  - When an `Open` message arrives, the UI checks if the document is already open in an existing tab. If so, it switches focus to that tab; otherwise, it opens the file in a new tab (or reuses the default empty tab).
+  - The application requests OS window focus using `egui::ViewportCommand::Focus`, `egui::ViewportCommand::Minimized(false)`, and `egui::ViewportCommand::RequestUserAttention(Critical)`.
+
+---
+
+## 8. In-PDF Hyperlinks & URL Actions
+* **Link Extraction (`pdf/worker.rs`)**:
+  - Worker queries both `page.links()` and `page.annotations()` during text extraction.
+  - Resolves internal destinations (`XYZ`, `Fit`, page index) and external URI actions (`http`, `https`, `mailto`).
+  - Converts link bounding boxes into canonical coordinate space (`PageLink { rect, target }`) and caches them inside `PageTextData`.
+* **Interaction & Tooltips (`ui/viewer.rs`)**:
+  - When the pointer hovers over a link, the cursor transforms into `CursorIcon::PointingHand`.
+  - Tooltips display destination details: `"Go to page N"` for internal document jumps, or the full URL for external web links.
+  - **Click vs. Drag Differentiation**: A primary mouse click executes the link action (`ViewerAction::JumpToPage` or `ViewerAction::OpenUrl`), while mouse drag gestures seamlessly transition into text selection without activating the link.
+  - Internal page jumps are recorded in the tab's navigation history, allowing instant backward and forward traversal via `Alt+Left` / `Alt+Right`. External URLs open in the default web browser via `ctx.open_url`.
+
+---
+
+## 9. Annotation Storage & Lifecycle
 * **Storage Invariant**: Annotations (`Highlight`, `TextBox`) are stored strictly in canonical coordinates (points, unrotated, origin top-left).
 * **Storage Path**: Persisted as JSON in `~/.local/share/pdfview/annotations/<blake3(abs path + file size)>.json`.
 * **Direct PDF Embedding (`Ctrl+S`)**: Native ISO 32000 `/Highlight`, `/Ink`, and `/FreeText` annotations are embedded directly into the document using an atomic temporary-file-and-rename pipeline, enabling seamless viewing across Microsoft Edge, Chrome, and Adobe Acrobat.
@@ -143,6 +173,32 @@ PROGRESS.md        Milestone checklist and verification status
   - **Highlighter**: Dragging over text creates line-height-adjusted highlight rectangles (`adjust_rect_thickness`), centering the band vertically on lines. Dragging in whitespace or margins creates freehand ink strokes. Drawn with native PDFium `FXDIB_BLEND_MULTIPLY` blending.
   - **Text Tool**: Clicking on a page creates an inline `egui::TextEdit::multiline` text box. Double-clicking existing boxes edits them; clicking and dragging moves them across pages with full rotation support; pressing `Delete` deletes selected boxes; empty boxes are discarded on commit. Text is rendered continuously using egui's text layout engine over a transparent background matching the selected font color.
   - **Text Box Resizing**: Selected and actively editing text boxes feature an interactive circular handle on the right edge. Hovering displays `CursorIcon::ResizeHorizontal`; dragging resizes box width (clamped $\ge 40\text{ pt}$) with dynamic multiline text reflow and wrapping; mouse release pushes an undoable `ModifyTextBox` action.
-  - **Eraser**: Sets cursor to `Crosshair`. Clicking or dragging across highlights or text boxes hit-tests points in canonical space and deletes them, pushing deletions to the undo stack.
   - **Settings**: Active highlighter color/thickness, text font size, text color, and touchpad/mouse wheel multipliers persist in `~/.config/pdfview/settings.toml`.
+
+---
+
+## 10. External Annotation Rendering & Solid Block Elimination
+* **Problem Solved**: External PDF editors (Adobe Acrobat, Microsoft Edge, Xournal++) write `/FreeText`, `/Text` (sticky notes), and `/Popup` annotations with appearance streams or default background fills. When `render_annotations(true)` is enabled in PDFium, PDFium burns opaque rectangular black or yellow boxes into the page bitmap, while egui simultaneously draws the text on top.
+* **Extraction & Clean In-Memory State**:
+  - `extract_annotations_from_page` in `src/pdf/worker.rs` extracts all text content, geometry, font size, and color into canonical `TextBox` models.
+  - Immediately following extraction, `/FreeText`, `/Text`, and associated `/Popup` annotations are deleted from the in-memory `PdfPage` (`annots.delete_annotation(annot)`).
+  - In `Command::Render`, a safety check purges any remaining solid-block annotations before `page.render_with_config`, guaranteeing that visible pages never render with opaque backgrounds regardless of prefetch or race timing.
+* **Transparent egui Text Layering**:
+  - Text annotations are rendered exclusively through egui's galley layout engine with transparent backgrounds and the exact author-selected font colors.
+  - Native save (`Command::SaveDoc`) serializes standard ISO 32000 `/FreeText` annotations with transparent interior color (`/IC`) and borderless style, and cleans the in-memory document immediately after saving.
+
+---
+
+## 11. Dormant Tab Memory Optimization
+* **Inactivity Tracking**:
+  - Each `PdfTab` tracks `last_accessed: Instant` and `is_dormant: bool`.
+  - The UI check loop (`check_dormant_tabs`) monitors background tabs. Any tab inactive for $> 5\text{ minutes}$ ($300\text{ seconds}$) is transitioned to dormant state.
+* **Three-Tier Resource Deallocation**:
+  1. **OpenGL Texture Cache**: Purges all GPU texture handles (`cache.clear_doc(doc_id)`).
+  2. **Page Text Cache**: Drops extracted character bounding boxes (`text_cache.clear_doc(doc_id)`).
+  3. **Worker Pdfium Document**: Dispatches `Command::UnloadDoc { doc_id }`, which drops the `PdfDocument` handle and releases C++ font tables and page buffers.
+* **Minimal Memory Footprint & Seamless Wakeup**:
+  - Dormant tabs retain only ~1 KB of tab metadata in RAM (path, page count, scroll offset, zoom, rotation, annotations, nav history).
+  - In the tab bar, dormant tabs display italicized titles and a sleeping tooltip: `"Sleeping tab to save memory — click to wake"`.
+  - Clicking a dormant tab awakens it instantly: `ensure_active_tab_awake` reloads the PDF on the worker thread ($< 30\text{ ms}$) and synchronizes any unsaved annotations without viewport jump or flickering.
 

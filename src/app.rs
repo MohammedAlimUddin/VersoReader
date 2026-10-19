@@ -12,7 +12,7 @@ use crate::pdf::types::{
 use crate::pdf::{start_worker, Command, Event, PageTransform};
 use crate::settings::Settings;
 use crate::ui::findbar::{render_find_bar, FindBarAction, FindState};
-use crate::ui::icons::render_adobe_button;
+use crate::ui::icons::{render_adobe_button, render_adobe_checkbox};
 use crate::ui::pathbar::{parse_pdf_path, PathBar, PathBarAction};
 use crate::ui::sidebar_toc::render_sidebar_toc;
 use crate::ui::tabbar::{render_tab_bar, TabBarAction, TabItem};
@@ -62,6 +62,91 @@ pub struct PdfTab {
     pub selected_text_box_id: Option<u64>,
     pub dragging_text_box: Option<(u64, egui::Pos2, [f32; 2])>,
     pub resizing_text_box: Option<(Option<u64>, egui::Pos2, f32)>,
+    pub nav_history: Vec<(usize, f32)>,
+    pub nav_future: Vec<(usize, f32)>,
+    pub last_accessed: Instant,
+    pub is_dormant: bool,
+}
+
+impl PdfTab {
+    /// Marks the tab as dormant to free RAM, returning true if state changed.
+    #[allow(dead_code)]
+    pub fn deactivate(&mut self) -> bool {
+        if !self.is_dormant && !self.path.as_os_str().is_empty() {
+            self.is_dormant = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Wakes up a dormant tab and refreshes its activity timestamp.
+    pub fn wake_up(&mut self) {
+        self.is_dormant = false;
+        self.last_accessed = Instant::now();
+    }
+
+    /// Records a discontinuous navigation jump (e.g. from page box, TOC, search, Home/End).
+    pub fn record_nav_jump(&mut self) {
+        let current_entry = (self.current_page, self.scroll_offset_y);
+        // Avoid duplicate entries if jump is within the same page and nearly identical offset
+        if let Some(&(last_page, last_offset)) = self.nav_history.last() {
+            if last_page == current_entry.0 && (last_offset - current_entry.1).abs() < 50.0 {
+                return;
+            }
+        }
+        self.nav_history.push(current_entry);
+        if self.nav_history.len() > 50 {
+            self.nav_history.remove(0);
+        }
+        self.nav_future.clear();
+    }
+
+    /// Returns true if backwards navigation is available.
+    pub fn can_go_back(&self) -> bool {
+        !self.nav_history.is_empty()
+    }
+
+    /// Returns true if forward navigation is available.
+    pub fn can_go_forward(&self) -> bool {
+        !self.nav_future.is_empty()
+    }
+
+    /// Navigates back in history stack.
+    pub fn go_back(&mut self) {
+        if let Some((target_page, target_offset)) = self.nav_history.pop() {
+            self.nav_future
+                .push((self.current_page, self.scroll_offset_y));
+            if self.nav_future.len() > 50 {
+                self.nav_future.remove(0);
+            }
+            if target_offset > 0.0 {
+                self.pending_set_scroll_offset_y = Some(target_offset);
+                self.pending_scroll_to_page = None;
+            } else {
+                self.pending_scroll_to_page = Some(target_page);
+                self.pending_set_scroll_offset_y = None;
+            }
+        }
+    }
+
+    /// Navigates forward in history stack.
+    pub fn go_forward(&mut self) {
+        if let Some((target_page, target_offset)) = self.nav_future.pop() {
+            self.nav_history
+                .push((self.current_page, self.scroll_offset_y));
+            if self.nav_history.len() > 50 {
+                self.nav_future.remove(0);
+            }
+            if target_offset > 0.0 {
+                self.pending_set_scroll_offset_y = Some(target_offset);
+                self.pending_scroll_to_page = None;
+            } else {
+                self.pending_scroll_to_page = Some(target_page);
+                self.pending_set_scroll_offset_y = None;
+            }
+        }
+    }
 }
 
 /// Top-level tabs in the reader.
@@ -208,11 +293,18 @@ pub struct PdfViewApp {
     pub last_window_title: String,
     pub settings: Settings,
     pub draft_settings: Settings,
+    pub reading_history: crate::settings::ReadingHistory,
+    pub last_session_save: Option<Instant>,
+    pub session_restored: bool,
     pub settings_saved_toast: Option<Instant>,
     pub show_about_modal: bool,
     pub fullscreen_quickbar_open: bool,
     pub fullscreen_page_input: String,
     pub fullscreen_is_editing_page: bool,
+    #[cfg(unix)]
+    pub _ipc_server: Option<crate::platform::ipc::IpcServer>,
+    #[cfg(unix)]
+    pub rx_ipc: Option<crossbeam_channel::Receiver<crate::platform::ipc::IpcMessage>>,
 }
 
 impl PdfViewApp {
@@ -220,6 +312,13 @@ impl PdfViewApp {
         crate::ui::theme::Theme::apply(&cc.egui_ctx);
 
         let (tx_cmd, rx_evt) = start_worker(cc.egui_ctx.clone());
+
+        #[cfg(unix)]
+        let (ipc_server, rx_ipc) = match crate::platform::ipc::IpcServer::start(cc.egui_ctx.clone())
+        {
+            Some((srv, rx)) => (Some(srv), Some(rx)),
+            None => (None, None),
+        };
 
         let mut path_bar = PathBar::new();
         let mut pending_open_path = None;
@@ -237,6 +336,7 @@ impl PdfViewApp {
         }
 
         let loaded_settings = Settings::load();
+        let reading_history = Settings::load_history();
         let mut texture_cache = TextureCache::default();
         texture_cache.set_max_bytes(loaded_settings.cache_size_mb * 1024 * 1024);
 
@@ -271,11 +371,18 @@ impl PdfViewApp {
             last_window_title: "Verso Reader".to_string(),
             draft_settings: loaded_settings.clone(),
             settings: loaded_settings,
+            reading_history,
+            last_session_save: None,
+            session_restored: false,
             settings_saved_toast: None,
             show_about_modal: false,
             fullscreen_quickbar_open: false,
             fullscreen_page_input: "1".to_string(),
             fullscreen_is_editing_page: false,
+            #[cfg(unix)]
+            _ipc_server: ipc_server,
+            #[cfg(unix)]
+            rx_ipc,
         };
 
         if app.pending_open_path.is_none() {
@@ -355,6 +462,10 @@ impl PdfViewApp {
             selected_text_box_id: None,
             dragging_text_box: None,
             resizing_text_box: None,
+            nav_history: Vec::new(),
+            nav_future: Vec::new(),
+            last_accessed: Instant::now(),
+            is_dormant: false,
         };
 
         self.tabs.push(Tab::Pdf(tab));
@@ -364,10 +475,18 @@ impl PdfViewApp {
         self.path_bar.expand_and_focus();
     }
 
-    /// Opens a PDF file. Reuses the active tab if it is an empty tab, or creates a new tab otherwise.
-    pub fn open_pdf_tab(&mut self, path: PathBuf) {
+    /// Opens a PDF file with restored reading position, zoom, and rotation.
+    pub fn open_pdf_tab_with_state(
+        &mut self,
+        path: PathBuf,
+        page: usize,
+        scroll_offset_y: f32,
+        zoom: f32,
+        rotation: u16,
+    ) {
         self.path_bar.set_text(path.display().to_string());
         self.path_bar.set_error(None);
+        self.path_bar.is_collapsed = true;
 
         let title = path
             .file_name()
@@ -381,17 +500,30 @@ impl PdfViewApp {
             false
         };
 
+        let pending_scroll_to_page = if scroll_offset_y > 0.0 {
+            None
+        } else {
+            Some(page.max(1))
+        };
+        let pending_set_scroll_offset_y = if scroll_offset_y > 0.0 {
+            Some(scroll_offset_y)
+        } else {
+            None
+        };
+
         if active_is_empty {
             if let Some(Tab::Pdf(tab)) = self.tabs.get_mut(self.active_tab_idx) {
                 tab.path = path.clone();
                 tab.title = title;
                 tab.page_count = 0;
                 tab.page_sizes.clear();
-                tab.current_page = 1;
-                tab.scroll_offset_y = 0.0;
-                tab.pending_scroll_to_page = Some(1);
+                tab.current_page = page.max(1);
+                tab.zoom = zoom.clamp(0.1, 8.0);
+                tab.rotation = rotation;
+                tab.scroll_offset_y = scroll_offset_y;
+                tab.pending_scroll_to_page = pending_scroll_to_page;
                 tab.pending_scroll_delta_y = None;
-                tab.pending_set_scroll_offset_y = None;
+                tab.pending_set_scroll_offset_y = pending_set_scroll_offset_y;
                 tab.is_loading = true;
                 tab.loading_message = format!("Opening {}...", path.display());
                 tab.outline = None;
@@ -412,6 +544,8 @@ impl PdfViewApp {
                 tab.selected_text_box_id = None;
                 tab.dragging_text_box = None;
                 tab.resizing_text_box = None;
+                tab.nav_history.clear();
+                tab.nav_future.clear();
                 let doc_id = tab.doc_id;
                 self.render_generation += 1;
                 self.pending_render_requests.clear();
@@ -430,13 +564,13 @@ impl PdfViewApp {
             title,
             page_count: 0,
             page_sizes: Vec::new(),
-            current_page: 1,
-            zoom: 1.0,
-            rotation: 0,
-            scroll_offset_y: 0.0,
-            pending_scroll_to_page: Some(1),
+            current_page: page.max(1),
+            zoom: zoom.clamp(0.1, 8.0),
+            rotation,
+            scroll_offset_y,
+            pending_scroll_to_page,
             pending_scroll_delta_y: None,
-            pending_set_scroll_offset_y: None,
+            pending_set_scroll_offset_y,
             last_viewport_height: 600.0,
             last_viewport_top: 0.0,
             last_scroll_offset_y: 0.0,
@@ -463,18 +597,176 @@ impl PdfViewApp {
             selected_text_box_id: None,
             dragging_text_box: None,
             resizing_text_box: None,
+            nav_history: Vec::new(),
+            nav_future: Vec::new(),
+            last_accessed: Instant::now(),
+            is_dormant: false,
         };
 
-        // If switching from an existing tab, drop its textures from cache
-        if let Some(prev) = self.active_pdf_tab() {
-            self.cache.clear_doc(prev.doc_id);
+        // If the current active tab is an empty placeholder tab (e.g. "New Tab" with no file),
+        // replace it with this document instead of leaving an empty tab behind.
+        let replace_active_empty = match self.tabs.get(self.active_tab_idx) {
+            Some(Tab::Pdf(t)) => t.path.as_os_str().is_empty() && t.page_count == 0,
+            _ => false,
+        };
+
+        if replace_active_empty {
+            self.tabs[self.active_tab_idx] = Tab::Pdf(tab);
+        } else {
+            // If switching from an existing tab, drop its textures from cache
+            if let Some(prev) = self.active_pdf_tab() {
+                self.cache.clear_doc(prev.doc_id);
+            }
+            self.tabs.push(Tab::Pdf(tab));
+            self.active_tab_idx = self.tabs.len() - 1;
         }
 
-        self.tabs.push(Tab::Pdf(tab));
-        self.active_tab_idx = self.tabs.len() - 1;
         self.pending_render_requests.clear();
 
         let _ = self.tx_cmd.send(Command::Open { doc_id, path });
+    }
+
+    /// Opens a PDF file. Restores reading position if available, or starts at page 1.
+    pub fn open_pdf_tab(&mut self, path: PathBuf) {
+        let (initial_page, initial_scroll, initial_zoom, initial_rotation) =
+            if self.settings.remember_reading_position {
+                let key = Settings::canonical_path_key(&path);
+                if let Some(pos) = self.reading_history.entries.get(&key) {
+                    (
+                        pos.current_page.max(1),
+                        pos.scroll_offset_y.max(0.0),
+                        pos.zoom.clamp(0.1, 8.0),
+                        pos.rotation,
+                    )
+                } else {
+                    (1, 0.0, 1.0, 0)
+                }
+            } else {
+                (1, 0.0, 1.0, 0)
+            };
+
+        self.open_pdf_tab_with_state(
+            path,
+            initial_page,
+            initial_scroll,
+            initial_zoom,
+            initial_rotation,
+        );
+    }
+
+    /// Restores previously open tabs from saved session state.
+    pub fn restore_saved_session(&mut self) {
+        let Some(session) = Settings::load_session() else {
+            return;
+        };
+        let valid_tabs: Vec<_> = session
+            .tabs
+            .into_iter()
+            .filter(|t| t.path.exists())
+            .collect();
+        if valid_tabs.is_empty() {
+            return;
+        }
+
+        let target_active_idx = session.active_tab_index;
+        for tab_state in valid_tabs {
+            self.open_pdf_tab_with_state(
+                tab_state.path,
+                tab_state.current_page,
+                tab_state.scroll_offset_y,
+                tab_state.zoom,
+                tab_state.rotation,
+            );
+        }
+
+        if target_active_idx < self.tabs.len() {
+            self.active_tab_idx = target_active_idx;
+        } else if !self.tabs.is_empty() {
+            self.active_tab_idx = self.tabs.len() - 1;
+        }
+
+        if let Some(curr) = self.active_pdf_tab_mut() {
+            curr.pending_set_scroll_offset_y = Some(curr.scroll_offset_y);
+            let path_str = if curr.path.as_os_str().is_empty() {
+                String::new()
+            } else {
+                curr.path.display().to_string()
+            };
+            self.path_bar.set_text(path_str);
+            self.path_bar.set_error(None);
+        }
+    }
+
+    /// Records the reading position for the tab at index into history.
+    pub fn update_reading_history_for_tab(&mut self, tab_idx: usize) {
+        if let Some(Tab::Pdf(tab)) = self.tabs.get(tab_idx) {
+            if !tab.path.as_os_str().is_empty() && tab.page_count > 0 {
+                let key = Settings::canonical_path_key(&tab.path);
+                let now_ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                self.reading_history.entries.insert(
+                    key,
+                    crate::settings::DocumentPosition {
+                        scroll_offset_y: tab.scroll_offset_y,
+                        current_page: tab.current_page,
+                        zoom: tab.zoom,
+                        rotation: tab.rotation,
+                        updated_at: now_ts,
+                    },
+                );
+
+                if self.reading_history.entries.len() > 100 {
+                    if let Some(oldest_key) = self
+                        .reading_history
+                        .entries
+                        .iter()
+                        .min_by_key(|(_, pos)| pos.updated_at)
+                        .map(|(k, _)| k.clone())
+                    {
+                        self.reading_history.entries.remove(&oldest_key);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Saves session tabs to `session.json` and reading positions to `history.json`.
+    pub fn save_session_and_history(&mut self) {
+        if !self.session_restored {
+            return;
+        }
+        for idx in 0..self.tabs.len() {
+            self.update_reading_history_for_tab(idx);
+        }
+        if self.settings.remember_reading_position {
+            Settings::save_history(&self.reading_history);
+        }
+
+        if self.settings.restore_session {
+            let mut session_tabs = Vec::new();
+            for tab_item in &self.tabs {
+                if let Tab::Pdf(tab) = tab_item {
+                    if !tab.path.as_os_str().is_empty() {
+                        session_tabs.push(crate::settings::SessionTab {
+                            path: tab.path.clone(),
+                            scroll_offset_y: tab.scroll_offset_y,
+                            current_page: tab.current_page,
+                            zoom: tab.zoom,
+                            rotation: tab.rotation,
+                        });
+                    }
+                }
+            }
+            let session = crate::settings::SessionState {
+                tabs: session_tabs,
+                active_tab_index: self.active_tab_idx,
+            };
+            Settings::save_session(&session);
+        } else {
+            Settings::save_session(&crate::settings::SessionState::default());
+        }
     }
 
     /// Requests closing the tab at index. If it has unsaved changes, presents a confirmation modal.
@@ -503,6 +795,8 @@ impl PdfViewApp {
             return;
         }
 
+        self.update_reading_history_for_tab(index);
+
         let closed = self.tabs.remove(index);
         if let Tab::Pdf(tab) = closed {
             let _ = self.tx_cmd.send(Command::Close { doc_id: tab.doc_id });
@@ -512,6 +806,7 @@ impl PdfViewApp {
 
         if self.tabs.is_empty() {
             self.create_empty_tab();
+            self.save_session_and_history();
             return;
         }
 
@@ -523,18 +818,94 @@ impl PdfViewApp {
         self.pending_render_requests.clear();
 
         // If new active tab exists, restore its scroll offset and synchronize path bar
-        if let Some(curr) = self.active_pdf_tab_mut() {
+        let tab_path_info = if let Some(curr) = self.active_pdf_tab_mut() {
             curr.pending_set_scroll_offset_y = Some(curr.scroll_offset_y);
             let path_str = if curr.path.as_os_str().is_empty() {
                 String::new()
             } else {
                 curr.path.display().to_string()
             };
+            let is_empty = curr.path.as_os_str().is_empty() && curr.page_count == 0;
+            Some((path_str, is_empty))
+        } else {
+            None
+        };
+
+        if let Some((path_str, is_empty)) = tab_path_info {
             self.path_bar.set_text(path_str);
             self.path_bar.set_error(None);
+            self.path_bar.is_collapsed = !is_empty;
         } else {
             self.path_bar.set_text(String::new());
             self.path_bar.set_error(None);
+            self.path_bar.is_collapsed = false;
+        }
+
+        self.save_session_and_history();
+        self.ensure_active_tab_awake();
+    }
+
+    /// Evaluates background tabs for dormancy: unloads textures, text cache, and Pdfium document handles
+    /// for tabs that have been inactive for longer than the configured timeout, freeing RAM without losing state.
+    pub fn check_dormant_tabs(&mut self) {
+        if self.settings.inactivity_timeout_mins == 0 {
+            return;
+        }
+        let timeout_secs = (self.settings.inactivity_timeout_mins as u64) * 60;
+        let dormant_timeout = std::time::Duration::from_secs(timeout_secs);
+        let active_doc_id = self.active_pdf_tab().map(|t| t.doc_id);
+        let now = Instant::now();
+
+        let mut to_deactivate = Vec::new();
+        for tab_item in &mut self.tabs {
+            if let Tab::Pdf(ref mut tab) = tab_item {
+                if Some(tab.doc_id) != active_doc_id
+                    && !tab.is_dormant
+                    && !tab.path.as_os_str().is_empty()
+                    && now.duration_since(tab.last_accessed) >= dormant_timeout
+                {
+                    tab.is_dormant = true;
+                    to_deactivate.push(tab.doc_id);
+                }
+            }
+        }
+
+        for doc_id in to_deactivate {
+            self.cache.clear_doc(doc_id);
+            self.text_cache.clear_doc(doc_id);
+            let _ = self.tx_cmd.send(Command::UnloadDoc { doc_id });
+        }
+    }
+
+    /// Ensures the active tab is awakened from dormancy and reloaded from disk if needed.
+    pub fn ensure_active_tab_awake(&mut self) {
+        let wakeup_info = match self.tabs.get_mut(self.active_tab_idx) {
+            Some(Tab::Pdf(curr)) if curr.is_dormant && !curr.path.as_os_str().is_empty() => {
+                curr.wake_up();
+                Some((
+                    curr.doc_id,
+                    curr.path.clone(),
+                    curr.has_unsaved_changes,
+                    curr.annotations.highlights.clone(),
+                    curr.annotations.text_boxes.clone(),
+                ))
+            }
+            Some(Tab::Pdf(curr)) => {
+                curr.last_accessed = Instant::now();
+                None
+            }
+            _ => None,
+        };
+
+        if let Some((doc_id, path, unsaved, hl, tb)) = wakeup_info {
+            let _ = self.tx_cmd.send(Command::Open { doc_id, path });
+            if unsaved {
+                let _ = self.tx_cmd.send(Command::SyncAnnotations {
+                    doc_id,
+                    highlights: hl,
+                    text_boxes: tb,
+                });
+            }
         }
     }
 
@@ -544,6 +915,8 @@ impl PdfViewApp {
             return;
         }
 
+        self.update_reading_history_for_tab(self.active_tab_idx);
+
         // Drop previous tab's cached textures
         if let Some(prev) = self.active_pdf_tab() {
             self.cache.clear_doc(prev.doc_id);
@@ -552,20 +925,31 @@ impl PdfViewApp {
         self.active_tab_idx = target_idx;
         self.render_generation += 1;
         self.pending_render_requests.clear();
+        self.save_session_and_history();
+        self.ensure_active_tab_awake();
 
         // Restore scroll offset for newly active tab and synchronize path bar
-        if let Some(curr) = self.active_pdf_tab_mut() {
+        let tab_path_info = if let Some(curr) = self.active_pdf_tab_mut() {
             curr.pending_set_scroll_offset_y = Some(curr.scroll_offset_y);
             let path_str = if curr.path.as_os_str().is_empty() {
                 String::new()
             } else {
                 curr.path.display().to_string()
             };
+            let is_empty = curr.path.as_os_str().is_empty() && curr.page_count == 0;
+            Some((path_str, is_empty))
+        } else {
+            None
+        };
+
+        if let Some((path_str, is_empty)) = tab_path_info {
             self.path_bar.set_text(path_str);
             self.path_bar.set_error(None);
+            self.path_bar.is_collapsed = !is_empty;
         } else {
             self.path_bar.set_text(String::new());
             self.path_bar.set_error(None);
+            self.path_bar.is_collapsed = false;
         }
     }
 
@@ -1010,6 +1394,8 @@ impl eframe::App for PdfViewApp {
                     tab_idx: idx,
                     doc_title: title,
                 });
+            } else {
+                self.save_session_and_history();
             }
         }
 
@@ -1302,11 +1688,25 @@ impl eframe::App for PdfViewApp {
             }
         }
 
+        // Periodic debounced save of session and reading history every 3 seconds (only once session is restored)
+        if self.session_restored
+            && self
+                .last_session_save
+                .is_none_or(|t| t.elapsed() > Duration::from_secs(3))
+        {
+            self.last_session_save = Some(Instant::now());
+            self.save_session_and_history();
+        }
+
         // Keyboard navigation when no text input has focus and not pinching
         let any_focus = ctx.memory(|m| m.focused().is_some());
         if !any_focus && !ctrl_pressed && !is_pinching {
             if let Some(tab) = self.active_pdf_tab_mut() {
-                if ctx.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
+                if ctx.input(|i| i.modifiers.alt && i.key_pressed(egui::Key::ArrowLeft)) {
+                    tab.go_back();
+                } else if ctx.input(|i| i.modifiers.alt && i.key_pressed(egui::Key::ArrowRight)) {
+                    tab.go_forward();
+                } else if ctx.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
                     tab.pending_scroll_delta_y = Some(-80.0);
                 } else if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
                     tab.pending_scroll_delta_y = Some(80.0);
@@ -1325,8 +1725,10 @@ impl eframe::App for PdfViewApp {
                 }) {
                     tab.pending_scroll_delta_y = Some(500.0);
                 } else if ctx.input(|i| i.key_pressed(egui::Key::Home)) {
+                    tab.record_nav_jump();
                     tab.pending_scroll_to_page = Some(1);
                 } else if ctx.input(|i| i.key_pressed(egui::Key::End)) {
+                    tab.record_nav_jump();
                     tab.pending_scroll_to_page = Some(tab.page_count);
                 }
             }
@@ -1352,6 +1754,56 @@ impl eframe::App for PdfViewApp {
             }
         }
 
+        // Drain single-instance IPC requests non-blockingly
+        #[cfg(unix)]
+        let ipc_messages: Vec<_> = if let Some(ref rx) = self.rx_ipc {
+            let mut msgs = Vec::new();
+            while let Ok(msg) = rx.try_recv() {
+                msgs.push(msg);
+            }
+            msgs
+        } else {
+            Vec::new()
+        };
+
+        #[cfg(unix)]
+        for msg in ipc_messages {
+            match msg {
+                crate::platform::ipc::IpcMessage::Open(path) => {
+                    let mut found_tab = None;
+                    for (idx, tab) in self.tabs.iter().enumerate() {
+                        if let Tab::Pdf(pdf_tab) = tab {
+                            if pdf_tab.path == path {
+                                found_tab = Some(idx);
+                                break;
+                            }
+                        }
+                    }
+                    if let Some(idx) = found_tab {
+                        self.active_tab_idx = idx;
+                    } else if self.pdfium_status == PdfiumStatus::Ready {
+                        self.open_pdf_tab(path);
+                    } else if self.pdfium_status == PdfiumStatus::Initializing {
+                        self.pending_open_path = Some(path);
+                    }
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
+                        egui::UserAttentionType::Critical,
+                    ));
+                }
+                crate::platform::ipc::IpcMessage::Focus => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
+                        egui::UserAttentionType::Critical,
+                    ));
+                }
+            }
+        }
+
+        self.check_dormant_tabs();
+
         // Drain worker events non-blockingly
         while let Ok(evt) = self.rx_evt.try_recv() {
             match evt {
@@ -1359,7 +1811,11 @@ impl eframe::App for PdfViewApp {
                     self.pdfium_status = PdfiumStatus::Ready;
                     if let Some(path) = self.pending_open_path.take() {
                         self.open_pdf_tab(path);
+                    } else if self.settings.restore_session {
+                        self.restore_saved_session();
                     }
+                    self.session_restored = true;
+                    self.last_session_save = Some(Instant::now());
                 }
                 Event::PdfiumError(err) => {
                     self.pdfium_status = PdfiumStatus::Error(err);
@@ -1376,10 +1832,20 @@ impl eframe::App for PdfViewApp {
                             if tab.doc_id == doc_id {
                                 tab.page_count = page_count;
                                 tab.page_sizes = page_sizes;
+                                if tab.current_page > page_count && page_count > 0 {
+                                    tab.current_page = page_count;
+                                }
                                 tab.is_loading = false;
                                 tab.outline_loading = true;
                                 let _ = self.tx_cmd.send(Command::Outline { doc_id });
-                                if !tab.path.as_os_str().is_empty() {
+                                if tab.has_unsaved_changes {
+                                    // Preserve unsaved in-memory annotations across dormant reload
+                                    let _ = self.tx_cmd.send(Command::SyncAnnotations {
+                                        doc_id,
+                                        highlights: tab.annotations.highlights.clone(),
+                                        text_boxes: tab.annotations.text_boxes.clone(),
+                                    });
+                                } else if !tab.path.as_os_str().is_empty() {
                                     let file_size =
                                         std::fs::metadata(&tab.path).map(|m| m.len()).unwrap_or(0);
                                     let abs_path = std::fs::canonicalize(&tab.path)
@@ -1676,6 +2142,7 @@ impl eframe::App for PdfViewApp {
                                 is_loading: pdf.is_loading,
                                 is_dirty: pdf.has_unsaved_changes,
                                 is_settings: false,
+                                is_dormant: pdf.is_dormant,
                             },
                             Tab::Settings => TabItem {
                                 title: "Preferences",
@@ -1684,6 +2151,7 @@ impl eframe::App for PdfViewApp {
                                 is_loading: false,
                                 is_dirty: false,
                                 is_settings: true,
+                                is_dormant: false,
                             },
                         })
                         .collect();
@@ -1725,6 +2193,16 @@ impl eframe::App for PdfViewApp {
                                     }
                                 }
                                 PathBarAction::LaunchFileChooser => {
+                                    let active_has_doc = if let Some(Tab::Pdf(t)) =
+                                        self.tabs.get(self.active_tab_idx)
+                                    {
+                                        !t.path.as_os_str().is_empty() || t.page_count > 0
+                                    } else {
+                                        false
+                                    };
+                                    if active_has_doc {
+                                        self.create_empty_tab();
+                                    }
                                     self.open_native_file_dialog(ctx);
                                 }
                             }
@@ -1806,6 +2284,14 @@ impl eframe::App for PdfViewApp {
                                         .active_pdf_tab()
                                         .map(|t| !t.undo_stack.redo.is_empty())
                                         .unwrap_or(false),
+                                    can_go_back: self
+                                        .active_pdf_tab()
+                                        .map(|t| t.can_go_back())
+                                        .unwrap_or(false),
+                                    can_go_forward: self
+                                        .active_pdf_tab()
+                                        .map(|t| t.can_go_forward())
+                                        .unwrap_or(false),
                                 },
                             );
                         });
@@ -1834,7 +2320,18 @@ impl eframe::App for PdfViewApp {
                             }
                             ToolbarAction::JumpToPage(target) => {
                                 if let Some(tab) = self.active_pdf_tab_mut() {
+                                    tab.record_nav_jump();
                                     tab.pending_scroll_to_page = Some(target);
+                                }
+                            }
+                            ToolbarAction::GoBack => {
+                                if let Some(tab) = self.active_pdf_tab_mut() {
+                                    tab.go_back();
+                                }
+                            }
+                            ToolbarAction::GoForward => {
+                                if let Some(tab) = self.active_pdf_tab_mut() {
+                                    tab.go_forward();
                                 }
                             }
                             ToolbarAction::ZoomIn => {
@@ -2056,6 +2553,7 @@ impl eframe::App for PdfViewApp {
                         FindBarAction::NextMatch => {
                             if let Some(tab) = self.active_pdf_tab_mut() {
                                 if let Some(idx) = tab.find_state.next_match() {
+                                    tab.record_nav_jump();
                                     if let Some(m) = tab.find_state.matches.get(idx) {
                                         let offset = compute_match_scroll_offset(
                                             m,
@@ -2073,6 +2571,7 @@ impl eframe::App for PdfViewApp {
                         FindBarAction::PrevMatch => {
                             if let Some(tab) = self.active_pdf_tab_mut() {
                                 if let Some(idx) = tab.find_state.prev_match() {
+                                    tab.record_nav_jump();
                                     if let Some(m) = tab.find_state.matches.get(idx) {
                                         let offset = compute_match_scroll_offset(
                                             m,
@@ -2261,6 +2760,7 @@ impl eframe::App for PdfViewApp {
                             tab.sidebar_open = false;
                         }
                         if let Some(target) = out.target_page {
+                            tab.record_nav_jump();
                             tab.pending_scroll_to_page = Some(target);
                         }
                     }
@@ -2393,6 +2893,19 @@ impl eframe::App for PdfViewApp {
 
                                         if response.gained_focus() {
                                             self.fullscreen_is_editing_page = true;
+                                            let mut state = egui::text_edit::TextEditState::load(
+                                                ui.ctx(),
+                                                response.id,
+                                            )
+                                            .unwrap_or_default();
+                                            let len = self.fullscreen_page_input.chars().count();
+                                            state.cursor.set_char_range(Some(
+                                                egui::text_selection::CCursorRange::two(
+                                                    egui::text::CCursor::new(0),
+                                                    egui::text::CCursor::new(len),
+                                                ),
+                                            ));
+                                            state.store(ui.ctx(), response.id);
                                         }
 
                                         let enter_pressed = (response.has_focus()
@@ -2467,6 +2980,7 @@ impl eframe::App for PdfViewApp {
                     }
                     if let Some(target) = jump_target {
                         if let Some(tab) = self.active_pdf_tab_mut() {
+                            tab.record_nav_jump();
                             tab.pending_scroll_to_page = Some(target);
                         }
                     }
@@ -2479,7 +2993,23 @@ impl eframe::App for PdfViewApp {
         }
 
         // Main Central Panel
-        egui::CentralPanel::default().show(ctx, |ui| match &self.pdfium_status {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let central_rect = ui.max_rect();
+            let pointer_clicked =
+                ui.input(|i| i.pointer.primary_clicked() || i.pointer.secondary_clicked());
+            if pointer_clicked {
+                if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
+                    if central_rect.contains(pos) {
+                        if let Some(tab) = self.active_pdf_tab_mut() {
+                            if tab.sidebar_open {
+                                tab.sidebar_open = false;
+                            }
+                        }
+                    }
+                }
+            }
+
+            match &self.pdfium_status {
             PdfiumStatus::Initializing => {
                 ui.vertical_centered(|ui| {
                     ui.add_space(80.0);
@@ -2594,18 +3124,14 @@ impl eframe::App for PdfViewApp {
                             ui.add_space(12.0);
                             ui.label(
                                 egui::RichText::new(
-                                    "Enter a PDF file path in the bar above or press Ctrl+L to open a document.",
+                                    "Open a PDF document or press Ctrl+L to enter a file path.",
                                 )
                                 .color(egui::Color32::from_rgb(170, 170, 175))
                                 .size(14.0),
                             );
                             ui.add_space(20.0);
-                            if ui
-                                .button(egui::RichText::new("Open Document (Ctrl+L)").size(13.0))
-                                .on_hover_cursor(egui::CursorIcon::PointingHand)
-                                .clicked()
-                            {
-                                self.path_bar.expand_and_focus();
+                            if render_adobe_button(ui, "Open Document", false).clicked() {
+                                self.open_native_file_dialog(ui.ctx());
                             }
                         });
                     }
@@ -2749,6 +3275,16 @@ impl eframe::App for PdfViewApp {
                                         selection = tab.selection;
                                         drag_start = None;
                                     }
+                                }
+                                ViewerAction::JumpToPage(p) => {
+                                    if let Some(tab) = self.active_pdf_tab_mut() {
+                                        tab.record_nav_jump();
+                                        tab.pending_scroll_to_page = Some(p + 1);
+                                        ctx.request_repaint();
+                                    }
+                                }
+                                ViewerAction::OpenUrl(url) => {
+                                    ctx.open_url(egui::OpenUrl::new_tab(url));
                                 }
                             }
                         }
@@ -3011,11 +3547,122 @@ impl eframe::App for PdfViewApp {
                                                 },
                                             );
                                         });
+                                        ui.add_space(8.0);
+                                        ui.horizontal(|ui| {
+                                            ui.label("Background tab inactivity timeout:");
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    ui.add(
+                                                        egui::Slider::new(
+                                                            &mut self
+                                                                .draft_settings
+                                                                .inactivity_timeout_mins,
+                                                            0..=30,
+                                                        )
+                                                        .custom_formatter(|n, _| {
+                                                            if n <= 0.0 {
+                                                                "Never (disabled)".to_string()
+                                                            } else if (n - 1.0).abs() < 0.1 {
+                                                                "1 min".to_string()
+                                                            } else {
+                                                                format!("{:.0} mins", n)
+                                                            }
+                                                        })
+                                                        .step_by(1.0),
+                                                    );
+                                                },
+                                            );
+                                        });
                                     });
 
                                 ui.add_space(14.0);
 
-                                // Section 4: About Verso Reader
+                                // Section 4: Startup & Session
+                                egui::Frame::NONE
+                                    .fill(egui::Color32::from_rgb(28, 28, 30))
+                                    .stroke(egui::Stroke::new(
+                                        1.0_f32,
+                                        egui::Color32::from_rgb(48, 48, 52),
+                                    ))
+                                    .corner_radius(crate::ui::theme::Theme::RADIUS)
+                                    .inner_margin(egui::Margin::symmetric(20, 16))
+                                    .show(ui, |ui| {
+                                        ui.set_width(card_w);
+                                        ui.label(
+                                            egui::RichText::new("Startup & Session")
+                                                .strong()
+                                                .size(14.0),
+                                        );
+                                        ui.add_space(10.0);
+                                        ui.horizontal(|ui| {
+                                            let label_resp = ui
+                                                .add(
+                                                    egui::Label::new(
+                                                        egui::RichText::new(
+                                                            "Restore open tabs on startup",
+                                                        )
+                                                        .size(13.0),
+                                                    )
+                                                    .sense(egui::Sense::click()),
+                                                )
+                                                .on_hover_cursor(egui::CursorIcon::PointingHand);
+
+                                            let _box_resp = ui
+                                                .with_layout(
+                                                    egui::Layout::right_to_left(egui::Align::Center),
+                                                    |ui| {
+                                                        render_adobe_checkbox(
+                                                            ui,
+                                                            &mut self.draft_settings.restore_session,
+                                                        )
+                                                    },
+                                                )
+                                                .inner;
+
+                                            if label_resp.clicked() {
+                                                self.draft_settings.restore_session =
+                                                    !self.draft_settings.restore_session;
+                                            }
+                                        });
+                                        ui.add_space(10.0);
+                                        ui.horizontal(|ui| {
+                                            let label_resp = ui
+                                                .add(
+                                                    egui::Label::new(
+                                                        egui::RichText::new(
+                                                            "Remember last read page and position per document",
+                                                        )
+                                                        .size(13.0),
+                                                    )
+                                                    .sense(egui::Sense::click()),
+                                                )
+                                                .on_hover_cursor(egui::CursorIcon::PointingHand);
+
+                                            let _box_resp = ui
+                                                .with_layout(
+                                                    egui::Layout::right_to_left(egui::Align::Center),
+                                                    |ui| {
+                                                        render_adobe_checkbox(
+                                                            ui,
+                                                            &mut self
+                                                                .draft_settings
+                                                                .remember_reading_position,
+                                                        )
+                                                    },
+                                                )
+                                                .inner;
+
+                                            if label_resp.clicked() {
+                                                self.draft_settings.remember_reading_position =
+                                                    !self.draft_settings.remember_reading_position;
+                                            }
+                                        });
+                                    });
+
+                                ui.add_space(14.0);
+
+                                // Section 5: About Verso Reader
                                 egui::Frame::NONE
                                     .fill(egui::Color32::from_rgb(28, 28, 30))
                                     .stroke(egui::Stroke::new(
@@ -3035,7 +3682,7 @@ impl eframe::App for PdfViewApp {
                                         ui.horizontal(|ui| {
                                             ui.label(
                                                 egui::RichText::new(
-                                                    "Verso Reader 0.1.0 • Built with Rust and Pdfium",
+                                                    "Verso Reader 2.0.0 ",
                                                 )
                                                 .color(egui::Color32::from_rgb(170, 170, 175))
                                                 .size(12.0),
@@ -3061,11 +3708,18 @@ impl eframe::App for PdfViewApp {
                                         self.settings = self.draft_settings.clone();
                                         let _ = self.settings.save();
                                         self.cache.set_max_bytes(self.settings.cache_size_mb * 1024 * 1024);
+                                        self.save_session_and_history();
                                         self.settings_saved_toast = Some(Instant::now());
                                         ctx.request_repaint();
                                     }
 
-                                    if render_adobe_button(ui, "Cancel", false).clicked() {
+                                    if crate::ui::icons::render_adobe_button_variant(
+                                        ui,
+                                        "Cancel",
+                                        crate::ui::icons::AdobeButtonVariant::Destructive,
+                                    )
+                                    .clicked()
+                                    {
                                         self.draft_settings = self.settings.clone();
                                         if self.tabs.len() > 1 {
                                             let target = if self.active_tab_idx > 0 {
@@ -3082,7 +3736,7 @@ impl eframe::App for PdfViewApp {
                                         if t.elapsed() < Duration::from_secs(3) {
                                             ui.add_space(8.0);
                                             ui.label(
-                                                egui::RichText::new("✓ Preferences saved successfully!")
+                                                egui::RichText::new("Preferences saved successfully!")
                                                     .color(egui::Color32::from_rgb(0, 220, 130))
                                                     .size(13.0),
                                             );
@@ -3115,7 +3769,8 @@ impl eframe::App for PdfViewApp {
                     }
                 }
             }
-        });
+        }
+    });
 
         // Confirmation modal for closing documents with unsaved changes
         if let Some(confirm) = self.pending_close_confirm.clone() {
@@ -3337,6 +3992,7 @@ impl eframe::App for PdfViewApp {
                             });
                         } else {
                             self.pending_close_confirm = None;
+                            self.save_session_and_history();
                             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                         }
                     }
@@ -3368,6 +4024,7 @@ impl eframe::App for PdfViewApp {
                             });
                         } else {
                             self.pending_close_confirm = None;
+                            self.save_session_and_history();
                             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                         }
                     }
@@ -3379,91 +4036,123 @@ impl eframe::App for PdfViewApp {
         if self.show_about_modal {
             let mut close_about = false;
             egui::Modal::new(egui::Id::new("verso_about_modal"))
-                .backdrop_color(egui::Color32::from_black_alpha(160))
+                .backdrop_color(egui::Color32::from_black_alpha(175))
                 .show(ctx, |ui| {
-                    ui.set_width(400.0);
-                    ui.spacing_mut().item_spacing = egui::vec2(10.0, 10.0);
+                    ui.set_width(430.0);
 
-                    ui.vertical(|ui| {
-                        ui.horizontal(|ui| {
-                            let (icon_rect, _) = ui
-                                .allocate_exact_size(egui::vec2(28.0, 28.0), egui::Sense::hover());
-                            crate::ui::icons::paint_verso_logo(ui.painter(), icon_rect);
-                            ui.add_space(8.0);
-                            ui.vertical(|ui| {
-                                ui.label(egui::RichText::new("Verso Reader").strong().size(18.0));
-                                ui.label(
-                                    egui::RichText::new("Version 0.1.0")
-                                        .color(egui::Color32::from_rgb(160, 160, 165))
-                                        .size(11.5),
+                    egui::Frame::NONE
+                        .fill(egui::Color32::from_rgb(26, 26, 28))
+                        .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(50, 50, 56)))
+                        .corner_radius(crate::ui::theme::Theme::RADIUS)
+                        .inner_margin(egui::Margin::symmetric(22, 18))
+                        .show(ui, |ui| {
+                            ui.spacing_mut().item_spacing = egui::vec2(0.0, 10.0);
+
+                            // Header row: Logo, Titles, and close button
+                            ui.horizontal(|ui| {
+                                let (icon_rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(34.0, 34.0),
+                                    egui::Sense::hover(),
                                 );
-                            });
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                let close_btn = crate::ui::icons::render_icon_button(
-                                    ui,
-                                    egui::vec2(24.0, 24.0),
-                                    false,
-                                    true,
-                                    "Close (Esc)",
-                                    crate::ui::icons::paint_close,
-                                );
-                                if close_btn.clicked() {
-                                    close_about = true;
-                                }
-                            });
-                        });
-
-                        ui.separator();
-
-                        ui.label(
-                            egui::RichText::new(
-                                "A minimalistic, very fast, low-RAM desktop PDF reader for Ubuntu, inspired by Microsoft Edge.",
-                            )
-                            .size(13.0)
-                            .color(egui::Color32::from_rgb(220, 220, 225)),
-                        );
-
-                        ui.add_space(4.0);
-                        egui::Frame::group(ui.style())
-                            .fill(egui::Color32::from_rgb(32, 32, 34))
-                            .corner_radius(crate::ui::theme::Theme::RADIUS)
-                            .inner_margin(egui::Margin::symmetric(14, 12))
-                            .show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    ui.label(egui::RichText::new("Developer:").strong().size(12.5));
-                                    ui.label(egui::RichText::new("Mohammed Alim Uddin").size(12.5));
-                                });
-                                ui.add_space(4.0);
-                                ui.horizontal(|ui| {
-                                    ui.label(egui::RichText::new("University:").strong().size(12.5));
+                                crate::ui::icons::paint_verso_logo(ui.painter(), icon_rect);
+                                ui.add_space(10.0);
+                                ui.vertical(|ui| {
+                                    ui.label(
+                                        egui::RichText::new("Verso Reader")
+                                            .strong()
+                                            .size(19.0)
+                                            .color(egui::Color32::WHITE),
+                                    );
                                     ui.label(
                                         egui::RichText::new(
-                                            "Bangladesh University of Engineering and Technology (BUET)",
+                                            "Version 2.0.0 • Fast, Minimalist PDF Reader",
                                         )
-                                        .size(12.5),
+                                        .color(egui::Color32::from_rgb(160, 160, 168))
+                                        .size(12.0),
                                     );
                                 });
-                                ui.add_space(4.0);
-                                ui.horizontal(|ui| {
-                                    ui.label(egui::RichText::new("Engine:").strong().size(12.5));
-                                    ui.label(
-                                        egui::RichText::new("Pdfium (dynamically linked libpdfium.so)")
-                                            .size(12.5),
-                                    );
-                                });
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        let close_btn = crate::ui::icons::render_icon_button(
+                                            ui,
+                                            egui::vec2(26.0, 26.0),
+                                            false,
+                                            true,
+                                            "Close (Esc)",
+                                            crate::ui::icons::paint_close,
+                                        );
+                                        if close_btn.clicked() {
+                                            close_about = true;
+                                        }
+                                    },
+                                );
                             });
 
-                        ui.add_space(6.0);
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui
-                                .button(egui::RichText::new("Close").size(13.0))
-                                .on_hover_cursor(egui::CursorIcon::PointingHand)
-                                .clicked()
-                            {
-                                close_about = true;
-                            }
+                            ui.add_space(2.0);
+                            ui.separator();
+                            ui.add_space(2.0);
+
+                            ui.label(
+                                egui::RichText::new(
+                                    "Verso Reader is a high-performance desktop PDF reader for Ubuntu written in Rust, delivering an Edge-inspired experience with instantaneous rendering and low memory footprint.",
+                                )
+                                .size(12.5)
+                                .color(egui::Color32::from_rgb(210, 210, 215)),
+                            );
+
+                            ui.add_space(6.0);
+
+                            // Structured Info Card
+                            egui::Frame::NONE
+                                .fill(egui::Color32::from_rgb(33, 33, 36))
+                                .stroke(egui::Stroke::new(
+                                    1.0_f32,
+                                    egui::Color32::from_rgb(46, 46, 52),
+                                ))
+                                .corner_radius(crate::ui::theme::Theme::RADIUS)
+                                .inner_margin(egui::Margin::symmetric(14, 12))
+                                .show(ui, |ui| {
+                                    ui.spacing_mut().item_spacing = egui::vec2(0.0, 7.0);
+
+                                    let mut render_info_row = |key: &str, val: &str| {
+                                        ui.horizontal(|ui| {
+                                            ui.label(
+                                                egui::RichText::new(key)
+                                                    .strong()
+                                                    .size(12.5)
+                                                    .color(egui::Color32::from_rgb(150, 150, 155)),
+                                            );
+                                            ui.add_space(8.0);
+                                            ui.label(
+                                                egui::RichText::new(val)
+                                                    .size(12.5)
+                                                    .color(egui::Color32::from_rgb(230, 230, 235)),
+                                            );
+                                        });
+                                    };
+
+                                    render_info_row("Developer:", "Mohammed Alim Uddin");
+                                    render_info_row(
+                                        "Institution:",
+                                        "BUET (Bangladesh University of Engineering and Technology)",
+                                    );
+                                    render_info_row("Framework:", "Rust • egui • eframe (Glow)");
+                                    render_info_row("Engine:", "Google Pdfium (libpdfium.so)");
+                                });
+
+                            ui.add_space(8.0);
+
+                            // Action button footer: modern Adobe-styled Close button
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if render_adobe_button(ui, "Close", true).clicked() {
+                                        close_about = true;
+                                    }
+                                },
+                            );
                         });
-                    });
                 });
 
             if close_about || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
@@ -3474,6 +4163,7 @@ impl eframe::App for PdfViewApp {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         let _ = self.settings.save();
+        self.save_session_and_history();
     }
 }
 
@@ -3534,12 +4224,19 @@ mod tests {
             last_window_title: "Verso Reader".to_string(),
             draft_settings: Settings::default(),
             settings: Settings::default(),
+            reading_history: crate::settings::ReadingHistory::default(),
+            last_session_save: None,
+            session_restored: true,
             settings_saved_toast: None,
             metrics: SystemMetrics::default(),
             show_about_modal: false,
             fullscreen_quickbar_open: false,
             fullscreen_page_input: "1".to_string(),
             fullscreen_is_editing_page: false,
+            #[cfg(unix)]
+            _ipc_server: None,
+            #[cfg(unix)]
+            rx_ipc: None,
         };
 
         let mut tab = PdfTab {
@@ -3584,6 +4281,10 @@ mod tests {
             selected_text_box_id: None,
             dragging_text_box: None,
             resizing_text_box: None,
+            nav_history: Vec::new(),
+            nav_future: Vec::new(),
+            last_accessed: Instant::now(),
+            is_dormant: false,
         };
 
         app.tabs.push(Tab::Pdf(tab.clone()));
@@ -3651,12 +4352,19 @@ mod tests {
             last_window_title: "Verso Reader".to_string(),
             draft_settings: Settings::default(),
             settings: Settings::default(),
+            reading_history: crate::settings::ReadingHistory::default(),
+            last_session_save: None,
+            session_restored: true,
             settings_saved_toast: None,
             metrics: SystemMetrics::default(),
             show_about_modal: false,
             fullscreen_quickbar_open: false,
             fullscreen_page_input: "1".to_string(),
             fullscreen_is_editing_page: false,
+            #[cfg(unix)]
+            _ipc_server: None,
+            #[cfg(unix)]
+            rx_ipc: None,
         };
 
         let path1 = PathBuf::from("fixtures/MLE.pdf");
@@ -3690,5 +4398,749 @@ mod tests {
         app.switch_to_tab(0);
         assert_eq!(app.active_tab_idx, 0);
         assert_eq!(app.path_bar.text, path1.display().to_string());
+    }
+
+    #[test]
+    fn test_navigation_history_back_forward_stack() {
+        let mut tab = PdfTab {
+            doc_id: 1,
+            path: PathBuf::from("/test.pdf"),
+            title: "test.pdf".to_string(),
+            page_count: 50,
+            page_sizes: vec![PageSize {
+                width: 595.0,
+                height: 842.0,
+            }],
+            current_page: 1,
+            zoom: 1.0,
+            rotation: 0,
+            scroll_offset_y: 0.0,
+            pending_scroll_to_page: None,
+            pending_scroll_delta_y: None,
+            pending_set_scroll_offset_y: None,
+            last_viewport_height: 600.0,
+            last_viewport_top: 0.0,
+            last_scroll_offset_y: 0.0,
+            is_loading: false,
+            loading_message: String::new(),
+            outline: None,
+            outline_loading: false,
+            sidebar_open: false,
+            sidebar_width: 280.0,
+            find_state: FindState::default(),
+            selection: None,
+            drag_start: None,
+            context_menu: None,
+            pending_text_requests: HashSet::new(),
+            active_tool: ActiveTool::None,
+            annotations: DocumentAnnotations::default(),
+            file_key: String::new(),
+            annotations_dirty: false,
+            last_annotation_change: None,
+            undo_stack: UndoStack::default(),
+            has_unsaved_changes: false,
+            freehand_stroke: None,
+            editing_text_box: None,
+            selected_text_box_id: None,
+            dragging_text_box: None,
+            resizing_text_box: None,
+            nav_history: Vec::new(),
+            nav_future: Vec::new(),
+            last_accessed: Instant::now(),
+            is_dormant: false,
+        };
+
+        // Initially no history
+        assert!(!tab.can_go_back());
+        assert!(!tab.can_go_forward());
+
+        // Jump 1: From Page 1 (offset 0.0) to Page 15 (offset 1500.0)
+        tab.record_nav_jump();
+        tab.current_page = 15;
+        tab.scroll_offset_y = 1500.0;
+        assert!(tab.can_go_back());
+        assert!(!tab.can_go_forward());
+        assert_eq!(tab.nav_history.len(), 1);
+        assert_eq!(tab.nav_history[0], (1, 0.0));
+
+        // Jump 2: From Page 15 (offset 1500.0) to Page 30 (offset 3000.0)
+        tab.record_nav_jump();
+        assert_eq!(tab.nav_history.len(), 2);
+        assert_eq!(tab.nav_history[1], (15, 1500.0));
+
+        // Deduplication: Calling record_nav_jump again from the same location must not duplicate entry
+        tab.scroll_offset_y = 1510.0;
+        tab.record_nav_jump();
+        assert_eq!(
+            tab.nav_history.len(),
+            2,
+            "Must deduplicate near identical jumps"
+        );
+
+        tab.current_page = 30;
+        tab.scroll_offset_y = 3000.0;
+
+        // Navigate Back -> Should jump to Page 15, offset 1500.0
+        tab.go_back();
+        assert_eq!(tab.pending_set_scroll_offset_y, Some(1500.0));
+        assert!(tab.pending_scroll_to_page.is_none());
+        assert!(tab.can_go_back());
+        assert!(tab.can_go_forward());
+        assert_eq!(tab.nav_future.len(), 1);
+        assert_eq!(tab.nav_future[0], (30, 3000.0));
+
+        // Simulate viewer reaching Page 15
+        tab.current_page = 15;
+        tab.scroll_offset_y = 1500.0;
+
+        // Navigate Back again -> Should jump to Page 1, offset 0.0
+        tab.go_back();
+        assert_eq!(tab.pending_scroll_to_page, Some(1));
+        assert!(!tab.can_go_back());
+        assert!(tab.can_go_forward());
+        assert_eq!(tab.nav_future.len(), 2);
+
+        // Simulate viewer reaching Page 1
+        tab.current_page = 1;
+        tab.scroll_offset_y = 0.0;
+
+        // Navigate Forward -> Should return to Page 15, offset 1500.0
+        tab.go_forward();
+        assert_eq!(tab.pending_set_scroll_offset_y, Some(1500.0));
+        assert!(tab.can_go_back());
+        assert!(tab.can_go_forward());
+
+        // Simulate viewer reaching Page 15
+        tab.current_page = 15;
+        tab.scroll_offset_y = 1500.0;
+
+        // Branching: If we now perform a new jump to Page 42, nav_future must be cleared
+        tab.record_nav_jump();
+        tab.current_page = 42;
+        tab.scroll_offset_y = 4200.0;
+        assert!(tab.can_go_back());
+        assert!(
+            !tab.can_go_forward(),
+            "New jump must clear forward navigation stack"
+        );
+    }
+
+    #[test]
+    fn test_reading_history_tracking_and_pruning() {
+        let (tx_cmd, _) = crossbeam_channel::unbounded();
+        let (_, rx_evt) = crossbeam_channel::unbounded();
+        let mut app = PdfViewApp {
+            tx_cmd,
+            rx_evt,
+            pdfium_status: PdfiumStatus::Ready,
+            tabs: Vec::new(),
+            active_tab_idx: 0,
+            next_doc_id: 1,
+            pending_close_confirm: None,
+            path_bar: PathBar::new(),
+            toolbar: Toolbar::new(),
+            is_fullscreen: false,
+            pending_open_path: None,
+            rx_file_chooser: None,
+            cache: TextureCache::default(),
+            text_cache: PageTextCache::default(),
+            pending_render_requests: HashSet::new(),
+            render_generation: 0,
+            debug_visible: false,
+            last_frame_time: Instant::now(),
+            frame_time_ms: 16.0,
+            #[cfg(target_os = "linux")]
+            rx_pinch_gesture: None,
+            #[cfg(target_os = "linux")]
+            wayland_gesture_init_attempted: false,
+            pinch_active: false,
+            pinch_last_active: None,
+            last_scroll_unit: None,
+            last_window_title: "Verso Reader".to_string(),
+            draft_settings: Settings::default(),
+            settings: Settings::default(),
+            reading_history: crate::settings::ReadingHistory::default(),
+            last_session_save: None,
+            session_restored: true,
+            settings_saved_toast: None,
+            metrics: SystemMetrics::default(),
+            show_about_modal: false,
+            fullscreen_quickbar_open: false,
+            fullscreen_page_input: "1".to_string(),
+            fullscreen_is_editing_page: false,
+            #[cfg(unix)]
+            _ipc_server: None,
+            #[cfg(unix)]
+            rx_ipc: None,
+        };
+
+        let dummy_tab = PdfTab {
+            doc_id: 1,
+            path: PathBuf::from("/tmp/doc1.pdf"),
+            title: "doc1.pdf".to_string(),
+            page_count: 10,
+            page_sizes: Vec::new(),
+            current_page: 7,
+            zoom: 1.5,
+            rotation: 90,
+            scroll_offset_y: 1234.0,
+            pending_scroll_to_page: None,
+            pending_scroll_delta_y: None,
+            pending_set_scroll_offset_y: None,
+            last_viewport_height: 600.0,
+            last_viewport_top: 0.0,
+            last_scroll_offset_y: 1234.0,
+            is_loading: false,
+            loading_message: String::new(),
+            outline: None,
+            outline_loading: false,
+            sidebar_open: false,
+            sidebar_width: 280.0,
+            find_state: FindState::default(),
+            selection: None,
+            drag_start: None,
+            context_menu: None,
+            pending_text_requests: HashSet::new(),
+            active_tool: ActiveTool::None,
+            annotations: DocumentAnnotations::default(),
+            file_key: String::new(),
+            annotations_dirty: false,
+            last_annotation_change: None,
+            undo_stack: UndoStack::default(),
+            has_unsaved_changes: false,
+            freehand_stroke: None,
+            editing_text_box: None,
+            selected_text_box_id: None,
+            dragging_text_box: None,
+            resizing_text_box: None,
+            nav_history: Vec::new(),
+            nav_future: Vec::new(),
+            last_accessed: Instant::now(),
+            is_dormant: false,
+        };
+
+        app.tabs.push(Tab::Pdf(dummy_tab));
+        app.update_reading_history_for_tab(0);
+
+        let key = Settings::canonical_path_key(&PathBuf::from("/tmp/doc1.pdf"));
+        let pos = app
+            .reading_history
+            .entries
+            .get(&key)
+            .expect("entry must exist");
+        assert_eq!(pos.current_page, 7);
+        assert_eq!(pos.scroll_offset_y, 1234.0);
+        assert_eq!(pos.zoom, 1.5);
+        assert_eq!(pos.rotation, 90);
+    }
+
+    #[test]
+    fn test_open_pdf_tab_replaces_active_empty_tab() {
+        let (tx_cmd, _) = crossbeam_channel::unbounded();
+        let (_, rx_evt) = crossbeam_channel::unbounded();
+        let mut app = PdfViewApp {
+            tx_cmd,
+            rx_evt,
+            pdfium_status: PdfiumStatus::Ready,
+            tabs: Vec::new(),
+            active_tab_idx: 0,
+            next_doc_id: 1,
+            pending_close_confirm: None,
+            path_bar: PathBar::new(),
+            toolbar: Toolbar::new(),
+            is_fullscreen: false,
+            pending_open_path: None,
+            rx_file_chooser: None,
+            cache: TextureCache::default(),
+            text_cache: PageTextCache::default(),
+            pending_render_requests: HashSet::new(),
+            render_generation: 0,
+            debug_visible: false,
+            last_frame_time: Instant::now(),
+            frame_time_ms: 16.0,
+            metrics: SystemMetrics::default(),
+            #[cfg(target_os = "linux")]
+            rx_pinch_gesture: None,
+            #[cfg(target_os = "linux")]
+            wayland_gesture_init_attempted: false,
+            pinch_active: false,
+            pinch_last_active: None,
+            last_scroll_unit: None,
+            last_window_title: "Verso Reader".to_string(),
+            draft_settings: Settings::default(),
+            settings: Settings::default(),
+            reading_history: crate::settings::ReadingHistory::default(),
+            last_session_save: None,
+            session_restored: true,
+            settings_saved_toast: None,
+            show_about_modal: false,
+            fullscreen_quickbar_open: false,
+            fullscreen_page_input: "1".to_string(),
+            fullscreen_is_editing_page: false,
+            #[cfg(unix)]
+            _ipc_server: None,
+            #[cfg(unix)]
+            rx_ipc: None,
+        };
+
+        // App starts with an empty tab
+        app.create_empty_tab();
+        assert_eq!(app.tabs.len(), 1);
+        if let Tab::Pdf(ref t) = app.tabs[0] {
+            assert!(t.path.as_os_str().is_empty());
+        }
+
+        // Opening a document replaces the active empty tab
+        let path1 = PathBuf::from("fixtures/MLE.pdf");
+        app.open_pdf_tab(path1.clone());
+        assert_eq!(app.tabs.len(), 1, "Must replace active empty tab slot");
+        if let Tab::Pdf(ref t) = app.tabs[0] {
+            assert_eq!(t.path, path1);
+        }
+
+        // Opening a new tab creates a second tab
+        app.create_empty_tab();
+        assert_eq!(app.tabs.len(), 2);
+        assert_eq!(app.active_tab_idx, 1);
+
+        // Opening document in the active empty tab replaces tab 1
+        let path2 =
+            PathBuf::from("fixtures/Modern Operating Systems 4th Edition--Andrew Tanenbaum.pdf");
+        app.open_pdf_tab(path2.clone());
+        assert_eq!(
+            app.tabs.len(),
+            2,
+            "Must replace newly active empty tab slot"
+        );
+        if let Tab::Pdf(ref t) = app.tabs[1] {
+            assert_eq!(t.path, path2);
+        }
+    }
+
+    #[test]
+    fn test_session_save_guarded_by_session_restored() {
+        let (tx_cmd, _) = crossbeam_channel::unbounded();
+        let (_, rx_evt) = crossbeam_channel::unbounded();
+        let mut app = PdfViewApp {
+            tx_cmd,
+            rx_evt,
+            pdfium_status: PdfiumStatus::Ready,
+            tabs: Vec::new(),
+            active_tab_idx: 0,
+            next_doc_id: 1,
+            pending_close_confirm: None,
+            path_bar: PathBar::new(),
+            toolbar: Toolbar::new(),
+            is_fullscreen: false,
+            pending_open_path: None,
+            rx_file_chooser: None,
+            cache: TextureCache::default(),
+            text_cache: PageTextCache::default(),
+            pending_render_requests: HashSet::new(),
+            render_generation: 0,
+            debug_visible: false,
+            last_frame_time: Instant::now(),
+            frame_time_ms: 16.0,
+            metrics: SystemMetrics::default(),
+            #[cfg(target_os = "linux")]
+            rx_pinch_gesture: None,
+            #[cfg(target_os = "linux")]
+            wayland_gesture_init_attempted: false,
+            pinch_active: false,
+            pinch_last_active: None,
+            last_scroll_unit: None,
+            last_window_title: "Verso Reader".to_string(),
+            draft_settings: Settings::default(),
+            settings: Settings::default(),
+            reading_history: crate::settings::ReadingHistory::default(),
+            last_session_save: None,
+            session_restored: false, // Session restoration in progress
+            settings_saved_toast: None,
+            show_about_modal: false,
+            fullscreen_quickbar_open: false,
+            fullscreen_page_input: "1".to_string(),
+            fullscreen_is_editing_page: false,
+            #[cfg(unix)]
+            _ipc_server: None,
+            #[cfg(unix)]
+            rx_ipc: None,
+        };
+
+        app.create_empty_tab();
+        // With session_restored = false, save_session_and_history must safely early-exit
+        app.save_session_and_history();
+        assert!(!app.session_restored);
+    }
+
+    #[test]
+    fn test_dormant_tab_transition_and_wakeup() {
+        let (tx_cmd, rx_cmd) = crossbeam_channel::unbounded();
+        let (_, rx_evt) = crossbeam_channel::unbounded();
+        let mut app = PdfViewApp {
+            tx_cmd,
+            rx_evt,
+            pdfium_status: PdfiumStatus::Ready,
+            tabs: Vec::new(),
+            active_tab_idx: 0,
+            next_doc_id: 1,
+            pending_close_confirm: None,
+            path_bar: PathBar::new(),
+            toolbar: Toolbar::new(),
+            is_fullscreen: false,
+            pending_open_path: None,
+            rx_file_chooser: None,
+            cache: TextureCache::default(),
+            text_cache: PageTextCache::default(),
+            pending_render_requests: HashSet::new(),
+            render_generation: 0,
+            debug_visible: false,
+            last_frame_time: Instant::now(),
+            frame_time_ms: 16.0,
+            metrics: SystemMetrics::default(),
+            #[cfg(target_os = "linux")]
+            rx_pinch_gesture: None,
+            #[cfg(target_os = "linux")]
+            wayland_gesture_init_attempted: false,
+            pinch_active: false,
+            pinch_last_active: None,
+            last_scroll_unit: None,
+            last_window_title: "Verso Reader".to_string(),
+            draft_settings: Settings::default(),
+            settings: Settings::default(),
+            reading_history: crate::settings::ReadingHistory::default(),
+            last_session_save: None,
+            session_restored: true,
+            settings_saved_toast: None,
+            show_about_modal: false,
+            fullscreen_quickbar_open: false,
+            fullscreen_page_input: "1".to_string(),
+            fullscreen_is_editing_page: false,
+            #[cfg(unix)]
+            _ipc_server: None,
+            #[cfg(unix)]
+            rx_ipc: None,
+        };
+
+        let tab0 = PdfTab {
+            doc_id: 10,
+            path: PathBuf::from("/tmp/doc0.pdf"),
+            title: "doc0.pdf".to_string(),
+            page_count: 10,
+            page_sizes: vec![PageSize {
+                width: 500.0,
+                height: 700.0,
+            }],
+            current_page: 1,
+            zoom: 1.0,
+            rotation: 0,
+            scroll_offset_y: 0.0,
+            pending_scroll_to_page: None,
+            pending_scroll_delta_y: None,
+            pending_set_scroll_offset_y: None,
+            last_viewport_height: 600.0,
+            last_viewport_top: 0.0,
+            last_scroll_offset_y: 0.0,
+            is_loading: false,
+            loading_message: String::new(),
+            outline: None,
+            outline_loading: false,
+            sidebar_open: false,
+            sidebar_width: 280.0,
+            find_state: FindState::default(),
+            selection: None,
+            drag_start: None,
+            context_menu: None,
+            pending_text_requests: HashSet::new(),
+            active_tool: ActiveTool::None,
+            annotations: DocumentAnnotations::default(),
+            file_key: String::new(),
+            annotations_dirty: false,
+            last_annotation_change: None,
+            undo_stack: UndoStack::default(),
+            has_unsaved_changes: false,
+            freehand_stroke: None,
+            editing_text_box: None,
+            selected_text_box_id: None,
+            dragging_text_box: None,
+            resizing_text_box: None,
+            nav_history: Vec::new(),
+            nav_future: Vec::new(),
+            last_accessed: Instant::now(),
+            is_dormant: false,
+        };
+
+        let mut tab1 = tab0.clone();
+        tab1.doc_id = 20;
+        tab1.path = PathBuf::from("/tmp/doc1.pdf");
+        tab1.title = "doc1.pdf".to_string();
+        tab1.current_page = 5;
+        tab1.scroll_offset_y = 1200.0;
+        tab1.last_accessed = Instant::now() - std::time::Duration::from_secs(600);
+
+        app.tabs.push(Tab::Pdf(tab0));
+        app.tabs.push(Tab::Pdf(tab1));
+        app.active_tab_idx = 0;
+
+        app.check_dormant_tabs();
+
+        if let Tab::Pdf(ref t1) = app.tabs[1] {
+            assert!(
+                t1.is_dormant,
+                "Tab 1 must become dormant after 10m inactivity"
+            );
+        } else {
+            panic!("Expected Tab::Pdf");
+        }
+
+        let mut unloaded = false;
+        while let Ok(cmd) = rx_cmd.try_recv() {
+            if let Command::UnloadDoc { doc_id } = cmd {
+                if doc_id == 20 {
+                    unloaded = true;
+                }
+            }
+        }
+        assert!(unloaded, "Worker must receive Command::UnloadDoc for tab 1");
+
+        app.switch_to_tab(1);
+        assert_eq!(app.active_tab_idx, 1);
+
+        if let Tab::Pdf(ref t1) = app.tabs[1] {
+            assert!(!t1.is_dormant, "Tab 1 must be awakened on switch");
+            assert_eq!(t1.current_page, 5, "Reading page must be preserved");
+            assert_eq!(
+                t1.scroll_offset_y, 1200.0,
+                "Scroll offset must be preserved"
+            );
+        } else {
+            panic!("Expected Tab::Pdf");
+        }
+
+        let mut reopened = false;
+        while let Ok(cmd) = rx_cmd.try_recv() {
+            if let Command::Open { doc_id, path } = cmd {
+                if doc_id == 20 && path == std::path::Path::new("/tmp/doc1.pdf") {
+                    reopened = true;
+                }
+            }
+        }
+        assert!(
+            reopened,
+            "Worker must receive Command::Open on dormant tab wakeup"
+        );
+    }
+
+    #[test]
+    fn test_pathbar_collapse_and_uncollapse_on_tab_states() {
+        let (tx_cmd, _rx_cmd) = crossbeam_channel::unbounded();
+        let (_, rx_evt) = crossbeam_channel::unbounded();
+        let mut app = PdfViewApp {
+            tx_cmd,
+            rx_evt,
+            pdfium_status: PdfiumStatus::Ready,
+            tabs: Vec::new(),
+            active_tab_idx: 0,
+            next_doc_id: 1,
+            pending_close_confirm: None,
+            path_bar: PathBar::new(),
+            toolbar: Toolbar::new(),
+            is_fullscreen: false,
+            pending_open_path: None,
+            rx_file_chooser: None,
+            cache: TextureCache::default(),
+            text_cache: PageTextCache::default(),
+            pending_render_requests: HashSet::new(),
+            render_generation: 0,
+            debug_visible: false,
+            last_frame_time: Instant::now(),
+            frame_time_ms: 16.0,
+            metrics: SystemMetrics::default(),
+            #[cfg(target_os = "linux")]
+            rx_pinch_gesture: None,
+            #[cfg(target_os = "linux")]
+            wayland_gesture_init_attempted: false,
+            pinch_active: false,
+            pinch_last_active: None,
+            last_scroll_unit: None,
+            last_window_title: "Verso Reader".to_string(),
+            draft_settings: Settings::default(),
+            settings: Settings::default(),
+            reading_history: crate::settings::ReadingHistory::default(),
+            last_session_save: None,
+            session_restored: true,
+            settings_saved_toast: None,
+            show_about_modal: false,
+            fullscreen_quickbar_open: false,
+            fullscreen_page_input: "1".to_string(),
+            fullscreen_is_editing_page: false,
+            #[cfg(unix)]
+            _ipc_server: None,
+            #[cfg(unix)]
+            rx_ipc: None,
+        };
+
+        // Open a PDF document: pathbar must collapse
+        let path1 = PathBuf::from("fixtures/MLE.pdf");
+        app.open_pdf_tab(path1);
+        assert_eq!(app.tabs.len(), 1);
+        assert!(
+            app.path_bar.is_collapsed,
+            "Path bar must collapse when PDF is opened"
+        );
+
+        // Create empty tab: pathbar must uncollapse
+        app.create_empty_tab();
+        assert_eq!(app.tabs.len(), 2);
+        assert!(
+            !app.path_bar.is_collapsed,
+            "Path bar must be uncollapsed on empty tab"
+        );
+
+        // Switch back to PDF tab: pathbar must collapse
+        app.switch_to_tab(0);
+        assert!(
+            app.path_bar.is_collapsed,
+            "Path bar must re-collapse when switching to PDF tab"
+        );
+
+        // Switch to empty tab: pathbar must uncollapse
+        app.switch_to_tab(1);
+        assert!(
+            !app.path_bar.is_collapsed,
+            "Path bar must uncollapse when switching to empty tab"
+        );
+    }
+
+    #[test]
+    fn test_configurable_inactivity_timeout() {
+        let (tx_cmd, _rx_cmd) = crossbeam_channel::unbounded();
+        let (_, rx_evt) = crossbeam_channel::unbounded();
+        let mut app = PdfViewApp {
+            tx_cmd,
+            rx_evt,
+            pdfium_status: PdfiumStatus::Ready,
+            tabs: Vec::new(),
+            active_tab_idx: 0,
+            next_doc_id: 1,
+            pending_close_confirm: None,
+            path_bar: PathBar::new(),
+            toolbar: Toolbar::new(),
+            is_fullscreen: false,
+            pending_open_path: None,
+            rx_file_chooser: None,
+            cache: TextureCache::default(),
+            text_cache: PageTextCache::default(),
+            pending_render_requests: HashSet::new(),
+            render_generation: 0,
+            debug_visible: false,
+            last_frame_time: Instant::now(),
+            frame_time_ms: 16.0,
+            metrics: SystemMetrics::default(),
+            #[cfg(target_os = "linux")]
+            rx_pinch_gesture: None,
+            #[cfg(target_os = "linux")]
+            wayland_gesture_init_attempted: false,
+            pinch_active: false,
+            pinch_last_active: None,
+            last_scroll_unit: None,
+            last_window_title: "Verso Reader".to_string(),
+            draft_settings: Settings::default(),
+            settings: Settings::default(),
+            reading_history: crate::settings::ReadingHistory::default(),
+            last_session_save: None,
+            session_restored: true,
+            settings_saved_toast: None,
+            show_about_modal: false,
+            fullscreen_quickbar_open: false,
+            fullscreen_page_input: "1".to_string(),
+            fullscreen_is_editing_page: false,
+            #[cfg(unix)]
+            _ipc_server: None,
+            #[cfg(unix)]
+            rx_ipc: None,
+        };
+
+        let tab0 = PdfTab {
+            doc_id: 10,
+            path: PathBuf::from("/tmp/doc0.pdf"),
+            title: "doc0.pdf".to_string(),
+            page_count: 10,
+            page_sizes: vec![PageSize {
+                width: 500.0,
+                height: 700.0,
+            }],
+            current_page: 1,
+            zoom: 1.0,
+            rotation: 0,
+            scroll_offset_y: 0.0,
+            pending_scroll_to_page: None,
+            pending_scroll_delta_y: None,
+            pending_set_scroll_offset_y: None,
+            last_viewport_height: 600.0,
+            last_viewport_top: 0.0,
+            last_scroll_offset_y: 0.0,
+            is_loading: false,
+            loading_message: String::new(),
+            outline: None,
+            outline_loading: false,
+            sidebar_open: false,
+            sidebar_width: 280.0,
+            find_state: FindState::default(),
+            selection: None,
+            drag_start: None,
+            context_menu: None,
+            pending_text_requests: HashSet::new(),
+            active_tool: ActiveTool::None,
+            annotations: DocumentAnnotations::default(),
+            file_key: String::new(),
+            annotations_dirty: false,
+            last_annotation_change: None,
+            undo_stack: UndoStack::default(),
+            has_unsaved_changes: false,
+            freehand_stroke: None,
+            editing_text_box: None,
+            selected_text_box_id: None,
+            dragging_text_box: None,
+            resizing_text_box: None,
+            nav_history: Vec::new(),
+            nav_future: Vec::new(),
+            last_accessed: Instant::now(),
+            is_dormant: false,
+        };
+
+        let mut tab1 = tab0.clone();
+        tab1.doc_id = 20;
+        tab1.path = PathBuf::from("/tmp/doc1.pdf");
+        tab1.last_accessed = Instant::now() - std::time::Duration::from_secs(120); // 2 mins inactive
+
+        app.tabs.push(Tab::Pdf(tab0));
+        app.tabs.push(Tab::Pdf(tab1));
+        app.active_tab_idx = 0;
+
+        // With timeout = 0 (disabled), tab 1 must not become dormant
+        app.settings.inactivity_timeout_mins = 0;
+        app.check_dormant_tabs();
+        if let Tab::Pdf(ref t1) = app.tabs[1] {
+            assert!(
+                !t1.is_dormant,
+                "Tab must not become dormant when timeout is disabled (0)"
+            );
+        }
+
+        // With timeout = 1 (1 min), tab 1 (2 mins inactive) must become dormant
+        app.settings.inactivity_timeout_mins = 1;
+        app.check_dormant_tabs();
+        if let Tab::Pdf(ref t1) = app.tabs[1] {
+            assert!(
+                t1.is_dormant,
+                "Tab must become dormant when inactive > timeout"
+            );
+        }
+    }
+
+    #[test]
+    fn test_bengali_font_fallback_registered() {
+        let ctx = egui::Context::default();
+        crate::setup_custom_fonts(&ctx);
     }
 }

@@ -1,0 +1,14 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Verso Reader
+GenericName=PDF Reader
+Comment=Modern, lightweight, high-performance desktop PDF reader
+Exec=verso-reader %U
+Icon=verso-reader
+Terminal=false
+Categories=Office;Viewer;Graphics;
+MimeType=application/pdf;application/x-pdf;
+Keywords=PDF;Viewer;Reader;Documents;Verso;
+StartupWMClass=verso-reader
+

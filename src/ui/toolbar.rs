@@ -1,8 +1,9 @@
 use crate::annotations::{AnnotationColor, PRESET_HIGHLIGHT_COLORS};
 use crate::ui::icons::{
     paint_chevron_down, paint_eraser, paint_fit_page, paint_fit_width, paint_fullscreen,
-    paint_gear, paint_highlighter, paint_redo, paint_rotate, paint_save, paint_search,
-    paint_sidebar, paint_text_tool, paint_undo, paint_zoom_in, paint_zoom_out, render_icon_button,
+    paint_gear, paint_highlighter, paint_nav_back, paint_nav_forward, paint_redo, paint_rotate,
+    paint_save, paint_search, paint_sidebar, paint_text_tool, paint_undo, paint_zoom_in,
+    paint_zoom_out, render_icon_button,
 };
 use crate::ui::theme::Theme;
 use egui::{
@@ -25,6 +26,8 @@ pub enum ToolbarAction {
     ToggleOutlineSidebar,
     ToggleFind,
     JumpToPage(usize),
+    GoBack,
+    GoForward,
     ZoomIn,
     ZoomOut,
     FitWidth,
@@ -63,6 +66,8 @@ pub struct ToolbarProps {
     pub has_unsaved_changes: bool,
     pub can_undo: bool,
     pub can_redo: bool,
+    pub can_go_back: bool,
+    pub can_go_forward: bool,
 }
 
 /// Main top toolbar component containing page navigation, zoom, rotation, annotation tools, and fullscreen controls.
@@ -262,12 +267,15 @@ impl Toolbar {
                 .width(55.0)
                 .selected_text(format!("{:.0} pt", props.text_font_size))
                 .show_ui(&mut left_ui, |ui| {
+                    ui.visuals_mut().selection.bg_fill =
+                        Color32::from_rgba_unmultiplied(255, 255, 255, 35);
+                    ui.visuals_mut().selection.stroke = Stroke::NONE;
+
                     for &size in &[10.0, 12.0, 14.0, 16.0, 18.0, 20.0, 24.0, 28.0, 32.0, 36.0] {
                         let is_sel = (props.text_font_size - size).abs() < 0.1;
-                        if ui
-                            .selectable_label(is_sel, format!("{:.0} pt", size))
-                            .clicked()
-                        {
+                        let text =
+                            egui::RichText::new(format!("{:.0} pt", size)).color(Color32::WHITE);
+                        if ui.selectable_label(is_sel, text).clicked() {
                             action = Some(ToolbarAction::SetTextFontSize(size));
                         }
                     }
@@ -511,6 +519,32 @@ impl Toolbar {
         center_ui.separator();
         center_ui.add_space(2.0);
 
+        let back_btn = render_icon_button(
+            &mut center_ui,
+            vec2(28.0, 28.0),
+            false,
+            props.can_go_back,
+            "Go back (Alt+Left)",
+            paint_nav_back,
+        );
+        if back_btn.clicked() {
+            action = Some(ToolbarAction::GoBack);
+        }
+
+        let fwd_btn = render_icon_button(
+            &mut center_ui,
+            vec2(28.0, 28.0),
+            false,
+            props.can_go_forward,
+            "Go forward (Alt+Right)",
+            paint_nav_forward,
+        );
+        if fwd_btn.clicked() {
+            action = Some(ToolbarAction::GoForward);
+        }
+
+        center_ui.add_space(2.0);
+
         // Centered Page Navigation [ N ] of M
         center_ui.label(
             RichText::new("Page")
@@ -526,6 +560,16 @@ impl Toolbar {
 
         if response.gained_focus() {
             self.is_editing_page = true;
+            let mut state = egui::text_edit::TextEditState::load(center_ui.ctx(), response.id)
+                .unwrap_or_default();
+            let len = self.page_input_text.chars().count();
+            state
+                .cursor
+                .set_char_range(Some(egui::text_selection::CCursorRange::two(
+                    egui::text::CCursor::new(0),
+                    egui::text::CCursor::new(len),
+                )));
+            state.store(center_ui.ctx(), response.id);
         }
 
         let enter_pressed = (response.has_focus() || response.lost_focus())
@@ -594,6 +638,9 @@ mod tests {
         assert_eq!(ToolbarAction::Undo, ToolbarAction::Undo);
         assert_eq!(ToolbarAction::Redo, ToolbarAction::Redo);
         assert_ne!(ToolbarAction::Undo, ToolbarAction::Redo);
+        assert_eq!(ToolbarAction::GoBack, ToolbarAction::GoBack);
+        assert_eq!(ToolbarAction::GoForward, ToolbarAction::GoForward);
+        assert_ne!(ToolbarAction::GoBack, ToolbarAction::GoForward);
         assert_eq!(ToolbarAction::OpenSettings, ToolbarAction::OpenSettings);
     }
 }

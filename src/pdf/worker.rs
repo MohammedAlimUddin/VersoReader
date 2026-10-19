@@ -8,8 +8,8 @@ use pdfium_render::prelude::*;
 
 use crate::annotations::{AnnotationColor, Highlight, TextBox};
 use crate::pdf::types::{
-    CanonicalRect, CharBox, Command, DocId, Event, LineBox, OutlineItem, PageSize, PageTextData,
-    RenderResult, SearchMatch,
+    CanonicalRect, CharBox, Command, DocId, Event, LineBox, LinkTarget, OutlineItem, PageLink,
+    PageSize, PageTextData, RenderResult, SearchMatch,
 };
 
 static PDFIUM_INSTANCE: OnceLock<Result<&'static Pdfium, String>> = OnceLock::new();
@@ -192,6 +192,7 @@ fn worker_main(ctx: egui::Context, rx_cmd: Receiver<Command>, tx_evt: Sender<Eve
                 Command::Shutdown
                     | Command::Open { .. }
                     | Command::Close { .. }
+                    | Command::UnloadDoc { .. }
                     | Command::SyncAnnotations { .. }
                     | Command::SaveDoc { .. }
             )
@@ -306,7 +307,25 @@ fn worker_main(ctx: egui::Context, rx_cmd: Receiver<Command>, tx_evt: Sender<Eve
                         let page_count = doc.pages().len() as usize;
                         if render_cmd.page < page_count {
                             match doc.pages().get(render_cmd.page as i32) {
-                                Ok(page) => {
+                                Ok(mut page) => {
+                                    // Strip external FreeText, Text notes, or Popup annotations so PDFium
+                                    // never rasterizes solid background blocks or opaque rectangles into the page bitmap.
+                                    let annots = page.annotations_mut();
+                                    let mut i = annots.len();
+                                    while i > 0 {
+                                        i -= 1;
+                                        if let Ok(annot) = annots.get(i) {
+                                            if matches!(
+                                                annot.annotation_type(),
+                                                PdfPageAnnotationType::FreeText
+                                                    | PdfPageAnnotationType::Text
+                                                    | PdfPageAnnotationType::Popup
+                                            ) {
+                                                let _ = annots.delete_annotation(annot);
+                                            }
+                                        }
+                                    }
+
                                     let target_w = render_cmd.width_px.clamp(32, 6144) as i32;
                                     let rotation_setting = match render_cmd.rotation % 360 {
                                         90 => PdfPageRenderRotation::Degrees90,
@@ -413,6 +432,23 @@ fn worker_main(ctx: egui::Context, rx_cmd: Receiver<Command>, tx_evt: Sender<Eve
                             active_annotation_scan = None;
                         }
                     }
+                    doc_annotated_pages.remove(&doc_id);
+                    doc_freehand_highlights.remove(&doc_id);
+                    documents.remove(&doc_id);
+                    latest_generations.remove(&doc_id);
+                }
+                Command::UnloadDoc { doc_id } => {
+                    if let Some(ref s) = active_search {
+                        if s.doc_id == doc_id {
+                            active_search = None;
+                        }
+                    }
+                    if let Some(ref s) = active_annotation_scan {
+                        if s.doc_id == doc_id {
+                            active_annotation_scan = None;
+                        }
+                    }
+                    // Free Pdfium document handle and associated caches from worker memory
                     doc_annotated_pages.remove(&doc_id);
                     doc_freehand_highlights.remove(&doc_id);
                     documents.remove(&doc_id);
@@ -1216,9 +1252,10 @@ pub fn extract_annotations_from_page(
     let cb = crop_box.bottom().value;
     let ct = crop_box.top().value;
     let annots = page.annotations_mut();
-    let annot_count = annots.len();
+    let mut i = annots.len();
 
-    for i in 0..annot_count {
+    while i > 0 {
+        i -= 1;
         let Ok(mut annot) = annots.get(i) else {
             continue;
         };
@@ -1319,18 +1356,23 @@ pub fn extract_annotations_from_page(
                     thickness: stroke_width,
                 });
             }
-        } else if annot.annotation_type() == PdfPageAnnotationType::FreeText {
+        } else if annot.annotation_type() == PdfPageAnnotationType::FreeText
+            || (annot.annotation_type() == PdfPageAnnotationType::Text
+                && !annot.contents().unwrap_or_default().is_empty())
+        {
             let text = annot.contents().unwrap_or_default();
             if !text.is_empty() {
-                let annot_color = if !annot.objects().is_empty() {
-                    safe_extract_annot_color(annot.objects(), AnnotationColor::new(0, 0, 0))
-                } else {
-                    annot
-                        .stroke_color()
-                        .or_else(|_| annot.fill_color())
-                        .map(|c| AnnotationColor::new(c.red(), c.green(), c.blue()))
-                        .unwrap_or(AnnotationColor::new(0, 0, 0))
-                };
+                let annot_color = annot
+                    .stroke_color()
+                    .or_else(|_| annot.fill_color())
+                    .map(|c| AnnotationColor::new(c.red(), c.green(), c.blue()))
+                    .unwrap_or_else(|_| {
+                        if !annot.objects().is_empty() {
+                            safe_extract_annot_color(annot.objects(), AnnotationColor::new(0, 0, 0))
+                        } else {
+                            AnnotationColor::new(0, 0, 0)
+                        }
+                    });
                 let (pos, width) = if let Ok(b) = annot.bounds() {
                     let canon = user_rect_to_canonical(&b, &crop_box, rotation);
                     (
@@ -1351,8 +1393,16 @@ pub fn extract_annotations_from_page(
                     width,
                 });
             }
+            // Delete from in-memory page so PDFium won't bake solid blocks into the bitmap
+            let _ = annots.delete_annotation(annot);
+        } else if annot.annotation_type() == PdfPageAnnotationType::Popup {
+            let _ = annots.delete_annotation(annot);
         }
     }
+
+    // Restore natural forward document reading order
+    highlights.reverse();
+    text_boxes.reverse();
 }
 
 /// Extracts all existing Highlight, Ink, and FreeText annotations from a PdfDocument's pages into canonical models.
@@ -1726,15 +1776,127 @@ pub fn extract_outline(doc: &PdfDocument) -> Vec<OutlineItem> {
     items
 }
 
-/// Extracts all characters and layout line boxes for a given page in canonical coordinates.
-pub fn extract_page_text(doc: &PdfDocument, page_idx: usize) -> Option<PageTextData> {
-    let page = doc.pages().get(page_idx as i32).ok()?;
-    let text_page = page.text().ok()?;
-    let count = text_page.len();
-    if count <= 0 {
-        return Some(PageTextData::new(page_idx, Vec::new(), Vec::new()));
+/// Extracts interactive links for a given page in canonical coordinates.
+pub fn extract_links_from_page(
+    page: &PdfPage,
+    crop_box: &PdfRect,
+    rotation: PdfPageRenderRotation,
+) -> Vec<PageLink> {
+    let mut links = Vec::new();
+
+    // 1. Enumerate standard page links via FPDFLink_Enumerate
+    for link in page.links().iter() {
+        if let Ok(raw_rect) = link.rect() {
+            let canon = user_rect_to_canonical(&raw_rect, crop_box, rotation);
+            if canon.max_x <= canon.min_x || canon.max_y <= canon.min_y {
+                continue;
+            }
+
+            let target = if let Some(dest) = link.destination() {
+                dest.page_index()
+                    .ok()
+                    .map(|idx| LinkTarget::Page(idx as usize))
+            } else if let Some(action) = link.action() {
+                match action {
+                    PdfAction::Uri(uri_action) => uri_action.uri().ok().and_then(|u| {
+                        let trimmed = u.trim().to_string();
+                        if !trimmed.is_empty() {
+                            Some(LinkTarget::Uri(trimmed))
+                        } else {
+                            None
+                        }
+                    }),
+                    PdfAction::LocalDestination(local) => {
+                        if let Ok(dest) = local.destination() {
+                            dest.page_index()
+                                .ok()
+                                .map(|idx| LinkTarget::Page(idx as usize))
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+
+            if let Some(target) = target {
+                links.push(PageLink {
+                    rect: canon,
+                    target,
+                });
+            }
+        }
     }
 
+    // 2. Supplement with any link annotations from page.annotations()
+    for annot in page.annotations().iter() {
+        if let Some(link_annot) = annot.as_link_annotation() {
+            if let Ok(link) = link_annot.link() {
+                if let Ok(raw_rect) = link.rect() {
+                    let canon = user_rect_to_canonical(&raw_rect, crop_box, rotation);
+                    if canon.max_x <= canon.min_x || canon.max_y <= canon.min_y {
+                        continue;
+                    }
+
+                    // Deduplicate if already present
+                    let already_present = links.iter().any(|existing| {
+                        (existing.rect.min_x - canon.min_x).abs() < 1.0
+                            && (existing.rect.min_y - canon.min_y).abs() < 1.0
+                            && (existing.rect.max_x - canon.max_x).abs() < 1.0
+                            && (existing.rect.max_y - canon.max_y).abs() < 1.0
+                    });
+                    if already_present {
+                        continue;
+                    }
+
+                    let target = if let Some(dest) = link.destination() {
+                        dest.page_index()
+                            .ok()
+                            .map(|idx| LinkTarget::Page(idx as usize))
+                    } else if let Some(action) = link.action() {
+                        match action {
+                            PdfAction::Uri(uri_action) => uri_action.uri().ok().and_then(|u| {
+                                let trimmed = u.trim().to_string();
+                                if !trimmed.is_empty() {
+                                    Some(LinkTarget::Uri(trimmed))
+                                } else {
+                                    None
+                                }
+                            }),
+                            PdfAction::LocalDestination(local) => {
+                                if let Ok(dest) = local.destination() {
+                                    dest.page_index()
+                                        .ok()
+                                        .map(|idx| LinkTarget::Page(idx as usize))
+                                } else {
+                                    None
+                                }
+                            }
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+
+                    if let Some(target) = target {
+                        links.push(PageLink {
+                            rect: canon,
+                            target,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    links
+}
+
+/// Extracts all characters, layout line boxes, and interactive links for a given page in canonical coordinates.
+pub fn extract_page_text(doc: &PdfDocument, page_idx: usize) -> Option<PageTextData> {
+    let page = doc.pages().get(page_idx as i32).ok()?;
     let crop_box = if let Ok(crop) = page.boundaries().crop() {
         crop.bounds
     } else if let Ok(media) = page.boundaries().media() {
@@ -1748,6 +1910,16 @@ pub fn extract_page_text(doc: &PdfDocument, page_idx: usize) -> Option<PageTextD
         )
     };
     let rotation = page.rotation().unwrap_or(PdfPageRenderRotation::None);
+    let links = extract_links_from_page(&page, &crop_box, rotation);
+
+    let text_page = match page.text() {
+        Ok(tp) => tp,
+        Err(_) => return Some(PageTextData::new(page_idx, Vec::new(), Vec::new(), links)),
+    };
+    let count = text_page.len();
+    if count <= 0 {
+        return Some(PageTextData::new(page_idx, Vec::new(), Vec::new(), links));
+    }
 
     let page_chars = text_page.chars();
     let mut raw_chars: Vec<(char, CanonicalRect)> = Vec::with_capacity(count as usize);
@@ -1886,7 +2058,7 @@ pub fn extract_page_text(doc: &PdfDocument, page_idx: usize) -> Option<PageTextD
         }
     }
 
-    Some(PageTextData::new(page_idx, final_chars, final_lines))
+    Some(PageTextData::new(page_idx, final_chars, final_lines, links))
 }
 
 #[cfg(test)]
@@ -2173,6 +2345,36 @@ mod tests {
                 );
                 assert!(!s.is_empty());
             }
+        }
+    }
+
+    #[test]
+    fn test_worker_extract_page_links() {
+        let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let pdfium = bind_pdfium().expect("Pdfium must be available for fixture test");
+        let book_path =
+            PathBuf::from("fixtures/Modern Operating Systems 4th Edition--Andrew Tanenbaum.pdf");
+        if book_path.exists() {
+            let doc = pdfium
+                .load_pdf_from_file(&book_path, None)
+                .expect("load Modern Operating Systems book");
+            let mut found_links = false;
+            for p in 0..15.min(doc.pages().len() as usize) {
+                if let Some(data) = extract_page_text(&doc, p) {
+                    if !data.links.is_empty() {
+                        found_links = true;
+                        for link in &data.links {
+                            assert!(link.rect.max_x >= link.rect.min_x);
+                            assert!(link.rect.max_y >= link.rect.min_y);
+                        }
+                        break;
+                    }
+                }
+            }
+            assert!(
+                found_links,
+                "Modern Operating Systems book should contain interactive links in first 15 pages"
+            );
         }
     }
 
@@ -2593,9 +2795,15 @@ mod tests {
             .unwrap();
 
         // The first render result MUST be page 0 (priority 1), NOT page 1 (priority 3 or stale gen 1)
-        let evt1 = rx_evt
-            .recv_timeout(std::time::Duration::from_secs(3))
-            .unwrap();
+        let evt1 = loop {
+            let evt = rx_evt
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .unwrap();
+            if let Event::AnnotationsExtracted { .. } = evt {
+                continue;
+            }
+            break evt;
+        };
         if let Event::Rendered(res) = evt1 {
             assert_eq!(res.page, 0, "Visible page 0 must be rendered first");
             assert_eq!(res.generation, 2);
@@ -2605,9 +2813,15 @@ mod tests {
         }
 
         // The second render result MUST be page 1 from generation 2 (generation 1 must have been skipped)
-        let evt2 = rx_evt
-            .recv_timeout(std::time::Duration::from_secs(3))
-            .unwrap();
+        let evt2 = loop {
+            let evt = rx_evt
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .unwrap();
+            if let Event::AnnotationsExtracted { .. } = evt {
+                continue;
+            }
+            break evt;
+        };
         if let Event::Rendered(res) = evt2 {
             assert_eq!(res.page, 1);
             assert_eq!(res.generation, 2, "Stale generation 1 should be dropped");
@@ -2884,9 +3098,8 @@ mod tests {
             extracted_tb.len()
         );
 
-        // Clean in-memory document of FreeText annotations so PDFium won't render black bars
-        apply_highlights_to_doc(&doc, &extracted_hl).expect("apply highlights only to clean doc");
-
+        // Notice: extract_annotations_from_doc automatically cleans the in-memory document
+        // of FreeText annotations so PDFium won't render solid black/yellow boxes!
         let render_config = PdfRenderConfig::new()
             .set_target_width(800)
             .render_annotations(true);
@@ -2986,9 +3199,15 @@ mod tests {
                 })
                 .unwrap();
 
-            let evt = rx_evt
-                .recv_timeout(std::time::Duration::from_secs(10))
-                .expect("Worker must respond with Open event");
+            let evt = loop {
+                let e = rx_evt
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .expect("Worker must respond with Open event");
+                if let Event::AnnotationsExtracted { .. } = e {
+                    continue;
+                }
+                break e;
+            };
             assert!(
                 matches!(evt, Event::Opened { doc_id: d, .. } if d == doc_id),
                 "Expected Opened event for doc_id {doc_id}, got {evt:?}"
@@ -3307,5 +3526,104 @@ mod tests {
         assert!((ext_r.min_y - 150.0).abs() < 1.0);
         assert!((ext_r.max_x - 250.0).abs() < 1.0);
         assert!((ext_r.max_y - 180.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn test_worker_unload_doc() {
+        let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let ctx = egui::Context::default();
+        let (tx_cmd, rx_evt) = start_worker(ctx);
+
+        let doc_id = 999;
+        let path = PathBuf::from("fixtures/MLE.pdf");
+        if !path.exists() {
+            let _ = tx_cmd.send(Command::Shutdown);
+            return;
+        }
+
+        // Wait for PdfiumReady
+        let mut ready = false;
+        while let Ok(evt) = rx_evt.recv_timeout(std::time::Duration::from_millis(500)) {
+            if matches!(evt, Event::PdfiumReady) {
+                ready = true;
+                break;
+            }
+        }
+        assert!(ready, "Worker must initialize Pdfium");
+
+        // Open doc
+        tx_cmd
+            .send(Command::Open {
+                doc_id,
+                path: path.clone(),
+            })
+            .unwrap();
+
+        let mut opened = false;
+        while let Ok(evt) = rx_evt.recv_timeout(std::time::Duration::from_millis(500)) {
+            if let Event::Opened {
+                doc_id: id,
+                page_count,
+                ..
+            } = evt
+            {
+                assert_eq!(id, doc_id);
+                assert!(page_count > 0);
+                opened = true;
+                break;
+            }
+        }
+        assert!(opened, "Doc must open");
+
+        // Send UnloadDoc (dormant tab deactivation)
+        tx_cmd.send(Command::UnloadDoc { doc_id }).unwrap();
+
+        // Render request for unloaded doc should be ignored by worker
+        tx_cmd
+            .send(Command::Render(crate::pdf::types::RenderCommand {
+                doc_id,
+                page: 0,
+                width_px: 400,
+                rotation: 0,
+                generation: 1,
+                priority: 1,
+            }))
+            .unwrap();
+
+        // Give worker 100ms; no Rendered event should arrive
+        let start = std::time::Instant::now();
+        while start.elapsed() < std::time::Duration::from_millis(100) {
+            if let Ok(evt) = rx_evt.recv_timeout(std::time::Duration::from_millis(20)) {
+                if let Event::Rendered(_) = evt {
+                    panic!("Unloaded document must not emit Rendered event: {:?}", evt);
+                }
+            }
+        }
+
+        // Reopen doc (instant wake up from dormant)
+        tx_cmd
+            .send(Command::Open {
+                doc_id,
+                path: path.clone(),
+            })
+            .unwrap();
+
+        let mut reopened = false;
+        while let Ok(evt) = rx_evt.recv_timeout(std::time::Duration::from_millis(500)) {
+            if let Event::Opened {
+                doc_id: id,
+                page_count,
+                ..
+            } = evt
+            {
+                assert_eq!(id, doc_id);
+                assert!(page_count > 0);
+                reopened = true;
+                break;
+            }
+        }
+        assert!(reopened, "Reopened doc must emit Event::Opened");
+
+        let _ = tx_cmd.send(Command::Shutdown);
     }
 }

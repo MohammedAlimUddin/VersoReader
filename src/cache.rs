@@ -395,9 +395,9 @@ mod tests {
         use std::sync::Arc;
 
         let mut cache = PageTextCache::new(2);
-        let data0 = Arc::new(PageTextData::new(0, Vec::new(), Vec::new()));
-        let data1 = Arc::new(PageTextData::new(1, Vec::new(), Vec::new()));
-        let data2 = Arc::new(PageTextData::new(2, Vec::new(), Vec::new()));
+        let data0 = Arc::new(PageTextData::new(0, Vec::new(), Vec::new(), Vec::new()));
+        let data1 = Arc::new(PageTextData::new(1, Vec::new(), Vec::new(), Vec::new()));
+        let data2 = Arc::new(PageTextData::new(2, Vec::new(), Vec::new(), Vec::new()));
 
         cache.insert(1, 0, data0);
         cache.insert(1, 1, data1);

@@ -93,7 +93,10 @@ pub fn paint_sidebar(painter: &Painter, rect: Rect, stroke_color: Color32, is_op
 
     let div_x = box_rect.left() + 4.5;
     painter.line_segment(
-        [pos2(div_x, box_rect.top()), pos2(div_x, box_rect.bottom())],
+        [
+            pos2(div_x, box_rect.top() + 1.4),
+            pos2(div_x, box_rect.bottom() - 1.4),
+        ],
         stroke,
     );
 
@@ -274,7 +277,6 @@ pub fn paint_highlighter(
     ];
     painter.add(egui::Shape::line(path2_pts, stroke));
 }
-
 /// Paints the Eraser icon (Lucide `eraser`).
 pub fn paint_eraser(painter: &Painter, rect: Rect, stroke_color: Color32, is_active: bool) {
     let map = |x: f32, y: f32| -> Pos2 {
@@ -285,40 +287,45 @@ pub fn paint_eraser(painter: &Painter, rect: Rect, stroke_color: Color32, is_act
     };
     let stroke = Stroke::new(1.4_f32, stroke_color);
 
-    // Lucide eraser angled body polygon:
-    // (8.0, 21.0) -> (6.6, 20.4) -> (2.6, 16.4) -> (2.6, 13.6) -> (12.6, 3.6) -> (15.4, 3.6) -> (21.4, 9.6) -> (21.4, 12.4) -> (12.8, 21.0)
-    let body_pts = vec![
-        map(8.0, 21.0),
-        map(6.6, 20.4),
-        map(2.6, 16.4),
-        map(2.6, 13.6),
-        map(12.6, 3.6),
-        map(15.4, 3.6),
-        map(21.4, 9.6),
-        map(21.4, 12.4),
-        map(12.8, 21.0),
-    ];
-
-    let fill_color = if is_active {
-        Color32::from_rgba_unmultiplied(255, 255, 255, 20)
-    } else {
-        Color32::TRANSPARENT
+    // Sample a quadratic Bézier (approximates the r=2 arcs) and append to `pts`.
+    let quad = |pts: &mut Vec<Pos2>, p0: (f32, f32), c: (f32, f32), p1: (f32, f32)| {
+        const N: usize = 8;
+        for i in 1..=N {
+            let t = i as f32 / N as f32;
+            let u = 1.0 - t;
+            pts.push(map(
+                u * u * p0.0 + 2.0 * u * t * c.0 + t * t * p1.0,
+                u * u * p0.1 + 2.0 * u * t * c.1 + t * t * p1.1,
+            ));
+        }
     };
 
-    if fill_color != Color32::TRANSPARENT {
+    // Body outline: M8 21 → … → L12.834 21
+    let mut body = vec![map(8.0, 21.0)];
+    quad(&mut body, (8.0, 21.0), (7.173, 21.0), (6.586, 20.413)); // bottom-left corner
+    body.push(map(2.586, 16.414));
+    quad(&mut body, (2.586, 16.414), (1.414, 15.0), (2.586, 13.586)); // left end
+    body.push(map(12.586, 3.586));
+    quad(&mut body, (12.586, 3.586), (14.0, 2.414), (15.415, 3.586)); // top
+    body.push(map(21.414, 9.586));
+    quad(&mut body, (21.414, 9.586), (22.586, 11.0), (21.414, 12.414)); // right end
+    body.push(map(12.834, 21.0));
+
+    if is_active {
         painter.add(egui::Shape::convex_polygon(
-            body_pts.clone(),
-            fill_color,
+            body.clone(),
+            Color32::from_rgba_unmultiplied(255, 255, 255, 20),
             Stroke::NONE,
         ));
     }
-    painter.add(egui::Shape::closed_line(body_pts, stroke));
 
-    // Lucide sleeve divider line (m5.082 11.09 8.828 8.828)
-    painter.line_segment([map(5.1, 11.1), map(13.9, 19.9)], stroke);
+    painter.add(egui::Shape::closed_line(body, stroke));
 
-    // Ground surface line (M21 21H8)
-    painter.line_segment([map(8.0, 21.0), map(22.0, 21.0)], stroke);
+    // Base tail: (12.834,21) → (21,21)
+    painter.line_segment([map(12.834, 21.0), map(21.0, 21.0)], stroke);
+
+    // Sleeve divider: m5.082 11.09 8.828 8.828
+    painter.line_segment([map(5.082, 11.09), map(13.91, 19.918)], stroke);
 }
 
 /// Paints the Text Tool icon (Lucide `type` serif "T").
@@ -625,6 +632,34 @@ pub fn paint_redo(painter: &Painter, rect: Rect, stroke_color: Color32) {
     painter.add(egui::Shape::line(stem_pts, stroke));
 }
 
+/// Paints the navigation back arrow (Lucide `arrow-left`).
+pub fn paint_nav_back(painter: &Painter, rect: Rect, stroke_color: Color32) {
+    let map = |x: f32, y: f32| -> Pos2 {
+        pos2(
+            rect.left() + (x / 24.0) * rect.width(),
+            rect.top() + (y / 24.0) * rect.height(),
+        )
+    };
+    let stroke = Stroke::new(1.4_f32, stroke_color);
+    painter.line_segment([map(12.0, 19.0), map(5.0, 12.0)], stroke);
+    painter.line_segment([map(12.0, 5.0), map(5.0, 12.0)], stroke);
+    painter.line_segment([map(5.0, 12.0), map(19.0, 12.0)], stroke);
+}
+
+/// Paints the navigation forward arrow (Lucide `arrow-right`).
+pub fn paint_nav_forward(painter: &Painter, rect: Rect, stroke_color: Color32) {
+    let map = |x: f32, y: f32| -> Pos2 {
+        pos2(
+            rect.left() + (x / 24.0) * rect.width(),
+            rect.top() + (y / 24.0) * rect.height(),
+        )
+    };
+    let stroke = Stroke::new(1.4_f32, stroke_color);
+    painter.line_segment([map(12.0, 5.0), map(19.0, 12.0)], stroke);
+    painter.line_segment([map(12.0, 19.0), map(19.0, 12.0)], stroke);
+    painter.line_segment([map(5.0, 12.0), map(19.0, 12.0)], stroke);
+}
+
 /// Paints the Settings / Preferences gear icon (Lucide `settings`).
 pub fn paint_gear(painter: &Painter, rect: Rect, stroke_color: Color32) {
     let c = rect.center();
@@ -759,17 +794,19 @@ pub fn render_adobe_button_variant(
             } else {
                 (
                     Color32::TRANSPARENT,
-                    Color32::from_rgb(175, 75, 75),
-                    Color32::from_rgb(240, 120, 120),
+                    accent_red,
+                    Color32::from_rgb(250, 120, 120),
                 )
             }
         }
     };
 
-    ui.painter().rect(
+    if bg_color != Color32::TRANSPARENT {
+        ui.painter().rect_filled(rect, radius, bg_color);
+    }
+    ui.painter().rect_stroke(
         rect,
         radius,
-        bg_color,
         Stroke::new(1.4_f32, stroke_color),
         StrokeKind::Inside,
     );
@@ -798,6 +835,74 @@ pub fn render_adobe_button(ui: &mut egui::Ui, text: &str, is_primary: bool) -> e
         AdobeButtonVariant::Secondary
     };
     render_adobe_button_variant(ui, text, variant)
+}
+
+/// Renders a modern, enlarged (22x22 pt) Adobe-style checkbox:
+/// Rounded corners, subtle outline in dark mode, vibrant accent blue fill with crisp checkmark when checked.
+pub fn render_adobe_checkbox(ui: &mut egui::Ui, value: &mut bool) -> egui::Response {
+    let size = vec2(22.0, 22.0);
+    let (rect, mut response) = ui.allocate_exact_size(size, Sense::click());
+    response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+
+    if response.clicked() {
+        *value = !*value;
+        response.mark_changed();
+    }
+
+    let is_hovered = response.hovered();
+    let is_active = response.is_pointer_button_down_on();
+    let is_checked = *value;
+
+    let painter = ui.painter();
+    let radius = CornerRadius::same(5);
+
+    let (bg_color, stroke_color) = if is_checked {
+        if is_active {
+            (Color32::from_rgb(0, 90, 170), Color32::from_rgb(0, 90, 170))
+        } else if is_hovered {
+            (
+                Color32::from_rgb(30, 140, 235),
+                Color32::from_rgb(30, 140, 235),
+            )
+        } else {
+            (
+                Color32::from_rgb(0, 120, 212),
+                Color32::from_rgb(0, 120, 212),
+            )
+        }
+    } else if is_active {
+        (
+            Color32::from_rgb(50, 50, 58),
+            Color32::from_rgb(130, 130, 145),
+        )
+    } else if is_hovered {
+        (
+            Color32::from_rgb(45, 45, 52),
+            Color32::from_rgb(115, 115, 128),
+        )
+    } else {
+        (Color32::from_rgb(32, 32, 36), Color32::from_rgb(80, 80, 90))
+    };
+
+    painter.rect(
+        rect,
+        radius,
+        bg_color,
+        Stroke::new(1.4_f32, stroke_color),
+        StrokeKind::Inside,
+    );
+
+    if is_checked {
+        // Crisp checkmark path centered within the 22x22 square
+        let p1 = pos2(rect.left() + 5.5, rect.center().y);
+        let p2 = pos2(rect.left() + 9.0, rect.bottom() - 6.0);
+        let p3 = pos2(rect.right() - 5.5, rect.top() + 6.0);
+        let stroke = Stroke::new(2.2_f32, Color32::WHITE);
+        painter.line_segment([p1, p2], stroke);
+        painter.line_segment([p2, p3], stroke);
+    }
+
+    response
 }
 
 #[cfg(test)]

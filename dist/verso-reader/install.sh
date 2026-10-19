@@ -12,10 +12,10 @@ for size in 32x32 48x48 64x64 128x128 256x256; do
     mkdir -p "$ICON_BASE/$size/apps"
 done
 
-echo "Installing Verso Reader to $BIN_DIR/pdfview..."
-cp "$DIR/pdfview" "$BIN_DIR/pdfview"
-chmod +x "$BIN_DIR/pdfview"
-ln -sf "$BIN_DIR/pdfview" "$BIN_DIR/verso-reader"
+echo "Installing Verso Reader to $BIN_DIR/verso-reader..."
+cp "$DIR/verso-reader" "$BIN_DIR/verso-reader"
+chmod +x "$BIN_DIR/verso-reader"
+ln -sf "$BIN_DIR/verso-reader" "$BIN_DIR/pdfview"
 
 echo "Installing Pdfium engine to $LIB_DIR/libpdfium.so..."
 cp "$DIR/lib/libpdfium.so" "$LIB_DIR/libpdfium.so"
@@ -33,7 +33,7 @@ Type=Application
 Name=Verso Reader
 GenericName=PDF Reader
 Comment=Modern, lightweight, high-performance desktop PDF reader
-Exec=$BIN_DIR/pdfview %U
+Exec=$BIN_DIR/verso-reader %U
 Icon=verso-reader
 Terminal=false
 Categories=Office;Viewer;
