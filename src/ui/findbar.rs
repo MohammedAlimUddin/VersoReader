@@ -1,6 +1,6 @@
 //! Find/search bar UI component (Milestone 6).
 
-use egui::{vec2, Color32, RichText, Sense, Ui};
+use egui::{vec2, RichText, Sense, Ui};
 
 use crate::pdf::types::SearchMatch;
 use crate::ui::icons::{
@@ -119,11 +119,12 @@ pub fn render_find_bar(
         };
 
         if !count_text.is_empty() {
+            let palette = crate::ui::theme::Theme::palette(ui.visuals().dark_mode);
             ui.add_space(2.0);
             ui.label(
                 RichText::new(count_text)
                     .size(12.0)
-                    .color(Color32::from_rgb(180, 180, 185)),
+                    .color(palette.text_secondary),
             );
             ui.add_space(2.0);
         }

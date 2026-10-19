@@ -209,7 +209,15 @@ impl Toolbar {
                 let (preview_rect, _) =
                     ui.allocate_exact_size(vec2(160.0, 14.0), egui::Sense::hover());
                 let p = ui.painter();
-                p.rect_filled(preview_rect, 2.0, Color32::from_gray(40));
+                p.rect_filled(
+                    preview_rect,
+                    2.0,
+                    if ui.visuals().dark_mode {
+                        Color32::from_gray(40)
+                    } else {
+                        Color32::from_gray(225)
+                    },
+                );
                 let band_h = (preview_rect.height() * thickness).clamp(3.0, preview_rect.height());
                 let band_rect = Rect::from_center_size(
                     preview_rect.center(),
@@ -263,18 +271,23 @@ impl Toolbar {
 
         if text_active {
             // Font size picker
+            let is_dark = left_ui.visuals().dark_mode;
+            let palette = Theme::palette(is_dark);
             egui::ComboBox::from_id_salt("text_font_size_combo")
                 .width(55.0)
                 .selected_text(format!("{:.0} pt", props.text_font_size))
                 .show_ui(&mut left_ui, |ui| {
-                    ui.visuals_mut().selection.bg_fill =
-                        Color32::from_rgba_unmultiplied(255, 255, 255, 35);
+                    ui.visuals_mut().selection.bg_fill = if is_dark {
+                        Color32::from_rgba_unmultiplied(255, 255, 255, 35)
+                    } else {
+                        Color32::from_rgba_unmultiplied(0, 0, 0, 30)
+                    };
                     ui.visuals_mut().selection.stroke = Stroke::NONE;
 
                     for &size in &[10.0, 12.0, 14.0, 16.0, 18.0, 20.0, 24.0, 28.0, 32.0, 36.0] {
                         let is_sel = (props.text_font_size - size).abs() < 0.1;
-                        let text =
-                            egui::RichText::new(format!("{:.0} pt", size)).color(Color32::WHITE);
+                        let text = egui::RichText::new(format!("{:.0} pt", size))
+                            .color(palette.text_primary);
                         if ui.selectable_label(is_sel, text).clicked() {
                             action = Some(ToolbarAction::SetTextFontSize(size));
                         }
@@ -470,12 +483,15 @@ impl Toolbar {
             action = Some(ToolbarAction::ZoomOut);
         }
 
+        let is_dark = center_ui.visuals().dark_mode;
+        let palette = Theme::palette(is_dark);
+
         let zoom_percent = (props.zoom * 100.0).round();
         center_ui.add_space(1.0);
         center_ui.label(
             RichText::new(format!("{zoom_percent:.0}%"))
                 .size(12.0)
-                .color(Theme::TEXT_PRIMARY),
+                .color(palette.text_primary),
         );
         center_ui.add_space(1.0);
 
@@ -549,7 +565,7 @@ impl Toolbar {
         center_ui.label(
             RichText::new("Page")
                 .size(12.5)
-                .color(Theme::TEXT_SECONDARY),
+                .color(palette.text_secondary),
         );
 
         let text_edit = TextEdit::singleline(&mut self.page_input_text)
@@ -591,7 +607,7 @@ impl Toolbar {
         center_ui.label(
             RichText::new(format!("of {}", props.total_pages))
                 .size(12.5)
-                .color(Theme::TEXT_MUTED),
+                .color(palette.text_muted),
         );
 
         center_ui.add_space(2.0);

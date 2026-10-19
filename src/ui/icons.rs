@@ -27,36 +27,53 @@ pub fn render_icon_button(
     );
     let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
 
+    let is_dark = ui.visuals().dark_mode;
+    let palette = Theme::palette(is_dark);
+
     let (bg_color, stroke_color, border_stroke, show_bottom_line) = if !is_enabled {
         (
             Color32::TRANSPARENT,
-            Color32::from_rgb(90, 90, 95),
+            if is_dark {
+                Color32::from_rgb(90, 90, 95)
+            } else {
+                Color32::from_rgb(180, 185, 195)
+            },
             Stroke::NONE,
             false,
         )
     } else if is_selected {
         let bg = if response.hovered() {
-            Color32::from_rgba_unmultiplied(255, 255, 255, 20)
-        } else {
+            if is_dark {
+                Color32::from_rgba_unmultiplied(255, 255, 255, 20)
+            } else {
+                Color32::from_rgba_unmultiplied(0, 0, 0, 20)
+            }
+        } else if is_dark {
             Color32::from_rgba_unmultiplied(255, 255, 255, 10)
+        } else {
+            Color32::from_rgba_unmultiplied(0, 0, 0, 10)
         };
-        (bg, Color32::WHITE, Stroke::NONE, true)
+        (bg, palette.icon_fg_hover, Stroke::NONE, true)
     } else if response.is_pointer_button_down_on() {
         (
-            Color32::from_rgba_unmultiplied(255, 255, 255, 22),
-            Color32::WHITE,
+            if is_dark {
+                Color32::from_rgba_unmultiplied(255, 255, 255, 22)
+            } else {
+                Color32::from_rgba_unmultiplied(0, 0, 0, 22)
+            },
+            palette.icon_fg_hover,
             Stroke::NONE,
             false,
         )
     } else if response.hovered() {
-        (Theme::BG_PANEL_HOVER, Color32::WHITE, Stroke::NONE, false)
-    } else {
         (
-            Color32::TRANSPARENT,
-            Theme::TEXT_SECONDARY,
+            palette.bg_panel_hover,
+            palette.icon_fg_hover,
             Stroke::NONE,
             false,
         )
+    } else {
+        (Color32::TRANSPARENT, palette.icon_fg, Stroke::NONE, false)
     };
 
     let p = ui.painter();
@@ -740,6 +757,7 @@ pub fn render_adobe_button_variant(
     let (rect, response) = ui.allocate_exact_size(desired_size, Sense::click());
     let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
 
+    let is_dark = ui.visuals().dark_mode;
     let is_hovered = response.hovered();
     let is_active = response.is_pointer_button_down_on();
 
@@ -761,7 +779,11 @@ pub fn render_adobe_button_variant(
                 (
                     Color32::TRANSPARENT,
                     accent_blue,
-                    Color32::from_rgb(90, 165, 250),
+                    if is_dark {
+                        Color32::from_rgb(90, 165, 250)
+                    } else {
+                        Color32::from_rgb(0, 100, 195)
+                    },
                 )
             }
         }
@@ -777,8 +799,16 @@ pub fn render_adobe_button_variant(
             } else {
                 (
                     Color32::TRANSPARENT,
-                    Color32::from_rgb(110, 110, 115),
-                    Color32::from_rgb(220, 220, 225),
+                    if is_dark {
+                        Color32::from_rgb(110, 110, 115)
+                    } else {
+                        Color32::from_rgb(185, 190, 200)
+                    },
+                    if is_dark {
+                        Color32::from_rgb(220, 220, 225)
+                    } else {
+                        Color32::from_rgb(55, 60, 70)
+                    },
                 )
             }
         }
@@ -795,7 +825,11 @@ pub fn render_adobe_button_variant(
                 (
                     Color32::TRANSPARENT,
                     accent_red,
-                    Color32::from_rgb(250, 120, 120),
+                    if is_dark {
+                        Color32::from_rgb(250, 120, 120)
+                    } else {
+                        Color32::from_rgb(205, 45, 45)
+                    },
                 )
             }
         }
@@ -849,6 +883,7 @@ pub fn render_adobe_checkbox(ui: &mut egui::Ui, value: &mut bool) -> egui::Respo
         response.mark_changed();
     }
 
+    let is_dark = ui.visuals().dark_mode;
     let is_hovered = response.hovered();
     let is_active = response.is_pointer_button_down_on();
     let is_checked = *value;
@@ -871,17 +906,33 @@ pub fn render_adobe_checkbox(ui: &mut egui::Ui, value: &mut bool) -> egui::Respo
             )
         }
     } else if is_active {
-        (
-            Color32::from_rgb(50, 50, 58),
-            Color32::from_rgb(130, 130, 145),
-        )
+        if is_dark {
+            (
+                Color32::from_rgb(50, 50, 58),
+                Color32::from_rgb(130, 130, 145),
+            )
+        } else {
+            (
+                Color32::from_rgb(225, 230, 238),
+                Color32::from_rgb(130, 140, 155),
+            )
+        }
     } else if is_hovered {
-        (
-            Color32::from_rgb(45, 45, 52),
-            Color32::from_rgb(115, 115, 128),
-        )
-    } else {
+        if is_dark {
+            (
+                Color32::from_rgb(45, 45, 52),
+                Color32::from_rgb(115, 115, 128),
+            )
+        } else {
+            (
+                Color32::from_rgb(238, 242, 248),
+                Color32::from_rgb(145, 155, 170),
+            )
+        }
+    } else if is_dark {
         (Color32::from_rgb(32, 32, 36), Color32::from_rgb(80, 80, 90))
+    } else {
+        (Color32::WHITE, Color32::from_rgb(180, 185, 195))
     };
 
     painter.rect(

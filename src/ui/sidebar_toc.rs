@@ -43,10 +43,17 @@ fn render_outline_tree(
         let next_sibling_page = items.get(idx + 1).and_then(|sibling| sibling.page_number);
         let is_current = is_chapter_active(item, current_page, next_sibling_page);
 
+        let is_dark = ui.visuals().dark_mode;
         let label_color = if is_current {
-            Color32::from_rgb(100, 180, 255) // Accent blue for active chapter
-        } else {
+            if is_dark {
+                Color32::from_rgb(100, 180, 255) // Accent blue for active chapter
+            } else {
+                Color32::from_rgb(0, 100, 200)
+            }
+        } else if is_dark {
             Color32::from_rgb(220, 220, 225)
+        } else {
+            Color32::from_rgb(45, 50, 60)
         };
 
         let mut title_text = RichText::new(&item.title).color(label_color).size(12.5);
@@ -130,12 +137,13 @@ pub fn render_sidebar_toc(
 
     ui.separator();
 
+    let palette = crate::ui::theme::Theme::palette(ui.visuals().dark_mode);
     if is_loading {
         ui.vertical_centered(|ui| {
             ui.add_space(20.0);
             ui.spinner();
             ui.add_space(8.0);
-            ui.label(RichText::new("Loading outline...").color(Color32::GRAY));
+            ui.label(RichText::new("Loading outline...").color(palette.text_muted));
         });
     } else {
         match outline {
@@ -151,7 +159,7 @@ pub fn render_sidebar_toc(
             _ => {
                 ui.vertical_centered(|ui| {
                     ui.add_space(30.0);
-                    ui.label(RichText::new("No table of contents").color(Color32::GRAY));
+                    ui.label(RichText::new("No table of contents").color(palette.text_muted));
                 });
             }
         }

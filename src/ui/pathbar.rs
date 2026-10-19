@@ -164,20 +164,22 @@ pub enum PathBarAction {
 /// Draws a crisp vector folder/location badge in the path bar.
 fn paint_path_badge(ui: &mut egui::Ui, rect: Rect) {
     let p = ui.painter();
+    let is_dark = ui.visuals().dark_mode;
+    let palette = Theme::palette(is_dark);
     let center = rect.center();
     let box_rect = Rect::from_center_size(center, Vec2::new(15.0, 12.0));
-    let stroke = Stroke::new(1.1_f32, Theme::TEXT_SECONDARY);
+    let stroke = Stroke::new(1.1_f32, palette.text_secondary);
 
     // Folder tab
     let tab_rect = Rect::from_min_size(
         Pos2::new(box_rect.left(), box_rect.top() - 2.5),
         Vec2::new(6.0, 3.5),
     );
-    p.rect_filled(tab_rect, CornerRadius::same(1), Theme::BG_PANEL_HOVER);
+    p.rect_filled(tab_rect, CornerRadius::same(1), palette.bg_panel_hover);
     p.rect_stroke(tab_rect, CornerRadius::same(1), stroke, StrokeKind::Inside);
 
     // Folder body
-    p.rect_filled(box_rect, CornerRadius::same(2), Theme::BG_PANEL);
+    p.rect_filled(box_rect, CornerRadius::same(2), palette.bg_panel);
     p.rect_stroke(box_rect, CornerRadius::same(2), stroke, StrokeKind::Inside);
 }
 
@@ -290,6 +292,8 @@ impl PathBar {
 
             // Quick clear button (vector cross)
             if !self.text.is_empty() {
+                let is_dark = ui.visuals().dark_mode;
+                let palette = Theme::palette(is_dark);
                 let (c_rect, c_resp) =
                     ui.allocate_exact_size(Vec2::new(20.0, 20.0), Sense::click());
                 let c_resp = c_resp
@@ -297,12 +301,12 @@ impl PathBar {
                     .on_hover_text("Clear path");
                 if c_resp.hovered() {
                     ui.painter()
-                        .rect_filled(c_rect, Theme::RADIUS, Theme::BG_PANEL_HOVER);
+                        .rect_filled(c_rect, Theme::RADIUS, palette.bg_panel_hover);
                 }
                 let cross_col = if c_resp.hovered() {
-                    Color32::WHITE
+                    palette.icon_fg_hover
                 } else {
-                    Theme::TEXT_MUTED
+                    palette.text_muted
                 };
                 crate::ui::icons::paint_close(ui.painter(), c_rect, cross_col);
 

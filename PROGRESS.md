@@ -1329,3 +1329,45 @@
   - [x] Open Preferences: Cancel button has transparent background and red border; fills red on hover.
   - [x] Open a PDF, add annotations, close tab: Don't Save button has transparent background and red border; fills red on hover.
   - [x] Verify release binary is named `verso-reader` in `dist/verso-reader/`.
+
+---
+
+## Phase 6 — Comprehensive Light Mode & Theme Preferences
+- **Status:** Completed
+- **Done:**
+  1. **Theme Preference Settings (`src/settings.rs`)**:
+     - Added `ThemePreference` enum with `Dark` (default), `Light`, and `System` variants, serialized as lowercase in `settings.toml`.
+     - Implemented `ThemePreference::is_dark(&self, ctx: &egui::Context) -> bool` with automatic OS system theme detection (`ctx.system_theme()`).
+     - Added unit tests: `test_theme_preference_toml_variants` and updated settings defaults & roundtrip tests.
+  2. **Semantic Theme Token Architecture (`src/ui/theme.rs`)**:
+     - Introduced `ThemePalette` containing semantic tokens (`bg_canvas`, `bg_surface`, `bg_panel`, `bg_panel_hover`, `tabbar_bg`, `tab_active_bg`, `tab_inactive_bg`, `card_bg`, `card_border`, `text_primary`, `text_secondary`, `text_muted`, `icon_fg`, `icon_fg_hover`, etc.).
+     - Implemented `Theme::palette(is_dark)` with authentic Microsoft Edge-inspired light surfaces (`#EEF0F4` canvas, `#E4E7EC` titlebar, pure white paper tabs and cards, `#F6F8FA` toolbars and sidebars).
+     - Updated `Theme::apply(ctx, is_dark)` to configure `Visuals::light()` and `Visuals::dark()`.
+  3. **Adaptive Component & Control Styling**:
+     - `src/ui/icons.rs`: Updated `render_icon_button`, `render_adobe_button_variant`, and `render_adobe_checkbox` to dynamically adapt rest, hover, pressed, and disabled states.
+     - `src/ui/tabbar.rs`: Adapted active/inactive tabs, PDF badges, dormant tab indicators, and window controls to `palette`.
+     - `src/ui/toolbar.rs`: Adapted thickness preview, font size dropdown, zoom display, and page counter labels to `palette`.
+     - `src/ui/pathbar.rs`: Adapted path badge, text fields, and clear buttons.
+     - `src/ui/sidebar_toc.rs`: Adapted active/inactive outline chapter labels and empty/loading states.
+     - `src/ui/viewer.rs`: In light mode, added crisp white paper backgrounds and subtle drop shadows/borders around pages (`Stroke::new(1.0, Color32::from_rgba_unmultiplied(0, 0, 0, 45))`), and adaptive loading placeholders.
+     - `src/ui/findbar.rs`: Adapted match count labels to `palette.text_secondary`.
+  4. **Appearance & Theme Section in Preferences (`src/app.rs`)**:
+     - Added Section 1: "Appearance & Theme" with `[🌙 Dark]`, `[☀️ Light]`, and `[💻 System]` pill buttons.
+     - Implemented live preview: clicking a theme immediately updates the UI preview in the active window.
+     - Clicking "Save Preferences" persists `theme = "light"` (or `"dark"` / `"system"`) to `settings.toml`.
+     - Clicking "Cancel" reverts the draft settings and restores the saved theme.
+     - Adapted floating find bar, F3 debug bar, TOC sidebar, fullscreen quickbar, CentralPanel canvas, sliders, color swatches, unsaved changes modal, and About modal.
+  5. **Verification & Testing**:
+     - Added unit test `app::tests::test_is_dark_mode_live_preview` verifying live preview theme switching.
+     - Total 101 unit tests passing cleanly (`cargo test`).
+- **Quality Gates & Tests**:
+  - `cargo fmt --check` clean.
+  - `cargo clippy --all-targets -- -D warnings` passed with 0 warnings.
+  - `cargo test` passed (101/101 tests passed).
+- **Manual Verification Checklist:**
+  - [x] Open Preferences: Section 1 displays "Appearance & Theme" with `[🌙 Dark]`, `[☀️ Light]`, and `[💻 System]`.
+  - [x] Click `[☀️ Light]`: UI immediately switches to light mode with high-contrast chrome and authentic white document paper.
+  - [x] Click `[🌙 Dark]`: UI immediately switches back to dark mode.
+  - [x] Click `[☀️ Light]` and click "Save Preferences": Light mode persists across app restarts in `~/.config/pdfview/settings.toml`.
+  - [x] In light mode, verify the PDF viewer canvas, tab bar, toolbar, TOC sidebar, find bar, modals, and settings cards have crisp contrast.
+

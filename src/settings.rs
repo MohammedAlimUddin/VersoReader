@@ -49,9 +49,32 @@ fn default_inactivity_timeout_mins() -> u32 {
     5
 }
 
+/// Visual appearance theme preference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ThemePreference {
+    #[default]
+    Dark,
+    Light,
+    System,
+}
+
+impl ThemePreference {
+    /// Returns true if the resolved theme is dark for the given egui context.
+    pub fn is_dark(&self, ctx: &egui::Context) -> bool {
+        match self {
+            Self::Dark => true,
+            Self::Light => false,
+            Self::System => !matches!(ctx.system_theme(), Some(egui::Theme::Light)),
+        }
+    }
+}
+
 /// Persistent user settings saved in ~/.config/verso-reader/settings.toml.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Settings {
+    #[serde(default)]
+    pub theme: ThemePreference,
     #[serde(default = "default_highlighter_color")]
     pub highlighter_color: AnnotationColor,
     #[serde(default = "default_highlighter_thickness")]
@@ -81,6 +104,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            theme: ThemePreference::default(),
             highlighter_color: default_highlighter_color(),
             highlighter_thickness: default_highlighter_thickness(),
             text_font_size: default_text_font_size(),
@@ -245,6 +269,7 @@ mod tests {
     #[test]
     fn test_settings_defaults() {
         let s = Settings::default();
+        assert_eq!(s.theme, ThemePreference::Dark);
         assert_eq!(s.highlighter_color, PRESET_HIGHLIGHT_COLORS[0]);
         assert_eq!(s.highlighter_thickness, 1.0);
         assert_eq!(s.text_font_size, 16.0);
@@ -262,6 +287,7 @@ mod tests {
     #[test]
     fn test_settings_toml_roundtrip() {
         let s = Settings {
+            theme: ThemePreference::Light,
             highlighter_color: PRESET_HIGHLIGHT_COLORS[3],
             highlighter_thickness: 0.65,
             text_font_size: 20.0,
@@ -278,6 +304,21 @@ mod tests {
         let serialized = toml::to_string_pretty(&s).expect("serialize settings");
         let deserialized: Settings = toml::from_str(&serialized).expect("deserialize settings");
         assert_eq!(s, deserialized);
+    }
+
+    #[test]
+    fn test_theme_preference_toml_variants() {
+        let toml_dark = "theme = 'dark'\n";
+        let s_dark: Settings = toml::from_str(toml_dark).expect("parse dark theme");
+        assert_eq!(s_dark.theme, ThemePreference::Dark);
+
+        let toml_light = "theme = 'light'\n";
+        let s_light: Settings = toml::from_str(toml_light).expect("parse light theme");
+        assert_eq!(s_light.theme, ThemePreference::Light);
+
+        let toml_system = "theme = 'system'\n";
+        let s_system: Settings = toml::from_str(toml_system).expect("parse system theme");
+        assert_eq!(s_system.theme, ThemePreference::System);
     }
 
     #[test]

@@ -1268,6 +1268,23 @@ pub fn render_viewer(
             let active_tex_id = sharp_tex_id.or(fallback_tex_id);
 
             if is_in_viewport {
+                let is_dark = ui.visuals().dark_mode;
+                // Paper background and framing boundary
+                painter.rect_filled(screen_rect, 0.0, Color32::WHITE);
+                painter.rect_stroke(
+                    screen_rect,
+                    0.0,
+                    Stroke::new(
+                        1.0_f32,
+                        if is_dark {
+                            Color32::from_rgb(45, 45, 48)
+                        } else {
+                            Color32::from_rgba_unmultiplied(0, 0, 0, 45)
+                        },
+                    ),
+                    StrokeKind::Outside,
+                );
+
                 // Sharp render available -> paint sharp (and request refresh if stale)
                 if let Some(tex_id) = sharp_tex_id {
                     painter.image(
@@ -1301,12 +1318,27 @@ pub fn render_viewer(
                         });
                     }
                 } else {
-                    // Placeholder: light-gray page rectangle with crisp border
-                    painter.rect_filled(screen_rect, 0.0, Color32::from_rgb(240, 240, 240));
+                    // Placeholder: adaptive page rectangle with crisp border
+                    painter.rect_filled(
+                        screen_rect,
+                        0.0,
+                        if is_dark {
+                            Color32::from_rgb(35, 35, 38)
+                        } else {
+                            Color32::from_rgb(240, 240, 244)
+                        },
+                    );
                     painter.rect_stroke(
                         screen_rect,
                         0.0,
-                        Stroke::new(1.0_f32, Color32::from_rgb(180, 180, 180)),
+                        Stroke::new(
+                            1.0_f32,
+                            if is_dark {
+                                Color32::from_rgb(60, 60, 65)
+                            } else {
+                                Color32::from_rgb(200, 205, 215)
+                            },
+                        ),
                         StrokeKind::Outside,
                     );
 

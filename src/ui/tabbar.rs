@@ -61,13 +61,22 @@ pub struct TabItem<'a> {
 /// Draws a crisp vector PDF document icon with a folded corner.
 fn paint_pdf_icon(ui: &mut egui::Ui, rect: Rect, is_active: bool) {
     let p = ui.painter();
+    let is_dark = ui.visuals().dark_mode;
     let icon_rect = Rect::from_center_size(rect.center(), Vec2::new(12.0, 15.0));
     let fold = 3.5_f32;
 
     let outline_col = if is_active {
         Color32::from_rgb(220, 70, 70) // Edge PDF red accent
-    } else {
+    } else if is_dark {
         Color32::from_rgb(170, 80, 80)
+    } else {
+        Color32::from_rgb(190, 90, 90)
+    };
+
+    let (body_fill, fold_fill) = if is_dark {
+        (Color32::from_rgb(32, 32, 34), Color32::from_rgb(45, 45, 48))
+    } else {
+        (Color32::WHITE, Color32::from_rgb(225, 228, 234))
     };
 
     // Body of the page with top-right fold
@@ -81,7 +90,7 @@ fn paint_pdf_icon(ui: &mut egui::Ui, rect: Rect, is_active: bool) {
 
     p.add(egui::Shape::convex_polygon(
         points.to_vec(),
-        Color32::from_rgb(32, 32, 34),
+        body_fill,
         Stroke::new(1.0_f32, outline_col),
     ));
 
@@ -93,7 +102,7 @@ fn paint_pdf_icon(ui: &mut egui::Ui, rect: Rect, is_active: bool) {
     ];
     p.add(egui::Shape::convex_polygon(
         fold_points.to_vec(),
-        Color32::from_rgb(45, 45, 48),
+        fold_fill,
         Stroke::new(1.0_f32, outline_col),
     ));
 
@@ -114,6 +123,9 @@ pub fn render_tab_bar(
     let mut action = None;
     let mut toggle_path_bar = false;
 
+    let is_dark = ui.visuals().dark_mode;
+    let palette = Theme::palette(is_dark);
+
     let row_height = Theme::TAB_HEIGHT;
     ui.set_height(row_height);
 
@@ -128,7 +140,7 @@ pub fn render_tab_bar(
             .on_hover_text("About Verso Reader");
         if brand_resp.hovered() {
             ui.painter()
-                .rect_filled(brand_rect, Theme::RADIUS, Theme::BG_PANEL_HOVER);
+                .rect_filled(brand_rect, Theme::RADIUS, palette.bg_panel_hover);
         }
         crate::ui::icons::paint_verso_logo(ui.painter(), brand_rect);
         if brand_resp.clicked() {
@@ -139,15 +151,15 @@ pub fn render_tab_bar(
         // 1. Render tabs
         for (idx, tab) in tabs.iter().enumerate() {
             let bg_color = if tab.is_active {
-                Theme::TAB_ACTIVE_BG
+                palette.tab_active_bg
             } else {
-                Theme::TAB_INACTIVE_BG
+                palette.tab_inactive_bg
             };
 
             let text_color = if tab.is_active {
-                Color32::WHITE
+                palette.text_primary
             } else {
-                Theme::TEXT_SECONDARY
+                palette.text_secondary
             };
 
             let truncated_title = truncate_filename(tab.title, 24);
@@ -188,9 +200,7 @@ pub fn render_tab_bar(
                         .color(text_color)
                         .size(12.5);
                     if tab.is_dormant && !tab.is_active {
-                        title_label = title_label
-                            .color(Color32::from_rgb(130, 130, 135))
-                            .italics();
+                        title_label = title_label.color(palette.text_muted).italics();
                     }
                     ui.label(title_label);
 
@@ -214,9 +224,9 @@ pub fn render_tab_bar(
                     let (btn_bg, cross_col) = if c_hovered {
                         (Theme::CLOSE_RED, Color32::WHITE)
                     } else if tab.is_active {
-                        (Color32::TRANSPARENT, Color32::from_rgb(175, 175, 175))
+                        (Color32::TRANSPARENT, palette.icon_fg)
                     } else {
-                        (Color32::TRANSPARENT, Color32::from_rgb(125, 125, 125))
+                        (Color32::TRANSPARENT, palette.text_muted)
                     };
 
                     if btn_bg != Color32::TRANSPARENT {
@@ -279,7 +289,7 @@ pub fn render_tab_bar(
                     ui.painter().rect_stroke(
                         hover_frame,
                         Theme::TAB_RADIUS,
-                        Stroke::new(1.0_f32, Theme::BORDER_SUBTLE),
+                        Stroke::new(1.0_f32, palette.border_subtle),
                         StrokeKind::Inside,
                     );
                 }
@@ -316,15 +326,15 @@ pub fn render_tab_bar(
         let plus_hovered = plus_resp.hovered();
         if plus_hovered {
             ui.painter()
-                .rect_filled(plus_rect, Theme::RADIUS, Theme::BG_PANEL_HOVER);
+                .rect_filled(plus_rect, Theme::RADIUS, palette.bg_panel_hover);
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         }
         let plus_center = plus_rect.center();
         let plus_half = 4.5_f32;
         let plus_col = if plus_hovered {
-            Color32::WHITE
+            palette.icon_fg_hover
         } else {
-            Theme::TEXT_SECONDARY
+            palette.text_secondary
         };
         let plus_stroke = Stroke::new(1.4_f32, plus_col);
         ui.painter().line_segment(
@@ -380,7 +390,7 @@ pub fn render_tab_bar(
                 if close_hovered {
                     Color32::WHITE
                 } else {
-                    Theme::TEXT_SECONDARY
+                    palette.text_secondary
                 },
             );
             ui.painter().line_segment(
@@ -408,15 +418,15 @@ pub fn render_tab_bar(
             let max_hovered = max_resp.hovered();
             if max_hovered {
                 ui.painter()
-                    .rect_filled(max_rect, CornerRadius::ZERO, Theme::BG_PANEL_HOVER);
+                    .rect_filled(max_rect, CornerRadius::ZERO, palette.bg_panel_hover);
             }
             let m_center = max_rect.center();
             let m_stroke = Stroke::new(
                 1.1_f32,
                 if max_hovered {
-                    Color32::WHITE
+                    palette.icon_fg_hover
                 } else {
-                    Theme::TEXT_SECONDARY
+                    palette.text_secondary
                 },
             );
 
@@ -435,9 +445,9 @@ pub fn render_tab_bar(
                     Vec2::new(7.5, 7.5),
                 );
                 let fill = if max_hovered {
-                    Theme::BG_PANEL_HOVER
+                    palette.bg_panel_hover
                 } else {
-                    Theme::BG_PANEL
+                    palette.bg_panel
                 };
                 ui.painter().rect_filled(front_sq, CornerRadius::ZERO, fill);
                 ui.painter().rect_stroke(
@@ -464,15 +474,15 @@ pub fn render_tab_bar(
             let min_hovered = min_resp.hovered();
             if min_hovered {
                 ui.painter()
-                    .rect_filled(min_rect, CornerRadius::ZERO, Theme::BG_PANEL_HOVER);
+                    .rect_filled(min_rect, CornerRadius::ZERO, palette.bg_panel_hover);
             }
             let min_center = min_rect.center();
             let min_stroke = Stroke::new(
                 1.2_f32,
                 if min_hovered {
-                    Color32::WHITE
+                    palette.icon_fg_hover
                 } else {
-                    Theme::TEXT_SECONDARY
+                    palette.text_secondary
                 },
             );
             ui.painter().line_segment(
@@ -495,16 +505,16 @@ pub fn render_tab_bar(
             let chev_hovered = chev_resp.hovered();
             if chev_hovered {
                 ui.painter()
-                    .rect_filled(chev_rect, Theme::RADIUS, Theme::BG_PANEL_HOVER);
+                    .rect_filled(chev_rect, Theme::RADIUS, palette.bg_panel_hover);
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
             }
             let chev_center = chev_rect.center();
             let chev_stroke = Stroke::new(
                 1.3_f32,
                 if chev_hovered {
-                    Color32::WHITE
+                    palette.icon_fg_hover
                 } else {
-                    Theme::TEXT_SECONDARY
+                    palette.text_secondary
                 },
             );
             if path_bar_collapsed {

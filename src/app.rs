@@ -308,8 +308,20 @@ pub struct PdfViewApp {
 }
 
 impl PdfViewApp {
+    /// Returns true if dark mode is active for the current context and theme preference.
+    pub fn is_dark_mode(&self, ctx: &egui::Context) -> bool {
+        let theme_pref = if matches!(self.tabs.get(self.active_tab_idx), Some(Tab::Settings)) {
+            self.draft_settings.theme
+        } else {
+            self.settings.theme
+        };
+        theme_pref.is_dark(ctx)
+    }
+
     pub fn new(cc: &eframe::CreationContext<'_>, initial_path: Option<String>) -> Self {
-        crate::ui::theme::Theme::apply(&cc.egui_ctx);
+        let loaded_settings = Settings::load();
+        let initial_is_dark = loaded_settings.theme.is_dark(&cc.egui_ctx);
+        crate::ui::theme::Theme::apply(&cc.egui_ctx, initial_is_dark);
 
         let (tx_cmd, rx_evt) = start_worker(cc.egui_ctx.clone());
 
@@ -335,7 +347,6 @@ impl PdfViewApp {
             }
         }
 
-        let loaded_settings = Settings::load();
         let reading_history = Settings::load_history();
         let mut texture_cache = TextureCache::default();
         texture_cache.set_max_bytes(loaded_settings.cache_size_mb * 1024 * 1024);
@@ -1188,6 +1199,11 @@ impl PdfViewApp {
 
 impl eframe::App for PdfViewApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        let is_dark = self.is_dark_mode(ctx);
+        if ctx.style().visuals.dark_mode != is_dark {
+            crate::ui::theme::Theme::apply(ctx, is_dark);
+        }
+        let palette = crate::ui::theme::Theme::palette(is_dark);
         #[cfg(target_os = "linux")]
         if !self.wayland_gesture_init_attempted {
             self.wayland_gesture_init_attempted = true;
@@ -2126,7 +2142,7 @@ impl eframe::App for PdfViewApp {
             egui::TopBottomPanel::top("top_tabbar")
                 .frame(
                     egui::Frame::side_top_panel(&ctx.style())
-                        .fill(egui::Color32::from_rgb(20, 20, 22))
+                        .fill(palette.tabbar_bg)
                         .inner_margin(egui::Margin::symmetric(6, 2)),
                 )
                 .show(ctx, |ui| {
@@ -2180,6 +2196,7 @@ impl eframe::App for PdfViewApp {
                 egui::TopBottomPanel::top("top_pathbar")
                     .frame(
                         egui::Frame::side_top_panel(&ctx.style())
+                            .fill(palette.bg_panel)
                             .inner_margin(egui::Margin::symmetric(10, 4)),
                     )
                     .show(ctx, |ui| {
@@ -2245,6 +2262,7 @@ impl eframe::App for PdfViewApp {
                         .exact_height(crate::ui::theme::Theme::TOOLBAR_HEIGHT)
                         .frame(
                             egui::Frame::side_top_panel(&ctx.style())
+                                .fill(palette.bg_panel)
                                 .inner_margin(egui::Margin::symmetric(10, 4)),
                         )
                         .show(ctx, |ui| {
@@ -2505,12 +2523,9 @@ impl eframe::App for PdfViewApp {
                     .show(ctx, |ui| {
                         avail_w = ui.available_width();
                         egui::Frame::NONE
-                            .fill(egui::Color32::from_rgb(28, 28, 30))
+                            .fill(palette.card_bg)
                             .corner_radius(crate::ui::theme::Theme::RADIUS)
-                            .stroke(egui::Stroke::new(
-                                1.0_f32,
-                                egui::Color32::from_rgb(55, 55, 60),
-                            ))
+                            .stroke(egui::Stroke::new(1.0_f32, palette.card_border))
                             .inner_margin(egui::Margin::symmetric(12, 6))
                             .show(ui, |ui| {
                                 ui.set_width(400.0);
@@ -2613,7 +2628,7 @@ impl eframe::App for PdfViewApp {
                 egui::TopBottomPanel::bottom("debug_panel")
                     .frame(
                         egui::Frame::side_top_panel(&ctx.style())
-                            .fill(egui::Color32::from_rgb(20, 20, 20))
+                            .fill(palette.tabbar_bg)
                             .inner_margin(egui::Margin::symmetric(10, 4)),
                     )
                     .show(ctx, |ui| {
@@ -2634,9 +2649,14 @@ impl eframe::App for PdfViewApp {
                         let cpu_disp = self.metrics.cpu_percent;
                         let rss_disp = self.metrics.rss_mb;
 
+                        let debug_col = if is_dark {
+                            egui::Color32::from_rgb(0, 255, 128)
+                        } else {
+                            egui::Color32::from_rgb(0, 130, 60)
+                        };
                         ui.horizontal(|ui| {
                             ui.colored_label(
-                                egui::Color32::from_rgb(0, 255, 128),
+                                debug_col,
                                 format!(
                                     "F3 Debug | CPU: {:.1}% | RAM (RSS): {:.1} MB | Cache: {:.2} MB / {:.0} MB ({} cached) | Frame: {:.1} ms ({:.0} FPS) | Zoom: {:.0}% | Rot: {}° | Tabs: {}",
                                     cpu_disp,
@@ -2693,8 +2713,7 @@ impl eframe::App for PdfViewApp {
                 let _panel_res = side_panel.show(ctx, |ui| {
                     let panel_rect = ui.max_rect();
                     // Draw panel background strictly within panel_rect
-                    ui.painter()
-                        .rect_filled(panel_rect, 0.0, egui::Color32::from_rgb(26, 26, 28));
+                    ui.painter().rect_filled(panel_rect, 0.0, palette.bg_panel);
 
                     ui.set_clip_rect(panel_rect);
 
@@ -2732,7 +2751,7 @@ impl eframe::App for PdfViewApp {
                         } else if handle_resp.hovered() {
                             (egui::Color32::from_rgb(90, 160, 240), 2.0_f32)
                         } else {
-                            (egui::Color32::from_rgb(45, 45, 48), 1.0_f32)
+                            (palette.card_border, 1.0_f32)
                         };
                         ui.painter().line_segment(
                             [panel_rect.right_top(), panel_rect.right_bottom()],
@@ -2749,7 +2768,7 @@ impl eframe::App for PdfViewApp {
                     } else {
                         ui.painter().line_segment(
                             [panel_rect.right_top(), panel_rect.right_bottom()],
-                            egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(45, 45, 48)),
+                            egui::Stroke::new(1.0_f32, palette.card_border),
                         );
                     }
                 });
@@ -2803,12 +2822,9 @@ impl eframe::App for PdfViewApp {
                         .anchor(egui::Align2::LEFT_CENTER, egui::vec2(12.0, 0.0))
                         .show(ctx, |ui| {
                             let frame_res = egui::Frame::NONE
-                                .fill(egui::Color32::from_rgb(26, 26, 28))
+                                .fill(palette.bg_panel)
                                 .corner_radius(crate::ui::theme::Theme::RADIUS)
-                                .stroke(egui::Stroke::new(
-                                    1.0_f32,
-                                    egui::Color32::from_rgb(55, 55, 60),
-                                ))
+                                .stroke(egui::Stroke::new(1.0_f32, palette.card_border))
                                 .inner_margin(egui::Margin::symmetric(10, 12))
                                 .show(ui, |ui| {
                                     ui.spacing_mut().item_spacing = egui::vec2(0.0, 8.0);
@@ -2933,7 +2949,7 @@ impl eframe::App for PdfViewApp {
                                         ui.label(
                                             egui::RichText::new(format!("/ {total_pages}"))
                                                 .size(11.5)
-                                                .color(crate::ui::theme::Theme::TEXT_MUTED),
+                                                .color(palette.text_muted),
                                         );
                                     });
                                 });
@@ -2993,40 +3009,41 @@ impl eframe::App for PdfViewApp {
         }
 
         // Main Central Panel
-        egui::CentralPanel::default().show(ctx, |ui| {
-            let central_rect = ui.max_rect();
-            let pointer_clicked =
-                ui.input(|i| i.pointer.primary_clicked() || i.pointer.secondary_clicked());
-            if pointer_clicked {
-                if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
-                    if central_rect.contains(pos) {
-                        if let Some(tab) = self.active_pdf_tab_mut() {
-                            if tab.sidebar_open {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE.fill(palette.bg_canvas))
+            .show(ctx, |ui| {
+                let central_rect = ui.max_rect();
+                let pointer_clicked =
+                    ui.input(|i| i.pointer.primary_clicked() || i.pointer.secondary_clicked());
+                if pointer_clicked {
+                    if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
+                        if central_rect.contains(pos) {
+                            if let Some(tab) = self.active_pdf_tab_mut() {
                                 tab.sidebar_open = false;
                             }
                         }
                     }
                 }
-            }
 
-            match &self.pdfium_status {
-            PdfiumStatus::Initializing => {
-                ui.vertical_centered(|ui| {
-                    ui.add_space(80.0);
-                    ui.heading("Initializing Pdfium engine...");
-                    ui.add_space(10.0);
-                    ui.spinner();
-                });
-            }
-            PdfiumStatus::Error(err) => {
-                ui.vertical_centered(|ui| {
-                    ui.add_space(60.0);
-                    ui.heading(
-                        egui::RichText::new("Pdfium Not Available").color(egui::Color32::LIGHT_RED),
-                    );
-                    ui.add_space(12.0);
-                    egui::Frame::group(ui.style())
-                        .fill(egui::Color32::from_rgb(30, 30, 30))
+                match &self.pdfium_status {
+                PdfiumStatus::Initializing => {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(80.0);
+                        ui.heading("Initializing Pdfium engine...");
+                        ui.add_space(10.0);
+                        ui.spinner();
+                    });
+                }
+                PdfiumStatus::Error(err) => {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(60.0);
+                        ui.heading(
+                            egui::RichText::new("Pdfium Not Available").color(egui::Color32::LIGHT_RED),
+                        );
+                        ui.add_space(12.0);
+                        egui::Frame::group(ui.style())
+                            .fill(palette.card_bg)
+                            .stroke(egui::Stroke::new(1.0_f32, palette.card_border))
                         .show(ui, |ui| {
                             ui.set_max_width(650.0);
                             ui.label(egui::RichText::new(err).monospace());
@@ -3126,7 +3143,7 @@ impl eframe::App for PdfViewApp {
                                 egui::RichText::new(
                                     "Open a PDF document or press Ctrl+L to enter a file path.",
                                 )
-                                .color(egui::Color32::from_rgb(170, 170, 175))
+                                .color(palette.text_muted)
                                 .size(14.0),
                             );
                             ui.add_space(20.0);
@@ -3351,37 +3368,130 @@ impl eframe::App for PdfViewApp {
                                 ui.add_space(4.0);
                                 ui.label(
                                     egui::RichText::new(
-                                        "Customize scroll sensitivity, default annotations, and memory cache budget.",
+                                        "Customize appearance, scroll sensitivity, default annotations, and memory cache budget.",
                                     )
-                                    .color(egui::Color32::from_rgb(160, 160, 165))
+                                    .color(palette.text_muted)
                                     .size(12.5),
                                 );
                                 ui.add_space(16.0);
 
                                 // Customize visuals so the slider groove line/track behind the thumb is prominently visible
                                 let mut slider_style = (*ui.ctx().style()).clone();
-                                slider_style.visuals.widgets.inactive.bg_fill =
-                                    egui::Color32::from_rgb(45, 45, 52);
-                                slider_style.visuals.widgets.inactive.bg_stroke =
-                                    egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(85, 85, 95));
-                                slider_style.visuals.widgets.hovered.bg_fill =
-                                    egui::Color32::from_rgb(55, 55, 64);
-                                slider_style.visuals.widgets.hovered.bg_stroke =
-                                    egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(115, 115, 130));
-                                slider_style.visuals.widgets.active.bg_fill =
-                                    egui::Color32::from_rgb(60, 60, 72);
-                                slider_style.visuals.widgets.active.bg_stroke =
-                                    egui::Stroke::new(1.5_f32, crate::ui::theme::Theme::TAB_INDICATOR);
+                                if is_dark {
+                                    slider_style.visuals.widgets.inactive.bg_fill =
+                                        egui::Color32::from_rgb(45, 45, 52);
+                                    slider_style.visuals.widgets.inactive.bg_stroke =
+                                        egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(85, 85, 95));
+                                    slider_style.visuals.widgets.hovered.bg_fill =
+                                        egui::Color32::from_rgb(55, 55, 64);
+                                    slider_style.visuals.widgets.hovered.bg_stroke =
+                                        egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(115, 115, 130));
+                                    slider_style.visuals.widgets.active.bg_fill =
+                                        egui::Color32::from_rgb(60, 60, 72);
+                                    slider_style.visuals.widgets.active.bg_stroke =
+                                        egui::Stroke::new(1.5_f32, crate::ui::theme::Theme::TAB_INDICATOR);
+                                } else {
+                                    slider_style.visuals.widgets.inactive.bg_fill =
+                                        egui::Color32::from_rgb(220, 224, 230);
+                                    slider_style.visuals.widgets.inactive.bg_stroke =
+                                        egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(190, 195, 205));
+                                    slider_style.visuals.widgets.hovered.bg_fill =
+                                        egui::Color32::from_rgb(210, 215, 222);
+                                    slider_style.visuals.widgets.hovered.bg_stroke =
+                                        egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(160, 168, 180));
+                                    slider_style.visuals.widgets.active.bg_fill =
+                                        egui::Color32::from_rgb(200, 205, 215);
+                                    slider_style.visuals.widgets.active.bg_stroke =
+                                        egui::Stroke::new(1.5_f32, crate::ui::theme::Theme::TAB_INDICATOR);
+                                }
                                 ui.set_style(slider_style);
 
                                 let card_w = 580.0;
 
-                                // Section 1: Scrolling & Touchpad
+                                // Section 1: Appearance & Theme
                                 egui::Frame::NONE
-                                    .fill(egui::Color32::from_rgb(28, 28, 30))
+                                    .fill(palette.card_bg)
                                     .stroke(egui::Stroke::new(
                                         1.0_f32,
-                                        egui::Color32::from_rgb(48, 48, 52),
+                                        palette.card_border,
+                                    ))
+                                    .corner_radius(crate::ui::theme::Theme::RADIUS)
+                                    .inner_margin(egui::Margin::symmetric(20, 16))
+                                    .show(ui, |ui| {
+                                        ui.set_width(card_w);
+                                        ui.label(
+                                            egui::RichText::new("Appearance & Theme")
+                                                .strong()
+                                                .size(14.0),
+                                        );
+                                        ui.add_space(10.0);
+                                        ui.horizontal(|ui| {
+                                            ui.label("Application theme:");
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    let themes = [
+                                                        (crate::settings::ThemePreference::System, "💻 System"),
+                                                        (crate::settings::ThemePreference::Light, "☀️ Light"),
+                                                        (crate::settings::ThemePreference::Dark, "🌙 Dark"),
+                                                    ];
+                                                    for (theme_opt, label) in themes {
+                                                        let is_selected = self.draft_settings.theme == theme_opt;
+                                                        let (btn_fill, stroke_col, text_col) = if is_selected {
+                                                            if is_dark {
+                                                                (
+                                                                    egui::Color32::from_rgb(0, 100, 185),
+                                                                    egui::Color32::from_rgb(0, 125, 230),
+                                                                    egui::Color32::WHITE,
+                                                                )
+                                                            } else {
+                                                                (
+                                                                    egui::Color32::from_rgb(220, 235, 255),
+                                                                    egui::Color32::from_rgb(0, 106, 220),
+                                                                    egui::Color32::from_rgb(0, 85, 180),
+                                                                )
+                                                            }
+                                                        } else {
+                                                            (
+                                                                egui::Color32::TRANSPARENT,
+                                                                palette.card_border,
+                                                                palette.text_secondary,
+                                                            )
+                                                        };
+
+                                                        let btn = egui::Button::new(
+                                                            egui::RichText::new(label)
+                                                                .size(13.0)
+                                                                .color(text_col)
+                                                                .strong(),
+                                                        )
+                                                        .fill(btn_fill)
+                                                        .stroke(egui::Stroke::new(1.0_f32, stroke_col))
+                                                        .corner_radius(crate::ui::theme::Theme::RADIUS)
+                                                        .min_size(egui::vec2(88.0, 30.0));
+
+                                                        if ui
+                                                            .add(btn)
+                                                            .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                                            .clicked()
+                                                        {
+                                                            self.draft_settings.theme = theme_opt;
+                                                            ctx.request_repaint();
+                                                        }
+                                                    }
+                                                },
+                                            );
+                                        });
+                                    });
+
+                                ui.add_space(14.0);
+
+                                // Section 2: Scrolling & Touchpad
+                                egui::Frame::NONE
+                                    .fill(palette.card_bg)
+                                    .stroke(egui::Stroke::new(
+                                        1.0_f32,
+                                        palette.card_border,
                                     ))
                                     .corner_radius(crate::ui::theme::Theme::RADIUS)
                                     .inner_margin(egui::Margin::symmetric(20, 16))
@@ -3430,12 +3540,12 @@ impl eframe::App for PdfViewApp {
 
                                 ui.add_space(14.0);
 
-                                // Section 2: Default Annotations
+                                // Section 3: Default Annotations
                                 egui::Frame::NONE
-                                    .fill(egui::Color32::from_rgb(28, 28, 30))
+                                    .fill(palette.card_bg)
                                     .stroke(egui::Stroke::new(
                                         1.0_f32,
-                                        egui::Color32::from_rgb(48, 48, 52),
+                                        palette.card_border,
                                     ))
                                     .corner_radius(crate::ui::theme::Theme::RADIUS)
                                     .inner_margin(egui::Margin::symmetric(20, 16))
@@ -3480,10 +3590,11 @@ impl eframe::App for PdfViewApp {
                                                         let fill = egui::Color32::from_rgb(color.r, color.g, color.b);
                                                         ui.painter().rect_filled(rect, egui::CornerRadius::same(4), fill);
                                                         if is_sel {
+                                                            let stroke_col = if is_dark { egui::Color32::WHITE } else { egui::Color32::BLACK };
                                                             ui.painter().rect_stroke(
                                                                 rect,
                                                                 egui::CornerRadius::same(4),
-                                                                egui::Stroke::new(2.0_f32, egui::Color32::WHITE),
+                                                                egui::Stroke::new(2.0_f32, stroke_col),
                                                                 egui::StrokeKind::Outside,
                                                             );
                                                         }
@@ -3514,12 +3625,12 @@ impl eframe::App for PdfViewApp {
 
                                 ui.add_space(14.0);
 
-                                // Section 3: Performance & Memory Cache
+                                // Section 4: Performance & Memory Cache
                                 egui::Frame::NONE
-                                    .fill(egui::Color32::from_rgb(28, 28, 30))
+                                    .fill(palette.card_bg)
                                     .stroke(egui::Stroke::new(
                                         1.0_f32,
-                                        egui::Color32::from_rgb(48, 48, 52),
+                                        palette.card_border,
                                     ))
                                     .corner_radius(crate::ui::theme::Theme::RADIUS)
                                     .inner_margin(egui::Margin::symmetric(20, 16))
@@ -3578,12 +3689,12 @@ impl eframe::App for PdfViewApp {
 
                                 ui.add_space(14.0);
 
-                                // Section 4: Startup & Session
+                                // Section 5: Startup & Session
                                 egui::Frame::NONE
-                                    .fill(egui::Color32::from_rgb(28, 28, 30))
+                                    .fill(palette.card_bg)
                                     .stroke(egui::Stroke::new(
                                         1.0_f32,
-                                        egui::Color32::from_rgb(48, 48, 52),
+                                        palette.card_border,
                                     ))
                                     .corner_radius(crate::ui::theme::Theme::RADIUS)
                                     .inner_margin(egui::Margin::symmetric(20, 16))
@@ -3662,12 +3773,12 @@ impl eframe::App for PdfViewApp {
 
                                 ui.add_space(14.0);
 
-                                // Section 5: About Verso Reader
+                                // Section 6: About Verso Reader
                                 egui::Frame::NONE
-                                    .fill(egui::Color32::from_rgb(28, 28, 30))
+                                    .fill(palette.card_bg)
                                     .stroke(egui::Stroke::new(
                                         1.0_f32,
-                                        egui::Color32::from_rgb(48, 48, 52),
+                                        palette.card_border,
                                     ))
                                     .corner_radius(crate::ui::theme::Theme::RADIUS)
                                     .inner_margin(egui::Margin::symmetric(20, 16))
@@ -3684,7 +3795,7 @@ impl eframe::App for PdfViewApp {
                                                 egui::RichText::new(
                                                     "Verso Reader 2.0.0 ",
                                                 )
-                                                .color(egui::Color32::from_rgb(170, 170, 175))
+                                                .color(palette.text_secondary)
                                                 .size(12.0),
                                             );
                                             ui.with_layout(
@@ -3734,10 +3845,15 @@ impl eframe::App for PdfViewApp {
 
                                     if let Some(t) = self.settings_saved_toast {
                                         if t.elapsed() < Duration::from_secs(3) {
+                                            let toast_col = if is_dark {
+                                                egui::Color32::from_rgb(0, 220, 130)
+                                            } else {
+                                                egui::Color32::from_rgb(0, 140, 70)
+                                            };
                                             ui.add_space(8.0);
                                             ui.label(
                                                 egui::RichText::new("Preferences saved successfully!")
-                                                    .color(egui::Color32::from_rgb(0, 220, 130))
+                                                    .color(toast_col)
                                                     .size(13.0),
                                             );
                                         } else {
@@ -3778,23 +3894,21 @@ impl eframe::App for PdfViewApp {
             let mut do_save = false;
             let mut do_discard = false;
 
+            let shadow_alpha = if is_dark { 150 } else { 45 };
             let modal_frame = egui::Frame::NONE
-                .fill(egui::Color32::from_rgb(34, 34, 38))
+                .fill(palette.card_bg)
                 .corner_radius(egui::CornerRadius::same(10))
-                .stroke(egui::Stroke::new(
-                    1.0_f32,
-                    egui::Color32::from_rgb(58, 58, 66),
-                ))
+                .stroke(egui::Stroke::new(1.0_f32, palette.card_border))
                 .shadow(egui::epaint::Shadow {
                     offset: [0, 8],
                     blur: 24,
                     spread: 0,
-                    color: egui::Color32::from_black_alpha(150),
+                    color: egui::Color32::from_black_alpha(shadow_alpha),
                 })
                 .inner_margin(egui::Margin::symmetric(24, 20));
 
             egui::Modal::new(egui::Id::new("unsaved_changes_confirm_modal"))
-                .backdrop_color(egui::Color32::from_black_alpha(175))
+                .backdrop_color(egui::Color32::from_black_alpha(if is_dark { 175 } else { 100 }))
                 .frame(modal_frame)
                 .show(ctx, |ui| {
                     ui.set_width(450.0);
@@ -3810,11 +3924,24 @@ impl eframe::App for PdfViewApp {
                                 egui::vec2(40.0, 40.0),
                                 egui::Sense::hover(),
                             );
+                            let (badge_bg, badge_stroke, badge_fg) = if is_dark {
+                                (
+                                    egui::Color32::from_rgb(46, 36, 18),
+                                    egui::Color32::from_rgb(215, 140, 20),
+                                    egui::Color32::from_rgb(255, 185, 55),
+                                )
+                            } else {
+                                (
+                                    egui::Color32::from_rgb(254, 243, 225),
+                                    egui::Color32::from_rgb(220, 130, 0),
+                                    egui::Color32::from_rgb(180, 95, 0),
+                                )
+                            };
                             ui.painter().rect(
                                 badge_rect,
                                 egui::CornerRadius::same(8),
-                                egui::Color32::from_rgb(46, 36, 18),
-                                egui::Stroke::new(1.2_f32, egui::Color32::from_rgb(215, 140, 20)),
+                                badge_bg,
+                                egui::Stroke::new(1.2_f32, badge_stroke),
                                 egui::StrokeKind::Inside,
                             );
                             ui.painter().text(
@@ -3822,7 +3949,7 @@ impl eframe::App for PdfViewApp {
                                 egui::Align2::CENTER_CENTER,
                                 "!",
                                 egui::FontId::proportional(22.0),
-                                egui::Color32::from_rgb(255, 185, 55),
+                                badge_fg,
                             );
 
                             ui.vertical(|ui| {
@@ -3830,7 +3957,7 @@ impl eframe::App for PdfViewApp {
                                     egui::RichText::new("Save changes?")
                                         .strong()
                                         .size(17.0)
-                                        .color(egui::Color32::WHITE),
+                                        .color(palette.text_primary),
                                 );
                                 ui.add_space(2.0);
                                 ui.label(
@@ -3838,7 +3965,7 @@ impl eframe::App for PdfViewApp {
                                         "Unsaved annotations and edits will be lost.",
                                     )
                                     .size(12.5)
-                                    .color(egui::Color32::from_rgb(160, 160, 168)),
+                                    .color(palette.text_muted),
                                 );
                             });
                         });
@@ -3847,11 +3974,11 @@ impl eframe::App for PdfViewApp {
 
                         // 2. Document file callout container
                         let callout_frame = egui::Frame::NONE
-                            .fill(egui::Color32::from_rgb(25, 25, 28))
+                            .fill(palette.bg_surface)
                             .corner_radius(egui::CornerRadius::same(6))
                             .stroke(egui::Stroke::new(
                                 1.0_f32,
-                                egui::Color32::from_rgb(48, 48, 54),
+                                palette.card_border,
                             ))
                             .inner_margin(egui::Margin::symmetric(14, 10));
 
@@ -3889,7 +4016,7 @@ impl eframe::App for PdfViewApp {
                                     egui::RichText::new(doc_title)
                                         .strong()
                                         .size(13.0)
-                                        .color(egui::Color32::from_rgb(230, 230, 235)),
+                                        .color(palette.text_primary),
                                 );
                             });
                         });
@@ -3900,7 +4027,7 @@ impl eframe::App for PdfViewApp {
                                 "Do you want to save the changes you made to this document before closing?",
                             )
                             .size(13.0)
-                            .color(egui::Color32::from_rgb(180, 180, 188)),
+                            .color(palette.text_secondary),
                         );
 
                         ui.add_space(8.0);
@@ -3911,7 +4038,7 @@ impl eframe::App for PdfViewApp {
                             egui::Sense::hover(),
                         );
                         ui.painter()
-                            .rect_filled(sep_rect, 0.0, egui::Color32::from_rgb(50, 50, 56));
+                            .rect_filled(sep_rect, 0.0, palette.card_border);
 
                         ui.add_space(6.0);
 
@@ -4036,13 +4163,13 @@ impl eframe::App for PdfViewApp {
         if self.show_about_modal {
             let mut close_about = false;
             egui::Modal::new(egui::Id::new("verso_about_modal"))
-                .backdrop_color(egui::Color32::from_black_alpha(175))
+                .backdrop_color(egui::Color32::from_black_alpha(if is_dark { 175 } else { 100 }))
                 .show(ctx, |ui| {
                     ui.set_width(430.0);
 
                     egui::Frame::NONE
-                        .fill(egui::Color32::from_rgb(26, 26, 28))
-                        .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(50, 50, 56)))
+                        .fill(palette.card_bg)
+                        .stroke(egui::Stroke::new(1.0_f32, palette.card_border))
                         .corner_radius(crate::ui::theme::Theme::RADIUS)
                         .inner_margin(egui::Margin::symmetric(22, 18))
                         .show(ui, |ui| {
@@ -4061,13 +4188,13 @@ impl eframe::App for PdfViewApp {
                                         egui::RichText::new("Verso Reader")
                                             .strong()
                                             .size(19.0)
-                                            .color(egui::Color32::WHITE),
+                                            .color(palette.text_primary),
                                     );
                                     ui.label(
                                         egui::RichText::new(
                                             "Version 2.0.0 • Fast, Minimalist PDF Reader",
                                         )
-                                        .color(egui::Color32::from_rgb(160, 160, 168))
+                                        .color(palette.text_muted)
                                         .size(12.0),
                                     );
                                 });
@@ -4098,17 +4225,17 @@ impl eframe::App for PdfViewApp {
                                     "Verso Reader is a high-performance desktop PDF reader for Ubuntu written in Rust, delivering an Edge-inspired experience with instantaneous rendering and low memory footprint.",
                                 )
                                 .size(12.5)
-                                .color(egui::Color32::from_rgb(210, 210, 215)),
+                                .color(palette.text_secondary),
                             );
 
                             ui.add_space(6.0);
 
                             // Structured Info Card
                             egui::Frame::NONE
-                                .fill(egui::Color32::from_rgb(33, 33, 36))
+                                .fill(palette.bg_surface)
                                 .stroke(egui::Stroke::new(
                                     1.0_f32,
-                                    egui::Color32::from_rgb(46, 46, 52),
+                                    palette.card_border,
                                 ))
                                 .corner_radius(crate::ui::theme::Theme::RADIUS)
                                 .inner_margin(egui::Margin::symmetric(14, 12))
@@ -4121,13 +4248,13 @@ impl eframe::App for PdfViewApp {
                                                 egui::RichText::new(key)
                                                     .strong()
                                                     .size(12.5)
-                                                    .color(egui::Color32::from_rgb(150, 150, 155)),
+                                                    .color(palette.text_muted),
                                             );
                                             ui.add_space(8.0);
                                             ui.label(
                                                 egui::RichText::new(val)
                                                     .size(12.5)
-                                                    .color(egui::Color32::from_rgb(230, 230, 235)),
+                                                    .color(palette.text_primary),
                                             );
                                         });
                                     };
@@ -5142,5 +5269,78 @@ mod tests {
     fn test_bengali_font_fallback_registered() {
         let ctx = egui::Context::default();
         crate::setup_custom_fonts(&ctx);
+    }
+
+    #[test]
+    fn test_is_dark_mode_live_preview() {
+        let (tx_cmd, _rx_cmd) = crossbeam_channel::unbounded();
+        let (_, rx_evt) = crossbeam_channel::unbounded();
+        let mut app = PdfViewApp {
+            tx_cmd,
+            rx_evt,
+            pdfium_status: PdfiumStatus::Ready,
+            tabs: Vec::new(),
+            active_tab_idx: 0,
+            next_doc_id: 1,
+            pending_close_confirm: None,
+            path_bar: PathBar::new(),
+            toolbar: Toolbar::new(),
+            is_fullscreen: false,
+            pending_open_path: None,
+            rx_file_chooser: None,
+            cache: TextureCache::default(),
+            text_cache: PageTextCache::default(),
+            pending_render_requests: HashSet::new(),
+            render_generation: 0,
+            debug_visible: false,
+            last_frame_time: Instant::now(),
+            frame_time_ms: 16.0,
+            metrics: SystemMetrics::default(),
+            #[cfg(target_os = "linux")]
+            rx_pinch_gesture: None,
+            #[cfg(target_os = "linux")]
+            wayland_gesture_init_attempted: false,
+            pinch_active: false,
+            pinch_last_active: None,
+            last_scroll_unit: None,
+            last_window_title: "Verso Reader".to_string(),
+            draft_settings: Settings::default(),
+            settings: Settings::default(),
+            reading_history: crate::settings::ReadingHistory::default(),
+            last_session_save: None,
+            session_restored: true,
+            settings_saved_toast: None,
+            show_about_modal: false,
+            fullscreen_quickbar_open: false,
+            fullscreen_page_input: "1".to_string(),
+            fullscreen_is_editing_page: false,
+            #[cfg(unix)]
+            _ipc_server: None,
+            #[cfg(unix)]
+            rx_ipc: None,
+        };
+
+        let ctx = egui::Context::default();
+
+        // Default setting is Dark
+        app.settings.theme = crate::settings::ThemePreference::Dark;
+        assert!(app.is_dark_mode(&ctx));
+
+        // When switching to Light setting
+        app.settings.theme = crate::settings::ThemePreference::Light;
+        assert!(!app.is_dark_mode(&ctx));
+
+        // On Settings tab, draft_settings takes priority for live preview
+        app.tabs.push(Tab::Settings);
+        app.active_tab_idx = app.tabs.len() - 1;
+        app.settings.theme = crate::settings::ThemePreference::Dark;
+        app.draft_settings.theme = crate::settings::ThemePreference::Light;
+        assert!(
+            !app.is_dark_mode(&ctx),
+            "Live preview on Settings tab must reflect draft_settings"
+        );
+
+        app.draft_settings.theme = crate::settings::ThemePreference::Dark;
+        assert!(app.is_dark_mode(&ctx));
     }
 }
