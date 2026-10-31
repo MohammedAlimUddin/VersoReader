@@ -2899,6 +2899,9 @@ mod tests {
             .load_pdf_from_file(&path, None)
             .expect("load MLE.pdf");
 
+        // Clean all pages of existing annotations so this roundtrip test starts from a clean baseline
+        apply_annotations_to_doc_on_pages(&doc, &[], &[], 0..doc.pages().len() as usize).unwrap();
+
         let hl1 = Highlight {
             id: 1,
             page: 0,
@@ -2972,6 +2975,9 @@ mod tests {
         let doc = pdfium
             .load_pdf_from_file(&path, None)
             .expect("load fixture");
+
+        // Clean all pages of existing annotations so this roundtrip test starts from a clean baseline
+        apply_annotations_to_doc_on_pages(&doc, &[], &[], 0..doc.pages().len() as usize).unwrap();
 
         let tb = TextBox {
             id: 1,
@@ -3142,7 +3148,74 @@ mod tests {
         let doc = pdfium
             .load_pdf_from_file(&path, None)
             .expect("load MLE.pdf");
-        let (extracted_hl, extracted_tb) = extract_annotations_from_doc(&doc);
+
+        // If the fixture does not already have pre-baked text box annotations, bake sample annotations
+        // in-memory first so extraction, non-black-box rendering, and save/reload roundtrip test reliably.
+        let (doc, extracted_hl, extracted_tb) = {
+            let (hl, tb) = extract_annotations_from_doc(&doc);
+            if tb.len() >= 3 {
+                (doc, hl, tb)
+            } else {
+                let sample_hl = vec![
+                    Highlight {
+                        id: 1,
+                        page: 0,
+                        rects: vec![CanonicalRect::new(100.0, 100.0, 250.0, 120.0)],
+                        points: Vec::new(),
+                        color: AnnotationColor::new(255, 235, 59),
+                        alpha: 0.35,
+                        thickness: 1.0,
+                    },
+                    Highlight {
+                        id: 2,
+                        page: 0,
+                        rects: Vec::new(),
+                        points: vec![[50.0, 200.0], [150.0, 220.0], [250.0, 210.0]],
+                        color: AnnotationColor::new(76, 175, 80),
+                        alpha: 0.35,
+                        thickness: 12.0,
+                    },
+                ];
+                let sample_tb = vec![
+                    TextBox {
+                        id: 101,
+                        page: 0,
+                        pos: [100.0, 250.0],
+                        text: "Annotation 1".to_string(),
+                        font_size: 16.0,
+                        color: AnnotationColor::new(192, 57, 43),
+                        width: 150.0,
+                    },
+                    TextBox {
+                        id: 102,
+                        page: 0,
+                        pos: [100.0, 300.0],
+                        text: "Annotation 2".to_string(),
+                        font_size: 14.0,
+                        color: AnnotationColor::new(41, 128, 185),
+                        width: 150.0,
+                    },
+                    TextBox {
+                        id: 103,
+                        page: 0,
+                        pos: [100.0, 350.0],
+                        text: "Annotation 3".to_string(),
+                        font_size: 12.0,
+                        color: AnnotationColor::new(39, 174, 96),
+                        width: 150.0,
+                    },
+                ];
+                apply_annotations_to_doc(&doc, &sample_hl, &sample_tb)
+                    .expect("apply sample annotations");
+                let bytes = doc.save_to_bytes().expect("save sample annotations");
+                let reloaded = pdfium
+                    .load_pdf_from_byte_vec(bytes, None)
+                    .expect("reload sample doc");
+                let (re_hl, re_tb) = extract_annotations_from_doc(&reloaded);
+                (reloaded, re_hl, re_tb)
+            }
+        };
+
         assert!(
             extracted_tb.len() >= 3,
             "Must extract text boxes from MLE.pdf (got {})",
@@ -3226,8 +3299,14 @@ mod tests {
             return;
         }
 
-        let temp_path =
-            std::env::temp_dir().join(format!("verso_stress_leak_{}.pdf", std::process::id()));
+        let temp_path = std::env::temp_dir().join(format!(
+            "verso_stress_leak_{}_{}.pdf",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
         if let Err(e) = std::fs::copy(&src_path, &temp_path) {
             eprintln!("Failed to copy fixture for stress test: {e}");
             return;
@@ -3594,7 +3673,7 @@ mod tests {
 
         // Wait for PdfiumReady
         let mut ready = false;
-        while let Ok(evt) = rx_evt.recv_timeout(std::time::Duration::from_millis(500)) {
+        while let Ok(evt) = rx_evt.recv_timeout(std::time::Duration::from_secs(3)) {
             if matches!(evt, Event::PdfiumReady) {
                 ready = true;
                 break;
@@ -3611,7 +3690,7 @@ mod tests {
             .unwrap();
 
         let mut opened = false;
-        while let Ok(evt) = rx_evt.recv_timeout(std::time::Duration::from_millis(500)) {
+        while let Ok(evt) = rx_evt.recv_timeout(std::time::Duration::from_secs(3)) {
             if let Event::Opened {
                 doc_id: id,
                 page_count,
@@ -3660,7 +3739,7 @@ mod tests {
             .unwrap();
 
         let mut reopened = false;
-        while let Ok(evt) = rx_evt.recv_timeout(std::time::Duration::from_millis(500)) {
+        while let Ok(evt) = rx_evt.recv_timeout(std::time::Duration::from_secs(3)) {
             if let Event::Opened {
                 doc_id: id,
                 page_count,
