@@ -241,6 +241,8 @@ pub fn render_viewer(
     active_tool: ActiveTool,
     highlighter_color: AnnotationColor,
     highlighter_thickness: f32,
+    pen_color: AnnotationColor,
+    pen_thickness: f32,
     annotations: &mut DocumentAnnotations,
     undo_stack: &mut UndoStack,
     annotations_dirty: &mut bool,
@@ -665,6 +667,10 @@ pub fn render_viewer(
                                         ui.ctx().set_cursor_icon(egui::CursorIcon::Default);
                                         break;
                                     }
+                                    if active_tool == ActiveTool::Pen {
+                                        ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+                                        break;
+                                    }
                                     if active_tool == ActiveTool::Highlighter {
                                         let force_freehand = ui.input(|i| i.modifiers.shift);
                                         let over_text = if !force_freehand {
@@ -718,9 +724,13 @@ pub fn render_viewer(
                                     }
                                 }
                             }
-                            if !cursor_handled && active_tool == ActiveTool::Highlighter {
-                                ui.ctx().set_cursor_icon(egui::CursorIcon::None);
-                                show_highlighter_rect_cursor = Some(pos);
+                            if !cursor_handled {
+                                if active_tool == ActiveTool::Highlighter {
+                                    ui.ctx().set_cursor_icon(egui::CursorIcon::None);
+                                    show_highlighter_rect_cursor = Some(pos);
+                                } else if active_tool == ActiveTool::Pen {
+                                    ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+                                }
                             }
                         }
                     }
@@ -903,6 +913,16 @@ pub fn render_viewer(
                                             break;
                                         }
                                     }
+                                } else if active_tool == ActiveTool::Pen {
+                                    for info in &visible_info {
+                                        if info.screen_rect.contains(pos) {
+                                            let can_pt = info.transform.screen_to_canonical(pos);
+                                            *freehand_stroke =
+                                                Some((info.page, vec![[can_pt.x, can_pt.y]]));
+                                            ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+                                            break;
+                                        }
+                                    }
                                 } else if active_tool == ActiveTool::Highlighter {
                                     for info in &visible_info {
                                         if info.screen_rect.contains(pos) {
@@ -1020,8 +1040,12 @@ pub fn render_viewer(
                                 }
                             }
                         } else if let Some((fh_page, ref mut fh_pts)) = *freehand_stroke {
-                            ui.ctx().set_cursor_icon(egui::CursorIcon::None);
-                            show_highlighter_rect_cursor = Some(pos);
+                            if active_tool == ActiveTool::Pen {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+                            } else {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::None);
+                                show_highlighter_rect_cursor = Some(pos);
+                            }
                             for info in &visible_info {
                                 if info.page == fh_page {
                                     let can_pt = info.transform.screen_to_canonical(pos);
@@ -1119,15 +1143,23 @@ pub fn render_viewer(
                             }
                             if fh_pts.len() >= 2 {
                                 let id = generate_highlight_id();
-                                let stroke_thickness =
-                                    (12.0 * highlighter_thickness).clamp(3.0, 36.0);
+                                let is_pen = active_tool == ActiveTool::Pen;
+                                let (hl_col, hl_alpha, stroke_thickness) = if is_pen {
+                                    (pen_color, 1.0_f32, pen_thickness.clamp(1.0, 36.0))
+                                } else {
+                                    (
+                                        highlighter_color,
+                                        0.42_f32,
+                                        (12.0 * highlighter_thickness).clamp(3.0, 36.0),
+                                    )
+                                };
                                 let hl = Highlight {
                                     id,
                                     page: fh_page,
                                     rects: Vec::new(),
                                     points: fh_pts,
-                                    color: highlighter_color,
-                                    alpha: 0.42,
+                                    color: hl_col,
+                                    alpha: hl_alpha,
                                     thickness: stroke_thickness,
                                 };
                                 annotations.highlights.push(hl.clone());
@@ -1364,9 +1396,9 @@ pub fn render_viewer(
                                 hl.color.r,
                                 hl.color.g,
                                 hl.color.b,
-                                (0.42_f32 * 255.0_f32).round() as u8,
+                                (hl.alpha.clamp(0.0, 1.0) * 255.0_f32).round() as u8,
                             );
-                            let stroke_thickness = (hl.thickness * zoom).max(1.5);
+                            let stroke_thickness = (hl.thickness * zoom).max(1.0);
                             let screen_points: Vec<egui::Pos2> = hl
                                 .points
                                 .iter()
@@ -1387,13 +1419,23 @@ pub fn render_viewer(
                 // 2. Draw live freehand stroke preview if currently drawing on this page
                 if let Some((stroke_page, ref stroke_pts)) = *freehand_stroke {
                     if stroke_page == idx && !stroke_pts.is_empty() {
-                        let live_color = Color32::from_rgba_unmultiplied(
-                            highlighter_color.r,
-                            highlighter_color.g,
-                            highlighter_color.b,
-                            (0.42_f32 * 255.0_f32).round() as u8,
-                        );
-                        let stroke_thickness = (12.0 * highlighter_thickness * zoom).max(1.5);
+                        let is_pen = active_tool == ActiveTool::Pen;
+                        let (live_color, stroke_thickness) = if is_pen {
+                            (
+                                Color32::from_rgb(pen_color.r, pen_color.g, pen_color.b),
+                                (pen_thickness * zoom).max(1.0),
+                            )
+                        } else {
+                            (
+                                Color32::from_rgba_unmultiplied(
+                                    highlighter_color.r,
+                                    highlighter_color.g,
+                                    highlighter_color.b,
+                                    (0.42_f32 * 255.0_f32).round() as u8,
+                                ),
+                                (12.0 * highlighter_thickness * zoom).max(1.5),
+                            )
+                        };
                         let screen_points: Vec<egui::Pos2> = stroke_pts
                             .iter()
                             .map(|p| transform.canonical_to_screen(pos2(p[0], p[1])))
@@ -1541,7 +1583,7 @@ pub fn render_viewer(
                             .is_some_and(|(target, ..)| *target == Some(tb.id));
 
                         let font_size_px =
-                            (tb.font_size * zoom * PageTransform::DPI_SCALE).max(8.0);
+                            (tb.font_size * zoom * PageTransform::DPI_SCALE).max(4.0);
                         let text_col = Color32::from_rgb(tb.color.r, tb.color.g, tb.color.b);
                         let screen_pos = transform.canonical_to_screen(pos2(tb.pos[0], tb.pos[1]));
                         let screen_w = (tb.width * zoom * PageTransform::DPI_SCALE).max(40.0);
@@ -1584,7 +1626,7 @@ pub fn render_viewer(
                             transform.canonical_to_screen(pos2(etb.pos[0], etb.pos[1]));
                         let screen_w = (etb.width * zoom * PageTransform::DPI_SCALE).max(40.0);
                         let screen_font_size =
-                            (etb.font_size * zoom * PageTransform::DPI_SCALE).max(10.0);
+                            (etb.font_size * zoom * PageTransform::DPI_SCALE).max(4.0);
                         let text_col = Color32::from_rgb(etb.color.r, etb.color.g, etb.color.b);
                         let galley = painter.layout(
                             if etb.text.is_empty() {

@@ -294,6 +294,47 @@ pub fn paint_highlighter(
     ];
     painter.add(egui::Shape::line(path2_pts, stroke));
 }
+
+/// Paints the Pen tool icon reflecting the active solid ink color (Lucide `pen-line`).
+pub fn paint_pen(painter: &Painter, rect: Rect, stroke_color: Color32, pen_color: Color32) {
+    let map = |x: f32, y: f32| -> Pos2 {
+        pos2(
+            rect.left() + (x / 24.0) * rect.width(),
+            rect.top() + (y / 24.0) * rect.height(),
+        )
+    };
+    let stroke = Stroke::new(1.4_f32, stroke_color);
+
+    // 1. Ink stroke drawn on paper beneath the pen (Lucide: M12 20h9)
+    painter.line_segment(
+        [map(12.0, 21.0), map(21.0, 21.0)],
+        Stroke::new(2.2_f32, pen_color),
+    );
+
+    // 2. Nib polygon filled with active ink color (tapered from collar (6, 15) and (9, 18) to tip at (3, 21))
+    let nib_pts = vec![map(3.0, 21.0), map(6.0, 15.0), map(9.0, 18.0)];
+    painter.add(egui::Shape::convex_polygon(
+        nib_pts.clone(),
+        pen_color,
+        Stroke::NONE,
+    ));
+
+    // 3. Pen body path (barrel, rounded cap, and nib outline)
+    let body_pts = vec![
+        map(6.0, 15.0),
+        map(15.5, 5.5),
+        map(17.2, 3.8),
+        map(19.2, 5.8),
+        map(18.5, 8.5),
+        map(9.0, 18.0),
+        map(3.0, 21.0),
+        map(6.0, 15.0),
+    ];
+    painter.add(egui::Shape::line(body_pts, stroke));
+
+    // 4. Nib collar divider line
+    painter.line_segment([map(6.0, 15.0), map(9.0, 18.0)], stroke);
+}
 /// Paints the Eraser icon (Lucide `eraser`).
 pub fn paint_eraser(painter: &Painter, rect: Rect, stroke_color: Color32, is_active: bool) {
     let map = |x: f32, y: f32| -> Pos2 {

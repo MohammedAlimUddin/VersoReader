@@ -965,6 +965,18 @@ fn safe_extract_annot_color(
     default_color
 }
 
+fn parse_color_from_metadata(s: &str) -> Option<AnnotationColor> {
+    if let Some(idx) = s.find("color=") {
+        let rest = &s[idx + 6..];
+        let mut parts = rest.split(',');
+        let r = parts.next()?.trim().parse::<u8>().ok()?;
+        let g = parts.next()?.trim().parse::<u8>().ok()?;
+        let b = parts.next()?.trim().parse::<u8>().ok()?;
+        return Some(AnnotationColor::new(r, g, b));
+    }
+    None
+}
+
 fn parse_font_size_from_metadata(s: &str) -> Option<f32> {
     if let Some(idx) = s.find("size=") {
         let rest = &s[idx + 5..];
@@ -973,7 +985,7 @@ fn parse_font_size_from_metadata(s: &str) -> Option<f32> {
             .take_while(|c| c.is_ascii_digit() || *c == '.')
             .collect();
         if let Ok(v) = num_str.parse::<f32>() {
-            if (6.0..=120.0).contains(&v) {
+            if (4.0..=120.0).contains(&v) {
                 return Some(v);
             }
         }
@@ -1020,10 +1032,12 @@ fn safe_extract_annot_font_size(
             total_lines = 1.0;
         }
 
-        let line_h = ((box_h - 8.0) / total_lines).max(12.0);
+        let line_h = ((box_h - 8.0) / total_lines).max(6.0);
         let approx_size = line_h / 1.3;
 
-        const PRESETS: [f32; 10] = [10.0, 12.0, 14.0, 16.0, 18.0, 20.0, 24.0, 28.0, 32.0, 36.0];
+        const PRESETS: [f32; 14] = [
+            6.0, 8.0, 9.0, 10.0, 11.0, 12.0, 14.0, 16.0, 18.0, 20.0, 24.0, 28.0, 32.0, 36.0,
+        ];
         let mut best_preset = default_font_size;
         let mut min_diff = f32::MAX;
         for &p in &PRESETS {
@@ -1036,7 +1050,7 @@ fn safe_extract_annot_font_size(
         if min_diff <= 2.5 {
             return best_preset;
         }
-        return approx_size.clamp(8.0, 72.0);
+        return approx_size.clamp(6.0, 72.0);
     }
 
     default_font_size
@@ -1210,7 +1224,10 @@ pub fn rasterize_freehand_highlight(
         }
     }
 
-    // Blend into rgba buffer using ISO 32000 Multiply blend mode
+    // Blend into rgba buffer using ISO 32000 Multiply blend mode for highlighter,
+    // or standard opaque source-over blend for solid pen ink (alpha >= 0.95).
+    let is_solid_ink = hl.alpha >= 0.95;
+
     for by in 0..box_h {
         let py = bb_min_y + by;
         let row_offset = by * box_w;
@@ -1225,14 +1242,20 @@ pub fn rasterize_freehand_highlight(
                     let g_bg = rgba[pixel_idx + 1] as f32;
                     let b_bg = rgba[pixel_idx + 2] as f32;
 
-                    // ISO 32000 Multiply formula: (bg * hl) / 255.0
-                    let r_mult = (r_bg * color_r) / 255.0;
-                    let g_mult = (g_bg * color_g) / 255.0;
-                    let b_mult = (b_bg * color_b) / 255.0;
+                    if is_solid_ink {
+                        rgba[pixel_idx] = ((1.0 - cov) * r_bg + cov * color_r).round() as u8;
+                        rgba[pixel_idx + 1] = ((1.0 - cov) * g_bg + cov * color_g).round() as u8;
+                        rgba[pixel_idx + 2] = ((1.0 - cov) * b_bg + cov * color_b).round() as u8;
+                    } else {
+                        // ISO 32000 Multiply formula: (bg * hl) / 255.0
+                        let r_mult = (r_bg * color_r) / 255.0;
+                        let g_mult = (g_bg * color_g) / 255.0;
+                        let b_mult = (b_bg * color_b) / 255.0;
 
-                    rgba[pixel_idx] = ((1.0 - cov) * r_bg + cov * r_mult).round() as u8;
-                    rgba[pixel_idx + 1] = ((1.0 - cov) * g_bg + cov * g_mult).round() as u8;
-                    rgba[pixel_idx + 2] = ((1.0 - cov) * b_bg + cov * b_mult).round() as u8;
+                        rgba[pixel_idx] = ((1.0 - cov) * r_bg + cov * r_mult).round() as u8;
+                        rgba[pixel_idx + 1] = ((1.0 - cov) * g_bg + cov * g_mult).round() as u8;
+                        rgba[pixel_idx + 2] = ((1.0 - cov) * b_bg + cov * b_mult).round() as u8;
+                    }
                 }
             }
         }
@@ -1363,10 +1386,9 @@ pub fn extract_annotations_from_page(
             let text = annot.contents().unwrap_or_default();
             if !text.is_empty() {
                 let annot_color = annot
-                    .stroke_color()
-                    .or_else(|_| annot.fill_color())
-                    .map(|c| AnnotationColor::new(c.red(), c.green(), c.blue()))
-                    .unwrap_or_else(|_| {
+                    .creator()
+                    .and_then(|c| parse_color_from_metadata(&c))
+                    .unwrap_or_else(|| {
                         if !annot.objects().is_empty() {
                             safe_extract_annot_color(annot.objects(), AnnotationColor::new(0, 0, 0))
                         } else {
@@ -1627,7 +1649,10 @@ pub fn apply_annotations_to_doc_on_pages(
                     let _ = annot.set_is_printed(true);
                     let _ = annot.set_is_zoomable(true);
                     let _ = annot.set_is_rotatable(true);
-                    let _ = annot.set_creator(&format!("VersoReader:size={:.1}", tb.font_size));
+                    let _ = annot.set_creator(&format!(
+                        "VersoReader:size={:.1}:color={},{},{}",
+                        tb.font_size, tb.color.r, tb.color.g, tb.color.b
+                    ));
                 }
             }
         }
@@ -2728,6 +2753,32 @@ mod tests {
     }
 
     #[test]
+    fn test_rasterize_solid_pen_stroke_opaque_blending() {
+        let w = 100;
+        let h = 100;
+        // Fill canvas with mid-gray (128, 128, 128)
+        let mut canvas = vec![128_u8; w * h * 4];
+
+        let pen_stroke = Highlight {
+            id: 10,
+            page: 0,
+            rects: Vec::new(),
+            points: vec![[10.0, 50.0], [90.0, 50.0]],
+            color: AnnotationColor::new(192, 57, 43), // Crimson Red
+            alpha: 1.0,                               // Opaque pen
+            thickness: 8.0,
+        };
+
+        rasterize_freehand_highlight(&mut canvas, w, h, &pen_stroke, 100.0, 100.0, 0);
+
+        // Center pixel (50, 50) must be pure solid crimson red (192, 57, 43), NOT multiplied with 128
+        let mid_idx = (50 * w + 50) * 4;
+        assert_eq!(canvas[mid_idx], 192);
+        assert_eq!(canvas[mid_idx + 1], 57);
+        assert_eq!(canvas[mid_idx + 2], 43);
+    }
+
+    #[test]
     fn test_worker_queue_priority_and_generation_pruning() {
         let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let path = PathBuf::from("fixtures/MLE.pdf");
@@ -3625,5 +3676,28 @@ mod tests {
         assert!(reopened, "Reopened doc must emit Event::Opened");
 
         let _ = tx_cmd.send(Command::Shutdown);
+    }
+
+    #[test]
+    fn test_worker_open_drawboard_pdf_no_crash() {
+        let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let pdfium = bind_pdfium().expect("Pdfium must be available for fixture test");
+        let p1 = PathBuf::from("fixtures/21-22-A.pdf");
+        let path = if p1.exists() {
+            p1
+        } else {
+            PathBuf::from(
+                "/run/media/alimuddin/New Volume/3-1/Theory/CSE 309 (Compiler)/term final solutions/21 batch/21-22-A.pdf",
+            )
+        };
+        if !path.exists() {
+            return;
+        }
+
+        let doc = pdfium
+            .load_pdf_from_file(&path, None)
+            .expect("load 21-22-A.pdf");
+        let (highlights, text_boxes) = extract_annotations_from_doc(&doc);
+        assert!(!highlights.is_empty() || !text_boxes.is_empty() || doc.pages().len() == 10);
     }
 }

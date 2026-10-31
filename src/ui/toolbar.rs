@@ -1,9 +1,9 @@
-use crate::annotations::{AnnotationColor, PRESET_HIGHLIGHT_COLORS};
+use crate::annotations::{AnnotationColor, PRESET_HIGHLIGHT_COLORS, PRESET_PEN_COLORS};
 use crate::ui::icons::{
     paint_chevron_down, paint_eraser, paint_fit_page, paint_fit_width, paint_fullscreen,
-    paint_gear, paint_highlighter, paint_nav_back, paint_nav_forward, paint_redo, paint_rotate,
-    paint_save, paint_search, paint_sidebar, paint_text_tool, paint_undo, paint_zoom_in,
-    paint_zoom_out, render_icon_button,
+    paint_gear, paint_highlighter, paint_nav_back, paint_nav_forward, paint_pen, paint_redo,
+    paint_rotate, paint_save, paint_search, paint_sidebar, paint_text_tool, paint_undo,
+    paint_zoom_in, paint_zoom_out, render_icon_button,
 };
 use crate::ui::theme::Theme;
 use egui::{
@@ -16,6 +16,7 @@ use egui::{
 pub enum ActiveTool {
     None,
     Highlighter,
+    Pen,
     Eraser,
     Text,
 }
@@ -35,12 +36,15 @@ pub enum ToolbarAction {
     RotateClockwise,
     ToggleFullscreen,
     ToggleHighlighter,
+    TogglePen,
     ToggleEraser,
     ToggleText,
     Undo,
     Redo,
     SetHighlighterColor(AnnotationColor),
     SetHighlighterThickness(f32),
+    SetPenColor(AnnotationColor),
+    SetPenThickness(f32),
     SetTextFontSize(f32),
     SetTextColor(AnnotationColor),
     Save,
@@ -60,6 +64,8 @@ pub struct ToolbarProps {
     pub active_tool: ActiveTool,
     pub highlighter_color: AnnotationColor,
     pub highlighter_thickness: f32,
+    pub pen_color: AnnotationColor,
+    pub pen_thickness: f32,
     pub text_font_size: f32,
     pub text_color: AnnotationColor,
     pub can_save: bool,
@@ -162,12 +168,12 @@ impl Toolbar {
             &chevron_btn,
             egui::PopupCloseBehavior::CloseOnClickOutside,
             |ui| {
-                ui.set_min_width(170.0);
+                ui.set_min_width(175.0);
                 ui.add_space(2.0);
-                ui.label(RichText::new("Color").strong().size(12.0));
+                ui.label(RichText::new("Pastel Colors").strong().size(11.5));
                 ui.horizontal(|ui| {
-                    for color in PRESET_HIGHLIGHT_COLORS {
-                        let is_sel = props.highlighter_color == color;
+                    for color in &PRESET_HIGHLIGHT_COLORS[0..6] {
+                        let is_sel = props.highlighter_color == *color;
                         let c = Color32::from_rgb(color.r, color.g, color.b);
                         let (rect, resp) =
                             ui.allocate_exact_size(vec2(22.0, 22.0), egui::Sense::click());
@@ -189,7 +195,38 @@ impl Toolbar {
                             );
                         }
                         if resp.clicked() {
-                            action = Some(ToolbarAction::SetHighlighterColor(color));
+                            action = Some(ToolbarAction::SetHighlighterColor(*color));
+                        }
+                    }
+                });
+
+                ui.add_space(4.0);
+                ui.label(RichText::new("Classic Colors").strong().size(11.5));
+                ui.horizontal(|ui| {
+                    for color in &PRESET_HIGHLIGHT_COLORS[6..12] {
+                        let is_sel = props.highlighter_color == *color;
+                        let c = Color32::from_rgb(color.r, color.g, color.b);
+                        let (rect, resp) =
+                            ui.allocate_exact_size(vec2(22.0, 22.0), egui::Sense::click());
+                        let p = ui.painter();
+                        p.rect_filled(rect, 4.0, c);
+                        if is_sel {
+                            p.rect_stroke(
+                                rect,
+                                4.0,
+                                Stroke::new(2.0_f32, Color32::WHITE),
+                                StrokeKind::Outside,
+                            );
+                        } else if resp.hovered() {
+                            p.rect_stroke(
+                                rect,
+                                4.0,
+                                Stroke::new(1.0_f32, Color32::LIGHT_GRAY),
+                                StrokeKind::Outside,
+                            );
+                        }
+                        if resp.clicked() {
+                            action = Some(ToolbarAction::SetHighlighterColor(*color));
                         }
                     }
                 });
@@ -232,6 +269,118 @@ impl Toolbar {
                         props.highlighter_color.b,
                         200,
                     ),
+                );
+                ui.add_space(2.0);
+            },
+        );
+
+        left_ui.add_space(2.0);
+
+        // Pen tool
+        let pen_active = props.active_tool == ActiveTool::Pen;
+        let pen_color = Color32::from_rgb(props.pen_color.r, props.pen_color.g, props.pen_color.b);
+        let pen_btn = render_icon_button(
+            &mut left_ui,
+            vec2(32.0, 32.0),
+            pen_active,
+            true,
+            "Pen tool (P)",
+            |p, r, c| paint_pen(p, r, c, pen_color),
+        );
+        if pen_btn.clicked() {
+            action = Some(ToolbarAction::TogglePen);
+        }
+
+        // Dropdown Chevron for Pen Options
+        let pen_popup_id = left_ui.make_persistent_id("pen_options_popup");
+        let pen_chevron_btn = render_icon_button(
+            &mut left_ui,
+            vec2(16.0, 32.0),
+            false,
+            true,
+            "Pen color and thickness",
+            paint_chevron_down,
+        );
+        if pen_chevron_btn.clicked() {
+            left_ui.memory_mut(|m| m.toggle_popup(pen_popup_id));
+        }
+
+        egui::popup_below_widget(
+            &left_ui,
+            pen_popup_id,
+            &pen_chevron_btn,
+            egui::PopupCloseBehavior::CloseOnClickOutside,
+            |ui| {
+                ui.set_min_width(175.0);
+                ui.add_space(2.0);
+                ui.label(RichText::new("Color").strong().size(12.0));
+                ui.horizontal(|ui| {
+                    for color in PRESET_PEN_COLORS {
+                        let is_sel = props.pen_color == color;
+                        let c = Color32::from_rgb(color.r, color.g, color.b);
+                        let (rect, resp) =
+                            ui.allocate_exact_size(vec2(22.0, 22.0), egui::Sense::click());
+                        let p = ui.painter();
+                        p.rect_filled(rect, 4.0, c);
+                        if color.r > 240 && color.g > 240 && color.b > 240 {
+                            p.rect_stroke(
+                                rect,
+                                4.0,
+                                Stroke::new(1.0_f32, Color32::from_gray(120)),
+                                StrokeKind::Inside,
+                            );
+                        }
+                        if is_sel {
+                            p.rect_stroke(
+                                rect,
+                                4.0,
+                                Stroke::new(2.0_f32, Color32::from_rgb(0, 160, 255)),
+                                StrokeKind::Outside,
+                            );
+                        } else if resp.hovered() {
+                            p.rect_stroke(
+                                rect,
+                                4.0,
+                                Stroke::new(1.0_f32, Color32::LIGHT_GRAY),
+                                StrokeKind::Outside,
+                            );
+                        }
+                        if resp.clicked() {
+                            action = Some(ToolbarAction::SetPenColor(color));
+                        }
+                    }
+                });
+
+                ui.add_space(8.0);
+                ui.label(RichText::new("Thickness").strong().size(12.0));
+                let mut thickness = props.pen_thickness;
+                let slider = egui::Slider::new(&mut thickness, 1.0..=12.0)
+                    .suffix(" pt")
+                    .fixed_decimals(1);
+                if ui.add(slider).changed() {
+                    action = Some(ToolbarAction::SetPenThickness(thickness));
+                }
+
+                // Visual thickness preview line
+                ui.add_space(6.0);
+                let (preview_rect, _) =
+                    ui.allocate_exact_size(vec2(160.0, 14.0), egui::Sense::hover());
+                let p = ui.painter();
+                p.rect_filled(
+                    preview_rect,
+                    2.0,
+                    if ui.visuals().dark_mode {
+                        Color32::from_gray(40)
+                    } else {
+                        Color32::from_gray(225)
+                    },
+                );
+                let line_y = preview_rect.center().y;
+                let left_x = preview_rect.left() + 8.0;
+                let right_x = preview_rect.right() - 8.0;
+                p.line_segment(
+                    [pos2(left_x, line_y), pos2(right_x, line_y)],
+                    Stroke::new(thickness.clamp(1.0, 12.0), pen_color),
                 );
                 ui.add_space(2.0);
             },
@@ -284,7 +433,10 @@ impl Toolbar {
                     };
                     ui.visuals_mut().selection.stroke = Stroke::NONE;
 
-                    for &size in &[10.0, 12.0, 14.0, 16.0, 18.0, 20.0, 24.0, 28.0, 32.0, 36.0] {
+                    for &size in &[
+                        6.0, 8.0, 9.0, 10.0, 11.0, 12.0, 14.0, 16.0, 18.0, 20.0, 24.0, 28.0, 32.0,
+                        36.0,
+                    ] {
                         let is_sel = (props.text_font_size - size).abs() < 0.1;
                         let text = egui::RichText::new(format!("{:.0} pt", size))
                             .color(palette.text_primary);
@@ -658,5 +810,7 @@ mod tests {
         assert_eq!(ToolbarAction::GoForward, ToolbarAction::GoForward);
         assert_ne!(ToolbarAction::GoBack, ToolbarAction::GoForward);
         assert_eq!(ToolbarAction::OpenSettings, ToolbarAction::OpenSettings);
+        assert_eq!(ToolbarAction::TogglePen, ToolbarAction::TogglePen);
+        assert_ne!(ToolbarAction::ToggleHighlighter, ToolbarAction::TogglePen);
     }
 }

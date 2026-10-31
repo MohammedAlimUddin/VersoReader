@@ -17,6 +17,14 @@ fn default_highlighter_thickness() -> f32 {
     1.0
 }
 
+fn default_pen_color() -> AnnotationColor {
+    AnnotationColor::new(0, 0, 0) // Black
+}
+
+fn default_pen_thickness() -> f32 {
+    3.0 // 3.0 pt standard solid pen
+}
+
 fn default_touchpad_scroll_speed() -> f32 {
     4.5
 }
@@ -79,6 +87,10 @@ pub struct Settings {
     pub highlighter_color: AnnotationColor,
     #[serde(default = "default_highlighter_thickness")]
     pub highlighter_thickness: f32,
+    #[serde(default = "default_pen_color")]
+    pub pen_color: AnnotationColor,
+    #[serde(default = "default_pen_thickness")]
+    pub pen_thickness: f32,
     #[serde(default = "default_text_font_size")]
     pub text_font_size: f32,
     #[serde(default = "default_text_color")]
@@ -107,6 +119,8 @@ impl Default for Settings {
             theme: ThemePreference::default(),
             highlighter_color: default_highlighter_color(),
             highlighter_thickness: default_highlighter_thickness(),
+            pen_color: default_pen_color(),
+            pen_thickness: default_pen_thickness(),
             text_font_size: default_text_font_size(),
             text_color: default_text_color(),
             sidebar_open: false,
@@ -272,6 +286,8 @@ mod tests {
         assert_eq!(s.theme, ThemePreference::Dark);
         assert_eq!(s.highlighter_color, PRESET_HIGHLIGHT_COLORS[0]);
         assert_eq!(s.highlighter_thickness, 1.0);
+        assert_eq!(s.pen_color, AnnotationColor::new(0, 0, 0));
+        assert_eq!(s.pen_thickness, 3.0);
         assert_eq!(s.text_font_size, 16.0);
         assert_eq!(s.text_color, AnnotationColor::new(0, 0, 0));
         assert!(!s.sidebar_open);
@@ -290,6 +306,8 @@ mod tests {
             theme: ThemePreference::Light,
             highlighter_color: PRESET_HIGHLIGHT_COLORS[3],
             highlighter_thickness: 0.65,
+            pen_color: AnnotationColor::new(192, 57, 43),
+            pen_thickness: 4.5,
             text_font_size: 20.0,
             text_color: AnnotationColor::new(192, 57, 43),
             sidebar_open: true,

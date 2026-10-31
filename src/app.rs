@@ -964,6 +964,130 @@ impl PdfViewApp {
         }
     }
 
+    /// Reorders a tab from index `from` to index `to`, adjusting `active_tab_idx` accordingly.
+    pub fn move_tab(&mut self, from: usize, to: usize) {
+        if from == to || from >= self.tabs.len() || to >= self.tabs.len() {
+            return;
+        }
+
+        let tab = self.tabs.remove(from);
+        self.tabs.insert(to, tab);
+
+        // Keep active tab tracked accurately
+        if self.active_tab_idx == from {
+            self.active_tab_idx = to;
+        } else if from < to {
+            if self.active_tab_idx > from && self.active_tab_idx <= to {
+                self.active_tab_idx -= 1;
+            }
+        } else if self.active_tab_idx >= to && self.active_tab_idx < from {
+            self.active_tab_idx += 1;
+        }
+
+        self.save_session_and_history();
+    }
+
+    /// Detaches the tab at `index` into a new Verso Reader window and closes it in the current window.
+    pub fn detach_tab(&mut self, index: usize) {
+        if index >= self.tabs.len() || self.tabs.len() <= 1 {
+            return;
+        }
+
+        // Cannot detach settings tab or blank unsaved tab
+        let path = match self.tabs.get(index) {
+            Some(Tab::Pdf(t)) if !t.path.as_os_str().is_empty() => t.path.clone(),
+            _ => return,
+        };
+
+        // If there are unsaved annotations, flush them to sidecar storage first
+        if let Some(Tab::Pdf(ref mut t)) = self.tabs.get_mut(index) {
+            if t.has_unsaved_changes && !t.file_key.is_empty() {
+                let _ = t.annotations.save_for_key(&t.file_key);
+                t.annotations_dirty = false;
+                t.has_unsaved_changes = false;
+            }
+        }
+
+        // Spawn a new Verso Reader instance with --new-window
+        if let Ok(exe) = std::env::current_exe() {
+            let mut cmd = std::process::Command::new(exe);
+            cmd.arg("--new-window");
+            cmd.arg(&path);
+            let _ = cmd.spawn();
+        }
+
+        // Close the tab in the current window
+        self.force_close_tab(index);
+    }
+
+    /// Executes an undo action for annotations on the active PDF tab, syncing with the worker and clearing cached page bitmaps.
+    pub fn perform_undo(&mut self, ctx: &egui::Context) {
+        let undo_info = self.active_pdf_tab_mut().and_then(|tab| {
+            if tab.undo_stack.undo(&mut tab.annotations) {
+                tab.annotations_dirty = true;
+                tab.has_unsaved_changes = true;
+                tab.last_annotation_change = Some(Instant::now());
+                if let Some(sel_id) = tab.selected_text_box_id {
+                    if !tab.annotations.text_boxes.iter().any(|tb| tb.id == sel_id) {
+                        tab.selected_text_box_id = None;
+                    }
+                }
+                Some((
+                    tab.doc_id,
+                    tab.annotations.highlights.clone(),
+                    tab.annotations.text_boxes.clone(),
+                ))
+            } else {
+                None
+            }
+        });
+        if let Some((doc_id, highlights, text_boxes)) = undo_info {
+            let _ = self.tx_cmd.send(Command::SyncAnnotations {
+                doc_id,
+                highlights,
+                text_boxes,
+            });
+            self.cache.clear_doc(doc_id);
+            self.render_generation += 1;
+            self.pending_render_requests.clear();
+            ctx.request_repaint();
+        }
+    }
+
+    /// Executes a redo action for annotations on the active PDF tab, syncing with the worker and clearing cached page bitmaps.
+    pub fn perform_redo(&mut self, ctx: &egui::Context) {
+        let redo_info = self.active_pdf_tab_mut().and_then(|tab| {
+            if tab.undo_stack.redo(&mut tab.annotations) {
+                tab.annotations_dirty = true;
+                tab.has_unsaved_changes = true;
+                tab.last_annotation_change = Some(Instant::now());
+                if let Some(sel_id) = tab.selected_text_box_id {
+                    if !tab.annotations.text_boxes.iter().any(|tb| tb.id == sel_id) {
+                        tab.selected_text_box_id = None;
+                    }
+                }
+                Some((
+                    tab.doc_id,
+                    tab.annotations.highlights.clone(),
+                    tab.annotations.text_boxes.clone(),
+                ))
+            } else {
+                None
+            }
+        });
+        if let Some((doc_id, highlights, text_boxes)) = redo_info {
+            let _ = self.tx_cmd.send(Command::SyncAnnotations {
+                doc_id,
+                highlights,
+                text_boxes,
+            });
+            self.cache.clear_doc(doc_id);
+            self.render_generation += 1;
+            self.pending_render_requests.clear();
+            ctx.request_repaint();
+        }
+    }
+
     /// Changes the zoom factor on the active tab, scaling around a specified screen anchor point.
     pub fn apply_zoom(&mut self, new_zoom: f32, anchor_viewport_y: Option<f32>) {
         let active_idx = self.active_tab_idx;
@@ -1007,14 +1131,20 @@ impl PdfViewApp {
         if let Some(Tab::Pdf(tab)) = self.tabs.get_mut(active_idx) {
             let current_p = tab.current_page;
             let rot = tab.rotation;
+            let effective_w = if tab.sidebar_open {
+                (available_width - tab.sidebar_width).max(100.0)
+            } else {
+                available_width
+            };
             if let Some(page) = tab.page_sizes.get(current_p.saturating_sub(1)) {
                 let dummy = PageTransform::new(*page, 1.0, rot, egui::pos2(0.0, 0.0));
                 let (pw, _) = dummy.visual_size_points();
                 if pw > 0.0 {
-                    let target_zoom = ((available_width - 32.0).max(100.0) / pw).clamp(0.10, 8.0);
+                    let target_zoom = ((effective_w - 36.0).max(100.0) / pw).clamp(0.10, 8.0);
                     tab.zoom = target_zoom;
                     self.render_generation += 1;
                     self.pending_render_requests.clear();
+                    tab.pending_scroll_to_page = Some(current_p);
                 }
             }
         }
@@ -1026,11 +1156,16 @@ impl PdfViewApp {
         if let Some(Tab::Pdf(tab)) = self.tabs.get_mut(active_idx) {
             let current_p = tab.current_page;
             let rot = tab.rotation;
+            let effective_w = if tab.sidebar_open {
+                (available_width - tab.sidebar_width).max(100.0)
+            } else {
+                available_width
+            };
             if let Some(page) = tab.page_sizes.get(current_p.saturating_sub(1)) {
                 let dummy = PageTransform::new(*page, 1.0, rot, egui::pos2(0.0, 0.0));
                 let (pw, ph) = dummy.visual_size_points();
                 if pw > 0.0 && ph > 0.0 {
-                    let z_w = (available_width - 32.0).max(100.0) / pw;
+                    let z_w = (effective_w - 36.0).max(100.0) / pw;
                     let z_h = (available_height - 32.0).max(100.0) / ph;
                     let target_zoom = z_w.min(z_h).clamp(0.10, 8.0);
                     tab.zoom = target_zoom;
@@ -1480,65 +1615,9 @@ impl eframe::App for PdfViewApp {
             let y_pressed = ctx.input(|i| i.key_pressed(egui::Key::Y));
 
             if ctrl && !shift && z_pressed {
-                let undo_info = self.active_pdf_tab_mut().and_then(|tab| {
-                    if tab.undo_stack.undo(&mut tab.annotations) {
-                        tab.annotations_dirty = true;
-                        tab.has_unsaved_changes = true;
-                        tab.last_annotation_change = Some(Instant::now());
-                        if let Some(sel_id) = tab.selected_text_box_id {
-                            if !tab.annotations.text_boxes.iter().any(|tb| tb.id == sel_id) {
-                                tab.selected_text_box_id = None;
-                            }
-                        }
-                        Some((
-                            tab.doc_id,
-                            tab.annotations.highlights.clone(),
-                            tab.annotations.text_boxes.clone(),
-                        ))
-                    } else {
-                        None
-                    }
-                });
-                if let Some((doc_id, highlights, text_boxes)) = undo_info {
-                    let _ = self.tx_cmd.send(Command::SyncAnnotations {
-                        doc_id,
-                        highlights,
-                        text_boxes,
-                    });
-                    self.render_generation += 1;
-                    self.pending_render_requests.clear();
-                    ctx.request_repaint();
-                }
+                self.perform_undo(ctx);
             } else if (ctrl && y_pressed) || (ctrl && shift && z_pressed) {
-                let redo_info = self.active_pdf_tab_mut().and_then(|tab| {
-                    if tab.undo_stack.redo(&mut tab.annotations) {
-                        tab.annotations_dirty = true;
-                        tab.has_unsaved_changes = true;
-                        tab.last_annotation_change = Some(Instant::now());
-                        if let Some(sel_id) = tab.selected_text_box_id {
-                            if !tab.annotations.text_boxes.iter().any(|tb| tb.id == sel_id) {
-                                tab.selected_text_box_id = None;
-                            }
-                        }
-                        Some((
-                            tab.doc_id,
-                            tab.annotations.highlights.clone(),
-                            tab.annotations.text_boxes.clone(),
-                        ))
-                    } else {
-                        None
-                    }
-                });
-                if let Some((doc_id, highlights, text_boxes)) = redo_info {
-                    let _ = self.tx_cmd.send(Command::SyncAnnotations {
-                        doc_id,
-                        highlights,
-                        text_boxes,
-                    });
-                    self.render_generation += 1;
-                    self.pending_render_requests.clear();
-                    ctx.request_repaint();
-                }
+                self.perform_redo(ctx);
             }
 
             // Delete selected text box shortcut: Delete
@@ -2186,6 +2265,8 @@ impl eframe::App for PdfViewApp {
                             TabBarAction::NewTab => self.create_empty_tab(),
                             TabBarAction::CloseWindow => self.request_close_window(ctx),
                             TabBarAction::OpenAbout => self.show_about_modal = true,
+                            TabBarAction::MoveTab { from, to } => self.move_tab(from, to),
+                            TabBarAction::DetachTab { index } => self.detach_tab(index),
                         }
                     }
                 });
@@ -2221,6 +2302,21 @@ impl eframe::App for PdfViewApp {
                                         self.create_empty_tab();
                                     }
                                     self.open_native_file_dialog(ctx);
+                                }
+                                PathBarAction::WebSearch(query) => {
+                                    let url = if query.starts_with("http://")
+                                        || query.starts_with("https://")
+                                    {
+                                        query
+                                    } else if query.starts_with("www.") {
+                                        format!("https://{query}")
+                                    } else {
+                                        format!(
+                                            "https://www.google.com/search?q={}",
+                                            crate::ui::pathbar::url_encode(&query)
+                                        )
+                                    };
+                                    ctx.open_url(egui::OpenUrl::new_tab(url));
                                 }
                             }
                         }
@@ -2284,6 +2380,8 @@ impl eframe::App for PdfViewApp {
                                     active_tool,
                                     highlighter_color: self.settings.highlighter_color,
                                     highlighter_thickness: self.settings.highlighter_thickness,
+                                    pen_color: self.settings.pen_color,
+                                    pen_thickness: self.settings.pen_thickness,
                                     text_font_size: self.settings.text_font_size,
                                     text_color: self.settings.text_color,
                                     can_save: self
@@ -2384,6 +2482,15 @@ impl eframe::App for PdfViewApp {
                                     };
                                 }
                             }
+                            ToolbarAction::TogglePen => {
+                                if let Some(tab) = self.active_pdf_tab_mut() {
+                                    tab.active_tool = if tab.active_tool == ActiveTool::Pen {
+                                        ActiveTool::None
+                                    } else {
+                                        ActiveTool::Pen
+                                    };
+                                }
+                            }
                             ToolbarAction::ToggleEraser => {
                                 if let Some(tab) = self.active_pdf_tab_mut() {
                                     tab.active_tool = if tab.active_tool == ActiveTool::Eraser {
@@ -2403,22 +2510,10 @@ impl eframe::App for PdfViewApp {
                                 }
                             }
                             ToolbarAction::Undo => {
-                                if let Some(tab) = self.active_pdf_tab_mut() {
-                                    if tab.undo_stack.undo(&mut tab.annotations) {
-                                        tab.has_unsaved_changes = true;
-                                        tab.annotations_dirty = true;
-                                        ctx.request_repaint();
-                                    }
-                                }
+                                self.perform_undo(ctx);
                             }
                             ToolbarAction::Redo => {
-                                if let Some(tab) = self.active_pdf_tab_mut() {
-                                    if tab.undo_stack.redo(&mut tab.annotations) {
-                                        tab.has_unsaved_changes = true;
-                                        tab.annotations_dirty = true;
-                                        ctx.request_repaint();
-                                    }
-                                }
+                                self.perform_redo(ctx);
                             }
                             ToolbarAction::SetHighlighterColor(color) => {
                                 self.settings.highlighter_color = color;
@@ -2426,6 +2521,14 @@ impl eframe::App for PdfViewApp {
                             }
                             ToolbarAction::SetHighlighterThickness(thickness) => {
                                 self.settings.highlighter_thickness = thickness;
+                                let _ = self.settings.save();
+                            }
+                            ToolbarAction::SetPenColor(color) => {
+                                self.settings.pen_color = color;
+                                let _ = self.settings.save();
+                            }
+                            ToolbarAction::SetPenThickness(thickness) => {
+                                self.settings.pen_thickness = thickness;
                                 let _ = self.settings.save();
                             }
                             ToolbarAction::SetTextFontSize(size) => {
@@ -2813,6 +2916,7 @@ impl eframe::App for PdfViewApp {
 
                     let mut jump_target = None;
                     let mut toggle_hl = false;
+                    let mut toggle_pen = false;
                     let mut toggle_eraser = false;
                     let mut toggle_text = false;
                     let mut bar_rect_opt = None;
@@ -2852,7 +2956,28 @@ impl eframe::App for PdfViewApp {
                                             toggle_hl = true;
                                         }
 
-                                        // 2. Eraser
+                                        // 2. Pen
+                                        let pen_active = active_tool == ActiveTool::Pen;
+                                        let pen_color = egui::Color32::from_rgb(
+                                            self.settings.pen_color.r,
+                                            self.settings.pen_color.g,
+                                            self.settings.pen_color.b,
+                                        );
+                                        let pen_btn = crate::ui::icons::render_icon_button(
+                                            ui,
+                                            egui::vec2(32.0, 32.0),
+                                            pen_active,
+                                            true,
+                                            "Pen tool (P)",
+                                            |p, r, c| {
+                                                crate::ui::icons::paint_pen(p, r, c, pen_color)
+                                            },
+                                        );
+                                        if pen_btn.clicked() {
+                                            toggle_pen = true;
+                                        }
+
+                                        // 3. Eraser
                                         let eraser_active = active_tool == ActiveTool::Eraser;
                                         let eraser_btn = crate::ui::icons::render_icon_button(
                                             ui,
@@ -2973,6 +3098,15 @@ impl eframe::App for PdfViewApp {
                                 ActiveTool::None
                             } else {
                                 ActiveTool::Highlighter
+                            };
+                        }
+                    }
+                    if toggle_pen {
+                        if let Some(tab) = self.active_pdf_tab_mut() {
+                            tab.active_tool = if tab.active_tool == ActiveTool::Pen {
+                                ActiveTool::None
+                            } else {
+                                ActiveTool::Pen
                             };
                         }
                     }
@@ -3199,6 +3333,8 @@ impl eframe::App for PdfViewApp {
                             active_tool,
                             self.settings.highlighter_color,
                             self.settings.highlighter_thickness,
+                            self.settings.pen_color,
+                            self.settings.pen_thickness,
                             &mut annotations,
                             &mut undo_stack,
                             &mut annotations_dirty,
@@ -3607,6 +3743,61 @@ impl eframe::App for PdfViewApp {
                                         });
                                         ui.add_space(10.0);
                                         ui.horizontal(|ui| {
+                                            ui.label("Pen ink color swatch:");
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    for &color in crate::annotations::PRESET_PEN_COLORS.iter().rev() {
+                                                        let is_sel = self.draft_settings.pen_color == color;
+                                                        let (rect, resp) = ui.allocate_exact_size(
+                                                            egui::vec2(22.0, 22.0),
+                                                            egui::Sense::click(),
+                                                        );
+                                                        let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+                                                        let fill = egui::Color32::from_rgb(color.r, color.g, color.b);
+                                                        ui.painter().rect_filled(rect, egui::CornerRadius::same(4), fill);
+                                                        if color.r > 240 && color.g > 240 && color.b > 240 {
+                                                            ui.painter().rect_stroke(
+                                                                rect,
+                                                                egui::CornerRadius::same(4),
+                                                                egui::Stroke::new(1.0_f32, egui::Color32::from_gray(120)),
+                                                                egui::StrokeKind::Inside,
+                                                            );
+                                                        }
+                                                        if is_sel {
+                                                            let stroke_col = if is_dark { egui::Color32::WHITE } else { egui::Color32::from_rgb(0, 160, 255) };
+                                                            ui.painter().rect_stroke(
+                                                                rect,
+                                                                egui::CornerRadius::same(4),
+                                                                egui::Stroke::new(2.0_f32, stroke_col),
+                                                                egui::StrokeKind::Outside,
+                                                            );
+                                                        }
+                                                        if resp.clicked() {
+                                                            self.draft_settings.pen_color = color;
+                                                        }
+                                                    }
+                                                },
+                                            );
+                                        });
+                                        ui.add_space(10.0);
+                                        ui.horizontal(|ui| {
+                                            ui.label("Pen stroke thickness:");
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    ui.add(
+                                                        egui::Slider::new(
+                                                            &mut self.draft_settings.pen_thickness,
+                                                            1.0..=12.0,
+                                                        )
+                                                        .text("pt"),
+                                                    );
+                                                },
+                                            );
+                                        });
+                                        ui.add_space(10.0);
+                                        ui.horizontal(|ui| {
                                             ui.label("Text tool font size:");
                                             ui.with_layout(
                                                 egui::Layout::right_to_left(egui::Align::Center),
@@ -3614,7 +3805,7 @@ impl eframe::App for PdfViewApp {
                                                     ui.add(
                                                         egui::Slider::new(
                                                             &mut self.draft_settings.text_font_size,
-                                                            10.0..=36.0,
+                                                            6.0..=36.0,
                                                         )
                                                         .text("pt"),
                                                     );
@@ -4192,7 +4383,7 @@ impl eframe::App for PdfViewApp {
                                     );
                                     ui.label(
                                         egui::RichText::new(
-                                            "Version 2.0.0 • Fast, Minimalist PDF Reader",
+                                            "Version 2.1.0 • Minimalist PDF Reader",
                                         )
                                         .color(palette.text_muted)
                                         .size(12.0),
@@ -4222,7 +4413,7 @@ impl eframe::App for PdfViewApp {
 
                             ui.label(
                                 egui::RichText::new(
-                                    "Verso Reader is a high-performance desktop PDF reader for Ubuntu written in Rust, delivering an Edge-inspired experience with instantaneous rendering and low memory footprint.",
+                                    "Verso Reader is a project inspired by the need for a lightweight, fast, and distraction-free PDF reading experience. It is designed to provide essential features for reading and annotating PDF documents without the bloat of larger applications. Shudhu kajer jinish e ache, behuda kichu nai.",
                                 )
                                 .size(12.5)
                                 .color(palette.text_secondary),
@@ -4265,7 +4456,7 @@ impl eframe::App for PdfViewApp {
                                         "BUET (Bangladesh University of Engineering and Technology)",
                                     );
                                     render_info_row("Framework:", "Rust • egui • eframe (Glow)");
-                                    render_info_row("Engine:", "Google Pdfium (libpdfium.so)");
+                                    render_info_row("PDFEngine:", "Google Pdfium (libpdfium.so)");
                                 });
 
                             ui.add_space(8.0);
@@ -5342,5 +5533,270 @@ mod tests {
 
         app.draft_settings.theme = crate::settings::ThemePreference::Dark;
         assert!(app.is_dark_mode(&ctx));
+    }
+
+    #[test]
+    fn test_fit_width_and_fit_page_preserve_current_page() {
+        let (tx_cmd, _rx_cmd) = crossbeam_channel::unbounded();
+        let (_tx_evt, rx_evt) = crossbeam_channel::unbounded();
+
+        let mut app = PdfViewApp {
+            tx_cmd,
+            rx_evt,
+            pdfium_status: PdfiumStatus::Ready,
+            tabs: Vec::new(),
+            active_tab_idx: 0,
+            next_doc_id: 1,
+            pending_close_confirm: None,
+            path_bar: PathBar::new(),
+            toolbar: Toolbar::new(),
+            is_fullscreen: false,
+            pending_open_path: None,
+            rx_file_chooser: None,
+            cache: TextureCache::default(),
+            text_cache: PageTextCache::default(),
+            pending_render_requests: HashSet::new(),
+            render_generation: 0,
+            debug_visible: false,
+            last_frame_time: Instant::now(),
+            frame_time_ms: 16.0,
+            metrics: SystemMetrics::default(),
+            #[cfg(target_os = "linux")]
+            rx_pinch_gesture: None,
+            #[cfg(target_os = "linux")]
+            wayland_gesture_init_attempted: false,
+            pinch_active: false,
+            pinch_last_active: None,
+            last_scroll_unit: None,
+            last_window_title: "Verso Reader".to_string(),
+            draft_settings: Settings::default(),
+            settings: Settings::default(),
+            reading_history: crate::settings::ReadingHistory::default(),
+            last_session_save: None,
+            session_restored: true,
+            settings_saved_toast: None,
+            show_about_modal: false,
+            fullscreen_quickbar_open: false,
+            fullscreen_page_input: "1".to_string(),
+            fullscreen_is_editing_page: false,
+            #[cfg(unix)]
+            _ipc_server: None,
+            #[cfg(unix)]
+            rx_ipc: None,
+        };
+
+        app.create_empty_tab();
+        if let Some(Tab::Pdf(tab)) = app.tabs.last_mut() {
+            tab.title = "huge_book.pdf".to_string();
+            tab.page_count = 100;
+            tab.page_sizes = vec![
+                PageSize {
+                    width: 600.0,
+                    height: 800.0,
+                };
+                100
+            ];
+            tab.current_page = 75;
+            tab.scroll_offset_y = 50000.0;
+        }
+        app.active_tab_idx = 0;
+
+        // Calling fit_width must explicitly set pending_scroll_to_page to current_page (75)
+        app.fit_width(1200.0);
+        if let Some(Tab::Pdf(tab)) = app.tabs.first() {
+            assert_eq!(tab.pending_scroll_to_page, Some(75));
+            assert!(tab.zoom > 0.0);
+        }
+
+        // Test with sidebar open: effective width is adjusted
+        if let Some(Tab::Pdf(tab)) = app.tabs.first_mut() {
+            tab.sidebar_open = true;
+            tab.sidebar_width = 300.0;
+            tab.pending_scroll_to_page = None;
+        }
+        app.fit_width(1200.0);
+        if let Some(Tab::Pdf(tab)) = app.tabs.first() {
+            assert_eq!(tab.pending_scroll_to_page, Some(75));
+            let expected_zoom = ((900.0 - 36.0_f32).max(100.0)
+                / (600.0 * PageTransform::DPI_SCALE))
+                .clamp(0.10, 8.0);
+            assert!((tab.zoom - expected_zoom).abs() < 1e-3);
+        }
+
+        // Calling fit_page must also preserve page 75
+        app.fit_page(1200.0, 900.0);
+        if let Some(Tab::Pdf(tab)) = app.tabs.first() {
+            assert_eq!(tab.pending_scroll_to_page, Some(75));
+        }
+    }
+
+    #[test]
+    fn test_move_tab_reordering_and_active_index_tracking() {
+        let (tx_cmd, _) = crossbeam_channel::unbounded();
+        let (_, rx_evt) = crossbeam_channel::unbounded();
+
+        let mut app = PdfViewApp {
+            tx_cmd,
+            rx_evt,
+            pdfium_status: PdfiumStatus::Ready,
+            tabs: Vec::new(),
+            active_tab_idx: 0,
+            next_doc_id: 1,
+            pending_close_confirm: None,
+            path_bar: PathBar::new(),
+            toolbar: Toolbar::new(),
+            is_fullscreen: false,
+            pending_open_path: None,
+            rx_file_chooser: None,
+            cache: TextureCache::default(),
+            text_cache: PageTextCache::default(),
+            pending_render_requests: HashSet::new(),
+            render_generation: 0,
+            debug_visible: false,
+            last_frame_time: Instant::now(),
+            frame_time_ms: 16.0,
+            metrics: SystemMetrics::default(),
+            #[cfg(target_os = "linux")]
+            rx_pinch_gesture: None,
+            #[cfg(target_os = "linux")]
+            wayland_gesture_init_attempted: true,
+            pinch_active: false,
+            pinch_last_active: None,
+            last_scroll_unit: None,
+            last_window_title: String::new(),
+            settings: Settings::default(),
+            draft_settings: Settings::default(),
+            reading_history: crate::settings::ReadingHistory::default(),
+            last_session_save: None,
+            session_restored: false,
+            settings_saved_toast: None,
+            show_about_modal: false,
+            fullscreen_quickbar_open: false,
+            fullscreen_page_input: "1".to_string(),
+            fullscreen_is_editing_page: false,
+            #[cfg(unix)]
+            _ipc_server: None,
+            #[cfg(unix)]
+            rx_ipc: None,
+        };
+
+        // Create 4 tabs: "A", "B", "C", "D"
+        for title in ["A", "B", "C", "D"] {
+            app.create_empty_tab();
+            if let Some(Tab::Pdf(tab)) = app.tabs.last_mut() {
+                tab.title = title.to_string();
+            }
+        }
+
+        let tab_titles = |app: &PdfViewApp| -> Vec<String> {
+            app.tabs
+                .iter()
+                .map(|t| match t {
+                    Tab::Pdf(p) => p.title.clone(),
+                    Tab::Settings => "Settings".to_string(),
+                })
+                .collect()
+        };
+
+        assert_eq!(tab_titles(&app), vec!["A", "B", "C", "D"]);
+
+        // 1. Move active tab from 0 to 2
+        app.active_tab_idx = 0; // "A" is active
+        app.move_tab(0, 2);
+        assert_eq!(tab_titles(&app), vec!["B", "C", "A", "D"]);
+        assert_eq!(
+            app.active_tab_idx, 2,
+            "Active tab should follow 'A' to index 2"
+        );
+
+        // 2. Tab "C" is at index 1. Set active tab to 1 ("C").
+        app.active_tab_idx = 1;
+        // Move "D" from 3 to 0.
+        // Elements between 0 and 2 shift right by 1, so "C" (was 1) should now be at index 2.
+        app.move_tab(3, 0);
+        assert_eq!(tab_titles(&app), vec!["D", "B", "C", "A"]);
+        assert_eq!(
+            app.active_tab_idx, 2,
+            "Active tab 'C' should shift right to index 2"
+        );
+
+        // 3. Move "D" from 0 to 3.
+        // Elements between 1 and 3 shift left by 1, so "C" (was 2) should now be at index 1.
+        app.move_tab(0, 3);
+        assert_eq!(tab_titles(&app), vec!["B", "C", "A", "D"]);
+        assert_eq!(
+            app.active_tab_idx, 1,
+            "Active tab 'C' should shift left to index 1"
+        );
+
+        // 4. Out of bounds move must be a safe no-op
+        app.move_tab(10, 0);
+        app.move_tab(0, 10);
+        app.move_tab(1, 1);
+        assert_eq!(tab_titles(&app), vec!["B", "C", "A", "D"]);
+        assert_eq!(app.active_tab_idx, 1);
+    }
+
+    #[test]
+    fn test_detach_tab_single_tab_no_op() {
+        let (tx_cmd, _) = crossbeam_channel::unbounded();
+        let (_, rx_evt) = crossbeam_channel::unbounded();
+
+        let mut app = PdfViewApp {
+            tx_cmd,
+            rx_evt,
+            pdfium_status: PdfiumStatus::Ready,
+            tabs: Vec::new(),
+            active_tab_idx: 0,
+            next_doc_id: 1,
+            pending_close_confirm: None,
+            path_bar: PathBar::new(),
+            toolbar: Toolbar::new(),
+            is_fullscreen: false,
+            pending_open_path: None,
+            rx_file_chooser: None,
+            cache: TextureCache::default(),
+            text_cache: PageTextCache::default(),
+            pending_render_requests: HashSet::new(),
+            render_generation: 0,
+            debug_visible: false,
+            last_frame_time: Instant::now(),
+            frame_time_ms: 16.0,
+            metrics: SystemMetrics::default(),
+            #[cfg(target_os = "linux")]
+            rx_pinch_gesture: None,
+            #[cfg(target_os = "linux")]
+            wayland_gesture_init_attempted: true,
+            pinch_active: false,
+            pinch_last_active: None,
+            last_scroll_unit: None,
+            last_window_title: String::new(),
+            settings: Settings::default(),
+            draft_settings: Settings::default(),
+            reading_history: crate::settings::ReadingHistory::default(),
+            last_session_save: None,
+            session_restored: false,
+            settings_saved_toast: None,
+            show_about_modal: false,
+            fullscreen_quickbar_open: false,
+            fullscreen_page_input: "1".to_string(),
+            fullscreen_is_editing_page: false,
+            #[cfg(unix)]
+            _ipc_server: None,
+            #[cfg(unix)]
+            rx_ipc: None,
+        };
+
+        // Create exactly 1 tab
+        app.create_empty_tab();
+        assert_eq!(app.tabs.len(), 1);
+
+        // Attempting to detach the only tab must be a safe no-op
+        app.detach_tab(0);
+        assert_eq!(
+            app.tabs.len(),
+            1,
+            "Detaching when only 1 tab exists must not close or detach the tab"
+        );
     }
 }

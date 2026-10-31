@@ -23,14 +23,32 @@ impl AnnotationColor {
     }
 }
 
-/// Six preset highlighter colors (imitating Microsoft Edge).
-pub const PRESET_HIGHLIGHT_COLORS: [AnnotationColor; 6] = [
-    AnnotationColor::new(255, 235, 59),  // 1. Classic Yellow
-    AnnotationColor::new(105, 240, 174), // 2. Fresh Green
-    AnnotationColor::new(68, 138, 255),  // 3. Sky Cyan/Blue
-    AnnotationColor::new(255, 64, 129),  // 4. Vibrant Pink
-    AnnotationColor::new(255, 152, 0),   // 5. Warm Orange
-    AnnotationColor::new(171, 71, 188),  // 6. Lavender Purple
+/// Twelve preset highlighter colors: 6 gentle pastel tones + 6 classic vivid tones.
+pub const PRESET_HIGHLIGHT_COLORS: [AnnotationColor; 12] = [
+    // --- Gentle Pastel Palette ---
+    AnnotationColor::new(254, 240, 138), // 1. Pastel Lemon
+    AnnotationColor::new(187, 247, 208), // 2. Pastel Sage / Mint
+    AnnotationColor::new(186, 230, 253), // 3. Pastel Sky Blue
+    AnnotationColor::new(233, 213, 255), // 4. Pastel Lavender
+    AnnotationColor::new(254, 205, 211), // 5. Pastel Rose Pink
+    AnnotationColor::new(254, 215, 170), // 6. Pastel Peach
+    // --- Classic Vivid Palette ---
+    AnnotationColor::new(255, 235, 59),  // 7. Bright Yellow
+    AnnotationColor::new(105, 240, 174), // 8. Neon Lime / Green
+    AnnotationColor::new(68, 138, 255),  // 9. Vibrant Cyan / Blue
+    AnnotationColor::new(255, 64, 129),  // 10. Vibrant Magenta / Pink
+    AnnotationColor::new(255, 152, 0),   // 11. Warm Amber / Orange
+    AnnotationColor::new(171, 71, 188),  // 12. Royal Violet / Purple
+];
+
+/// Six preset pen colors (solid ink).
+pub const PRESET_PEN_COLORS: [AnnotationColor; 6] = [
+    AnnotationColor::new(0, 0, 0),       // 1. Classic Black
+    AnnotationColor::new(26, 82, 118),   // 2. Navy Blue
+    AnnotationColor::new(192, 57, 43),   // 3. Crimson Red
+    AnnotationColor::new(39, 174, 96),   // 4. Forest Green
+    AnnotationColor::new(90, 95, 105),   // 5. Slate Gray
+    AnnotationColor::new(255, 255, 255), // 6. White
 ];
 
 /// Preset text box colors.
@@ -200,7 +218,7 @@ impl TextBox {
         if total_lines == 0.0 {
             total_lines = 1.0;
         }
-        let line_h = (self.font_size * 1.3).max(12.0);
+        let line_h = (self.font_size * 1.3).max(6.0);
         total_lines * line_h + 8.0
     }
 
@@ -260,7 +278,7 @@ impl EditingTextBox {
         if total_lines == 0.0 {
             total_lines = 1.0;
         }
-        let line_h = (self.font_size * 1.3).max(12.0);
+        let line_h = (self.font_size * 1.3).max(6.0);
         total_lines * line_h + 8.0
     }
 
@@ -805,5 +823,30 @@ mod tests {
         assert_eq!(ann.text_boxes[0].width, 400.0);
         assert!(undo_stack.redo(&mut ann));
         assert_eq!(ann.text_boxes[0].width, 200.0);
+    }
+
+    #[test]
+    fn test_preset_palette_sizes() {
+        assert_eq!(PRESET_HIGHLIGHT_COLORS.len(), 12);
+        assert_eq!(PRESET_PEN_COLORS.len(), 6);
+        assert_eq!(PRESET_TEXT_COLORS.len(), 6);
+    }
+
+    #[test]
+    fn test_pen_stroke_alpha_and_hit_testing() {
+        let pen_stroke = Highlight {
+            id: 999,
+            page: 0,
+            rects: Vec::new(),
+            points: vec![[100.0, 100.0], [150.0, 150.0]],
+            color: PRESET_PEN_COLORS[0], // Solid Black
+            alpha: 1.0,                  // Opaque
+            thickness: 3.0,
+        };
+
+        assert!(pen_stroke.is_freehand());
+        assert_eq!(pen_stroke.alpha, 1.0);
+        assert!(pen_stroke.contains_canonical_point(pos2(125.0, 125.0)));
+        assert!(!pen_stroke.contains_canonical_point(pos2(200.0, 200.0)));
     }
 }

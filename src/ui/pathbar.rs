@@ -159,6 +159,24 @@ pub fn parse_pdf_path(input: &str) -> Result<PathBuf, String> {
 pub enum PathBarAction {
     OpenPath(PathBuf),
     LaunchFileChooser,
+    WebSearch(String),
+}
+
+/// Encodes query parameters for web search URLs.
+pub fn url_encode(input: &str) -> String {
+    let mut encoded = String::new();
+    for byte in input.bytes() {
+        match byte {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char);
+            }
+            b' ' => encoded.push('+'),
+            _ => {
+                encoded.push_str(&format!("%{:02X}", byte));
+            }
+        }
+    }
+    encoded
 }
 
 /// Draws a crisp vector folder/location badge in the path bar.
@@ -350,17 +368,22 @@ impl PathBar {
             let enter_pressed = (response.has_focus() || response.lost_focus())
                 && ui.input(|i| i.key_pressed(egui::Key::Enter));
             if enter_pressed {
-                match parse_pdf_path(&self.text) {
-                    Ok(path) => {
-                        self.inline_error = None;
-                        response.surrender_focus();
-                        action = Some(PathBarAction::OpenPath(path));
-                        ui.ctx().request_repaint();
-                    }
-                    Err(err) => {
-                        self.inline_error = Some(err);
-                        response.request_focus();
-                        ui.ctx().request_repaint();
+                let trimmed = self.text.trim();
+                if !trimmed.is_empty() {
+                    match parse_pdf_path(&self.text) {
+                        Ok(path) => {
+                            self.inline_error = None;
+                            response.surrender_focus();
+                            action = Some(PathBarAction::OpenPath(path));
+                            ui.ctx().request_repaint();
+                        }
+                        Err(_) => {
+                            // If not a valid local PDF path, search via default browser
+                            self.inline_error = None;
+                            response.surrender_focus();
+                            action = Some(PathBarAction::WebSearch(trimmed.to_string()));
+                            ui.ctx().request_repaint();
+                        }
                     }
                 }
             }
@@ -504,6 +527,15 @@ mod tests {
         assert_eq!(
             unescape_bash_str(r"folder\&files/test\'s.pdf"),
             "folder&files/test's.pdf"
+        );
+    }
+
+    #[test]
+    fn test_url_encode() {
+        assert_eq!(url_encode("hello world"), "hello+world");
+        assert_eq!(
+            url_encode("compiler optimization & design?"),
+            "compiler+optimization+%26+design%3F"
         );
     }
 }

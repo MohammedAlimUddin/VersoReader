@@ -85,7 +85,7 @@ fn render_outline_tree(
             let id = ui.id().with(("outline_node", depth, idx, &item.title));
             let header = egui::CollapsingHeader::new(title_text)
                 .id_salt(id)
-                .default_open(depth == 0);
+                .default_open(false);
 
             let response = header.show(ui, |ui| {
                 if let Some(p) = render_outline_tree(ui, &item.children, current_page, depth + 1) {

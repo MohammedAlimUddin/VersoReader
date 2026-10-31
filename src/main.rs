@@ -10,19 +10,25 @@ mod ui;
 use app::PdfViewApp;
 
 fn main() -> eframe::Result<()> {
-    // Accept optional CLI argument: "verso-reader path/to/file.pdf" opens that file on start
-    let initial_path = std::env::args().nth(1);
+    // Accept optional CLI arguments:
+    // e.g. "verso-reader path/to/file.pdf" opens that file on start,
+    // or "--new-window path/to/file.pdf" to open in a new standalone window bypassing IPC.
+    let args: Vec<String> = std::env::args().collect();
+    let is_new_window = args.iter().any(|a| a == "--new-window");
+    let initial_path = args.iter().skip(1).find(|a| *a != "--new-window").cloned();
 
     #[cfg(unix)]
     {
-        if let Some(ref arg) = initial_path {
-            let path_to_open =
-                ui::pathbar::parse_pdf_path(arg).unwrap_or_else(|_| std::path::PathBuf::from(arg));
-            if platform::ipc::try_send_open(&path_to_open) {
+        if !is_new_window {
+            if let Some(ref arg) = initial_path {
+                let path_to_open = ui::pathbar::parse_pdf_path(arg)
+                    .unwrap_or_else(|_| std::path::PathBuf::from(arg));
+                if platform::ipc::try_send_open(&path_to_open) {
+                    return Ok(());
+                }
+            } else if platform::ipc::try_send_focus() {
                 return Ok(());
             }
-        } else if platform::ipc::try_send_focus() {
-            return Ok(());
         }
     }
 
@@ -39,6 +45,7 @@ fn main() -> eframe::Result<()> {
             .with_icon(icon_data)
             .with_inner_size([1040.0, 780.0])
             .with_min_inner_size([480.0, 320.0])
+            .with_maximized(true)
             .with_decorations(false),
         ..Default::default()
     };
