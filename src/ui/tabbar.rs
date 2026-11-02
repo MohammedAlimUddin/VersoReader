@@ -48,6 +48,48 @@ pub fn compute_tab_width(available_width: f32, tab_count: usize) -> f32 {
     (net_for_tabs / tab_count as f32).clamp(MIN_TAB_WIDTH, MAX_TAB_WIDTH)
 }
 
+/// Computes the horizontal target shift for tab `idx` when tab `src_idx` is dragged to `target_idx`.
+pub fn compute_tab_reorder_shift(
+    idx: usize,
+    src_idx: usize,
+    target_idx: usize,
+    tab_pitch: f32,
+) -> f32 {
+    if src_idx < target_idx {
+        if idx > src_idx && idx <= target_idx {
+            -tab_pitch
+        } else {
+            0.0
+        }
+    } else if target_idx < src_idx {
+        if idx >= target_idx && idx < src_idx {
+            tab_pitch
+        } else {
+            0.0
+        }
+    } else {
+        0.0
+    }
+}
+
+/// Computes the target slot index when a dragged tab's center is at `dragged_center_x`.
+pub fn compute_target_slot(dragged_center_x: f32, slot_centers: &[f32]) -> usize {
+    if slot_centers.is_empty() {
+        return 0;
+    }
+    for k in 0..slot_centers.len() {
+        let next_midpoint = if k + 1 < slot_centers.len() {
+            (slot_centers[k] + slot_centers[k + 1]) * 0.5
+        } else {
+            f32::INFINITY
+        };
+        if dragged_center_x < next_midpoint {
+            return k;
+        }
+    }
+    slot_centers.len().saturating_sub(1)
+}
+
 /// Helper function to truncate long file names with an ellipsis while preserving the extension.
 pub fn truncate_filename(name: &str, max_len: usize) -> String {
     if name.chars().count() <= max_len {
@@ -389,6 +431,7 @@ pub fn render_tab_bar(
             .layout(egui::Layout::left_to_right(egui::Align::Center)),
     );
     left_ui.spacing_mut().item_spacing = Vec2::new(2.0, 0.0);
+    left_ui.style_mut().interaction.selectable_labels = false;
 
     // Verso Reader brand mark (click to open About modal)
     let (brand_rect, brand_resp) =
@@ -421,15 +464,163 @@ pub fn render_tab_bar(
         left_ui.input(|i| i.pointer.button_clicked(egui::PointerButton::Middle));
 
     let tab_w = compute_tab_width(left_rect.width(), tabs.len());
-    let mut tab_rects = Vec::with_capacity(tabs.len());
+    let tab_spacing = 2.0;
+    let tab_h = row_height - 6.0;
+    let total_tabs_width = if tabs.is_empty() {
+        0.0
+    } else {
+        tabs.len() as f32 * tab_w + tabs.len().saturating_sub(1) as f32 * tab_spacing
+    };
+
+    // Allocate exact geometry for the entire tabs strip in left_ui
+    let (strip_rect, _) =
+        left_ui.allocate_exact_size(Vec2::new(total_tabs_width, tab_h), Sense::hover());
+
+    let mut base_rects = Vec::with_capacity(tabs.len());
+    let mut slot_centers = Vec::with_capacity(tabs.len());
+    for i in 0..tabs.len() {
+        let x = strip_rect.left() + i as f32 * (tab_w + tab_spacing);
+        let rect = Rect::from_min_size(Pos2::new(x, strip_rect.top()), Vec2::new(tab_w, tab_h));
+        slot_centers.push(rect.center().x);
+        base_rects.push(rect);
+    }
+
     let mut clicked_close_idx = None;
 
-    // Render tabs
-    for (idx, tab) in tabs.iter().enumerate() {
-        let is_being_dragged = drag_state
-            .as_ref()
-            .is_some_and(|d| d.src_idx == idx && (d.current_pos - d.start_pos).length() > 4.0);
+    // Detect drag start on primary button press
+    if is_primary_pressed && clicked_close_idx.is_none() {
+        if let Some(pos) = pointer_pos {
+            for (idx, rect) in base_rects.iter().enumerate() {
+                let show_close = tab_w >= 70.0 || tabs[idx].is_active;
+                let inner_margin_x = if tab_w < 80.0 {
+                    4.0
+                } else if tab_w < 130.0 {
+                    6.0
+                } else {
+                    8.0
+                };
+                let on_close_btn = show_close && {
+                    let c_rect = Rect::from_center_size(
+                        Pos2::new(rect.right() - inner_margin_x - 9.0, rect.center().y),
+                        Vec2::new(18.0, 18.0),
+                    );
+                    c_rect.contains(pos)
+                };
+                if rect.contains(pos) && !on_close_btn {
+                    drag_state = Some(TabDragState {
+                        src_idx: idx,
+                        start_pos: pos,
+                        current_pos: pos,
+                        target_idx: idx,
+                        is_detaching: false,
+                    });
+                    break;
+                }
+            }
+        }
+    }
 
+    // Process drag movement and target insertion index
+    if let Some(ref mut drag) = drag_state {
+        if is_primary_down {
+            if let Some(pos) = pointer_pos {
+                drag.current_pos = pos;
+                let dist = (pos - drag.start_pos).length();
+
+                if dist > 4.0 {
+                    let is_outside_y =
+                        pos.y > bar_rect.bottom() + 25.0 || pos.y < bar_rect.top() - 25.0;
+                    let can_detach =
+                        tabs.len() > 1 && !tabs.get(drag.src_idx).is_some_and(|t| t.is_settings);
+                    drag.is_detaching = is_outside_y && can_detach;
+
+                    if drag.is_detaching {
+                        left_ui.ctx().set_cursor_icon(egui::CursorIcon::Move);
+                    } else {
+                        left_ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                        if tabs.len() > 1 {
+                            let drag_dx = pos.x - drag.start_pos.x;
+                            let raw_center = base_rects[drag.src_idx].center().x + drag_dx;
+                            let clamped_center = raw_center
+                                .clamp(slot_centers[0], *slot_centers.last().unwrap_or(&0.0));
+                            drag.target_idx = compute_target_slot(clamped_center, &slot_centers);
+                        }
+                    }
+                    left_ui.ctx().request_repaint();
+                } else {
+                    left_ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                }
+            }
+        }
+    }
+
+    // Process drop or click release
+    if is_primary_released {
+        if let Some(drag) = drag_state.take() {
+            let dist = (drag.current_pos - drag.start_pos).length();
+            if dist > 4.0 {
+                if drag.is_detaching {
+                    action = Some(TabBarAction::DetachTab {
+                        index: drag.src_idx,
+                    });
+                } else if drag.target_idx != drag.src_idx {
+                    action = Some(TabBarAction::MoveTab {
+                        from: drag.src_idx,
+                        to: drag.target_idx,
+                    });
+                }
+            } else if clicked_close_idx.is_none() && !tabs[drag.src_idx].is_active {
+                action = Some(TabBarAction::Select(drag.src_idx));
+            }
+
+            // Reset tab animation offsets immediately on drop
+            for tab in tabs.iter() {
+                let anim_id = egui::Id::new("tab_reorder_anim").with(tab.tooltip);
+                left_ui.ctx().animate_value_with_time(anim_id, 0.0, 0.0);
+            }
+        }
+    }
+
+    let is_dragging = drag_state
+        .as_ref()
+        .is_some_and(|d| !d.is_detaching && (d.current_pos - d.start_pos).length() > 4.0);
+
+    // Compute animated visual rectangles for all tabs
+    let mut visual_rects = Vec::with_capacity(tabs.len());
+    for i in 0..tabs.len() {
+        if is_dragging {
+            let drag = drag_state.as_ref().unwrap();
+            if i == drag.src_idx {
+                let drag_dx = drag.current_pos.x - drag.start_pos.x;
+                let min_dx = base_rects[0].left() - base_rects[drag.src_idx].left();
+                let max_dx = base_rects.last().map(|r| r.left()).unwrap_or(0.0)
+                    - base_rects[drag.src_idx].left();
+                let clamped_dx = drag_dx.clamp(min_dx, max_dx);
+                visual_rects.push(base_rects[drag.src_idx].translate(Vec2::new(clamped_dx, 0.0)));
+            } else {
+                let target_shift = compute_tab_reorder_shift(
+                    i,
+                    drag.src_idx,
+                    drag.target_idx,
+                    tab_w + tab_spacing,
+                );
+                let anim_id = egui::Id::new("tab_reorder_anim").with(tabs[i].tooltip);
+                let shift_x = left_ui
+                    .ctx()
+                    .animate_value_with_time(anim_id, target_shift, 0.16);
+                visual_rects.push(base_rects[i].translate(Vec2::new(shift_x, 0.0)));
+            }
+        } else {
+            visual_rects.push(base_rects[i]);
+        }
+    }
+
+    // Helper to render one tab at its visual rect
+    let mut render_tab = |ui: &mut egui::Ui,
+                          idx: usize,
+                          tab: &TabItem<'_>,
+                          visual_rect: Rect,
+                          is_being_dragged: bool| {
         let bg_color = if tab.is_active {
             palette.tab_active_bg
         } else {
@@ -454,7 +645,7 @@ pub fn render_tab_bar(
 
         let tab_frame = egui::Frame::new()
             .fill(if is_being_dragged {
-                bg_color.gamma_multiply(0.6)
+                palette.bg_panel_hover
             } else {
                 bg_color
             })
@@ -463,19 +654,34 @@ pub fn render_tab_bar(
 
         let tab_inner_w = (tab_w - (inner_margin_x * 2) as f32).max(12.0);
 
-        let tab_response = tab_frame.show(&mut left_ui, |ui| {
-            ui.set_width(tab_inner_w);
-            ui.set_height(row_height - 6.0);
-            let inner_rect = ui.max_rect();
+        if is_being_dragged {
+            ui.painter().rect_filled(
+                visual_rect.translate(Vec2::new(0.0, 2.0)),
+                Theme::TAB_RADIUS,
+                Color32::from_black_alpha(60),
+            );
+        }
 
-            // 1. Close tab button (permanently anchored on the far right end of the tab)
+        let mut tab_child_ui = ui.new_child(
+            UiBuilder::new()
+                .max_rect(visual_rect)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        );
+        tab_child_ui.style_mut().interaction.selectable_labels = false;
+
+        let tab_response = tab_frame.show(&mut tab_child_ui, |tab_ui| {
+            tab_ui.set_width(tab_inner_w);
+            tab_ui.set_height(row_height - 6.0);
+            let inner_rect = tab_ui.max_rect();
+
+            // 1. Close tab button (anchored on far right end)
             let close_rect = Rect::from_center_size(
                 Pos2::new(inner_rect.right() - 9.0, inner_rect.center().y),
                 Vec2::new(18.0, 18.0),
             );
             if show_close {
-                let close_id = ui.id().with(("tab_close_btn", idx));
-                let c_resp = ui
+                let close_id = tab_ui.id().with(("tab_close_btn", idx));
+                let c_resp = tab_ui
                     .interact(close_rect, close_id, Sense::click())
                     .on_hover_cursor(egui::CursorIcon::PointingHand)
                     .on_hover_text("Close tab (Ctrl+W)");
@@ -490,21 +696,22 @@ pub fn render_tab_bar(
                 };
 
                 if btn_bg != Color32::TRANSPARENT {
-                    ui.painter()
+                    tab_ui
+                        .painter()
                         .rect_filled(close_rect, CornerRadius::same(4), btn_bg);
                 }
 
                 let center = close_rect.center();
                 let half = 3.5_f32;
                 let cross_stroke = Stroke::new(1.2_f32, cross_col);
-                ui.painter().line_segment(
+                tab_ui.painter().line_segment(
                     [
                         Pos2::new(center.x - half, center.y - half),
                         Pos2::new(center.x + half, center.y + half),
                     ],
                     cross_stroke,
                 );
-                ui.painter().line_segment(
+                tab_ui.painter().line_segment(
                     [
                         Pos2::new(center.x - half, center.y + half),
                         Pos2::new(center.x + half, center.y - half),
@@ -517,7 +724,7 @@ pub fn render_tab_bar(
                 }
             }
 
-            // 2. Unsaved changes subtle dot badge (anchored to the left of close button)
+            // 2. Unsaved changes dot badge
             let dot_right = if show_close {
                 close_rect.left() - 3.0
             } else {
@@ -525,11 +732,12 @@ pub fn render_tab_bar(
             };
             let dot_center = Pos2::new(dot_right - 4.0, inner_rect.center().y);
             if tab.is_dirty {
-                ui.painter()
+                tab_ui
+                    .painter()
                     .circle_filled(dot_center, 2.8, Color32::from_rgb(0, 120, 212));
             }
 
-            // 3. Document icon / Loading spinner / Settings gear icon (left-anchored)
+            // 3. Document icon / Loading spinner / Settings gear
             let icon_w = 14.0;
             let icon_rect = Rect::from_center_size(
                 Pos2::new(inner_rect.left() + icon_w * 0.5, inner_rect.center().y),
@@ -538,9 +746,10 @@ pub fn render_tab_bar(
             if tab.is_loading {
                 let spinner_rect =
                     Rect::from_center_size(icon_rect.center(), Vec2::new(14.0, 14.0));
-                let mut spinner_ui = ui.new_child(UiBuilder::new().max_rect(spinner_rect).layout(
-                    egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
-                ));
+                let mut spinner_ui =
+                    tab_ui.new_child(UiBuilder::new().max_rect(spinner_rect).layout(
+                        egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
+                    ));
                 spinner_ui.spinner();
             } else if tab.is_settings {
                 let icon_col = if tab.is_active {
@@ -548,12 +757,12 @@ pub fn render_tab_bar(
                 } else {
                     Color32::from_rgb(160, 160, 165)
                 };
-                crate::ui::icons::paint_gear(ui.painter(), icon_rect, icon_col);
+                crate::ui::icons::paint_gear(tab_ui.painter(), icon_rect, icon_col);
             } else {
-                paint_pdf_icon(ui, icon_rect, tab.is_active);
+                paint_pdf_icon(tab_ui, icon_rect, tab.is_active);
             }
 
-            // 4. Document title (occupies middle space between icon and right controls)
+            // 4. Document title (NEVER selectable, never I-beam)
             let title_left = icon_rect.right() + item_spacing_x;
             let title_right = if tab.is_dirty {
                 dot_center.x - 7.0
@@ -571,7 +780,7 @@ pub fn render_tab_bar(
                     Pos2::new(title_left, inner_rect.top()),
                     Pos2::new(title_right, inner_rect.bottom()),
                 );
-                let mut title_ui = ui.new_child(
+                let mut title_ui = tab_ui.new_child(
                     UiBuilder::new()
                         .max_rect(title_rect)
                         .layout(egui::Layout::left_to_right(egui::Align::Center)),
@@ -582,20 +791,17 @@ pub fn render_tab_bar(
                 if tab.is_dormant && !tab.is_active {
                     title_label = title_label.color(palette.text_muted).italics();
                 }
-                title_ui.label(title_label);
+                title_ui.add(egui::Label::new(title_label).selectable(false));
             }
         });
 
-        let tab_rect = tab_response.response.rect;
-        tab_rects.push(tab_rect);
-
-        // Draw active tab top accent line
-        if tab.is_active {
+        // Top accent line
+        if tab.is_active || is_being_dragged {
             let accent_line = Rect::from_min_size(
-                Pos2::new(tab_rect.left(), tab_rect.top()),
-                Vec2::new(tab_rect.width(), 2.0),
+                Pos2::new(visual_rect.left(), visual_rect.top()),
+                Vec2::new(visual_rect.width(), 2.0),
             );
-            left_ui.painter().rect_filled(
+            ui.painter().rect_filled(
                 accent_line,
                 CornerRadius {
                     nw: 4,
@@ -603,124 +809,90 @@ pub fn render_tab_bar(
                     sw: 0,
                     se: 0,
                 },
-                Theme::TAB_INDICATOR,
+                if is_being_dragged {
+                    Color32::from_rgb(0, 160, 255)
+                } else {
+                    Theme::TAB_INDICATOR
+                },
             );
         }
 
-        let is_tab_hovered = pointer_pos.is_some_and(|p| tab_rect.contains(p));
-        if is_tab_hovered && !tab.is_active && !is_being_dragged {
-            let hover_frame = tab_rect.shrink(0.5);
-            left_ui.painter().rect_stroke(
-                hover_frame,
+        // Outline feedback
+        if is_being_dragged {
+            ui.painter().rect_stroke(
+                visual_rect,
                 Theme::TAB_RADIUS,
-                Stroke::new(1.0_f32, palette.border_subtle),
+                Stroke::new(1.5_f32, Color32::from_rgb(0, 160, 255)),
+                StrokeKind::Inside,
+            );
+        } else {
+            let is_tab_hovered = pointer_pos.is_some_and(|p| visual_rect.contains(p));
+            if is_tab_hovered && !tab.is_active {
+                let hover_frame = visual_rect.shrink(0.5);
+                ui.painter().rect_stroke(
+                    hover_frame,
+                    Theme::TAB_RADIUS,
+                    Stroke::new(1.0_f32, palette.border_subtle),
+                    StrokeKind::Inside,
+                );
+            }
+
+            if is_tab_hovered {
+                if !is_dragging {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+                let tip = if tab.is_dormant && !tab.is_active {
+                    format!(
+                        "{} (Sleeping tab to save memory — click to wake)",
+                        tab.tooltip
+                    )
+                } else {
+                    tab.tooltip.to_string()
+                };
+                tab_response.response.on_hover_text(tip);
+
+                if is_middle_clicked {
+                    action = Some(TabBarAction::Close(idx));
+                }
+            }
+        }
+    };
+
+    // Render tabs in visual order
+    if is_dragging {
+        let drag = drag_state.as_ref().unwrap();
+        // Drop slot indicator placeholder
+        if drag.target_idx < base_rects.len() {
+            let target_slot_rect = base_rects[drag.target_idx];
+            left_ui.painter().rect_stroke(
+                target_slot_rect.shrink(1.0),
+                Theme::TAB_RADIUS,
+                Stroke::new(1.0_f32, Color32::from_rgba_premultiplied(0, 160, 255, 90)),
                 StrokeKind::Inside,
             );
         }
 
-        if is_tab_hovered {
-            if drag_state.is_none() {
-                left_ui
-                    .ctx()
-                    .set_cursor_icon(egui::CursorIcon::PointingHand);
+        // 1. Draw non-dragged tabs (sliding underneath)
+        for (idx, tab) in tabs.iter().enumerate() {
+            if idx == drag.src_idx {
+                continue;
             }
-            let tip = if tab.is_dormant && !tab.is_active {
-                format!(
-                    "{} (Sleeping tab to save memory — click to wake)",
-                    tab.tooltip
-                )
-            } else {
-                tab.tooltip.to_string()
-            };
-            tab_response.response.on_hover_text(tip);
-
-            if is_middle_clicked {
-                action = Some(TabBarAction::Close(idx));
-            }
+            render_tab(&mut left_ui, idx, tab, visual_rects[idx], false);
         }
-    }
 
-    // -------------------------------------------------------------
-    // Drag-to-reorder and drag-to-detach event handling
-    // -------------------------------------------------------------
-    if let Some(pos) = pointer_pos {
-        if is_primary_pressed && clicked_close_idx.is_none() {
-            for (idx, rect) in tab_rects.iter().enumerate() {
-                let show_close = tab_w >= 70.0 || tabs[idx].is_active;
-                let on_close_btn = show_close && {
-                    let c_rect = Rect::from_center_size(
-                        Pos2::new(rect.right() - 4.0 - 9.0, rect.center().y),
-                        Vec2::new(18.0, 18.0),
-                    );
-                    c_rect.contains(pos)
-                };
-                if rect.contains(pos) && !on_close_btn {
-                    drag_state = Some(TabDragState {
-                        src_idx: idx,
-                        start_pos: pos,
-                        current_pos: pos,
-                        target_idx: idx,
-                        is_detaching: false,
-                    });
-                    break;
-                }
-            }
+        // 2. Draw dragged tab last (floating above)
+        if let Some(tab) = tabs.get(drag.src_idx) {
+            render_tab(
+                &mut left_ui,
+                drag.src_idx,
+                tab,
+                visual_rects[drag.src_idx],
+                true,
+            );
         }
-    }
-
-    if let Some(ref mut drag) = drag_state {
-        if is_primary_down {
-            if let Some(pos) = pointer_pos {
-                drag.current_pos = pos;
-                let dist = (pos - drag.start_pos).length();
-
-                if dist > 4.0 {
-                    // Dragging outside tab bar bounds vertically triggers detachment (only if multiple tabs exist)
-                    let is_outside_y =
-                        pos.y > bar_rect.bottom() + 25.0 || pos.y < bar_rect.top() - 25.0;
-                    let can_detach =
-                        tabs.len() > 1 && !tabs.get(drag.src_idx).is_some_and(|t| t.is_settings);
-                    drag.is_detaching = is_outside_y && can_detach;
-
-                    if drag.is_detaching {
-                        left_ui.ctx().set_cursor_icon(egui::CursorIcon::Move);
-                    } else {
-                        left_ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
-
-                        // Find target reordering slot
-                        let mut target = drag.src_idx;
-                        for (i, rect) in tab_rects.iter().enumerate() {
-                            if pos.x < rect.center().x {
-                                target = i;
-                                break;
-                            }
-                            target = i;
-                        }
-                        drag.target_idx = target;
-                    }
-                    left_ui.ctx().request_repaint();
-                }
-            }
-        }
-    }
-
-    if is_primary_released {
-        if let Some(drag) = drag_state.take() {
-            let dist = (drag.current_pos - drag.start_pos).length();
-            if dist > 4.0 {
-                if drag.is_detaching {
-                    action = Some(TabBarAction::DetachTab {
-                        index: drag.src_idx,
-                    });
-                } else if drag.target_idx != drag.src_idx {
-                    action = Some(TabBarAction::MoveTab {
-                        from: drag.src_idx,
-                        to: drag.target_idx,
-                    });
-                }
-            } else if clicked_close_idx.is_none() && !tabs[drag.src_idx].is_active {
-                action = Some(TabBarAction::Select(drag.src_idx));
-            }
+    } else {
+        for (idx, tab) in tabs.iter().enumerate() {
+            render_tab(&mut left_ui, idx, tab, visual_rects[idx], false);
         }
     }
 
@@ -729,68 +901,59 @@ pub fn render_tab_bar(
         drag_state = None;
     }
 
-    // Visual feedback while dragging
+    // Detachment preview layer
     if let Some(ref drag) = drag_state {
         let dist = (drag.current_pos - drag.start_pos).length();
-        if dist > 4.0 {
-            if drag.is_detaching {
-                // Floating detach preview following cursor
-                let p = left_ui.ctx().layer_painter(egui::LayerId::new(
-                    egui::Order::Tooltip,
-                    egui::Id::new("tab_detach_preview_layer"),
-                ));
-                let preview_rect = Rect::from_min_size(
-                    drag.current_pos + Vec2::new(14.0, 14.0),
-                    Vec2::new(175.0, 34.0),
-                );
-                p.rect_filled(
-                    preview_rect,
-                    CornerRadius::same(6),
-                    palette.bg_panel.gamma_multiply(0.95),
-                );
-                p.rect_stroke(
-                    preview_rect,
-                    CornerRadius::same(6),
-                    Stroke::new(1.2_f32, Color32::from_rgb(0, 160, 255)),
-                    StrokeKind::Outside,
-                );
+        if dist > 4.0 && drag.is_detaching {
+            let p = left_ui.ctx().layer_painter(egui::LayerId::new(
+                egui::Order::Tooltip,
+                egui::Id::new("tab_detach_preview_layer"),
+            ));
+            let preview_rect = Rect::from_min_size(
+                drag.current_pos + Vec2::new(14.0, 14.0),
+                Vec2::new(175.0, 34.0),
+            );
+            p.rect_filled(
+                preview_rect,
+                CornerRadius::same(6),
+                palette.bg_panel.gamma_multiply(0.95),
+            );
+            p.rect_stroke(
+                preview_rect,
+                CornerRadius::same(6),
+                Stroke::new(1.2_f32, Color32::from_rgb(0, 160, 255)),
+                StrokeKind::Outside,
+            );
 
-                let tab_title = tabs
-                    .get(drag.src_idx)
-                    .map(|t| t.title)
-                    .unwrap_or("PDF Document");
-                let trunc = truncate_filename(tab_title, 18);
-                p.text(
-                    Pos2::new(preview_rect.left() + 8.0, preview_rect.top() + 6.0),
-                    egui::Align2::LEFT_TOP,
-                    format!("📄 {trunc}"),
-                    egui::FontId::proportional(12.0),
-                    palette.text_primary,
-                );
-                p.text(
-                    Pos2::new(preview_rect.left() + 8.0, preview_rect.top() + 20.0),
-                    egui::Align2::LEFT_TOP,
-                    "Detach into new window",
-                    egui::FontId::proportional(9.5),
-                    Color32::from_rgb(0, 160, 255),
-                );
-            } else if let Some(target_rect) = tab_rects.get(drag.target_idx) {
-                // Vertical insertion indicator line at target drop position
-                let drop_x = if drag.target_idx <= drag.src_idx {
-                    target_rect.left() - 1.0
-                } else {
-                    target_rect.right() + 1.0
-                };
-                let p = left_ui.painter();
-                let top_y = bar_rect.top() + 4.0;
-                let bot_y = bar_rect.bottom() - 4.0;
-                let ind_col = Color32::from_rgb(0, 160, 255);
-                p.line_segment(
-                    [Pos2::new(drop_x, top_y), Pos2::new(drop_x, bot_y)],
-                    Stroke::new(2.5_f32, ind_col),
-                );
-                p.circle_filled(Pos2::new(drop_x, top_y + 1.0), 2.5, ind_col);
-                p.circle_filled(Pos2::new(drop_x, bot_y - 1.0), 2.5, ind_col);
+            let tab_title = tabs
+                .get(drag.src_idx)
+                .map(|t| t.title)
+                .unwrap_or("PDF Document");
+            let trunc = truncate_filename(tab_title, 18);
+            p.text(
+                Pos2::new(preview_rect.left() + 8.0, preview_rect.top() + 6.0),
+                egui::Align2::LEFT_TOP,
+                format!("📄 {trunc}"),
+                egui::FontId::proportional(12.0),
+                palette.text_primary,
+            );
+            p.text(
+                Pos2::new(preview_rect.left() + 8.0, preview_rect.top() + 20.0),
+                egui::Align2::LEFT_TOP,
+                "Detach into new window",
+                egui::FontId::proportional(9.5),
+                Color32::from_rgb(0, 160, 255),
+            );
+        }
+    }
+
+    // Enforce cursor icon during drag
+    if let Some(ref drag) = drag_state {
+        if is_primary_down {
+            if drag.is_detaching {
+                left_ui.ctx().set_cursor_icon(egui::CursorIcon::Move);
+            } else {
+                left_ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
             }
         }
     }
@@ -812,9 +975,11 @@ pub fn render_tab_bar(
         left_ui
             .painter()
             .rect_filled(plus_rect, Theme::RADIUS, palette.bg_panel_hover);
-        left_ui
-            .ctx()
-            .set_cursor_icon(egui::CursorIcon::PointingHand);
+        if drag_state.is_none() {
+            left_ui
+                .ctx()
+                .set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
     }
     let plus_center = plus_rect.center();
     let plus_half = 4.5_f32;
@@ -926,5 +1091,49 @@ mod tests {
     #[test]
     fn test_compute_tab_width_zero_tabs() {
         assert_eq!(compute_tab_width(800.0, 0), MAX_TAB_WIDTH);
+    }
+
+    #[test]
+    fn test_compute_tab_reorder_shift_drag_right() {
+        let pitch = 150.0;
+        // Drag tab 0 to slot 2:
+        // Tabs in (0..=2], namely 1 and 2, shift left (-pitch)
+        assert_eq!(compute_tab_reorder_shift(0, 0, 2, pitch), 0.0);
+        assert_eq!(compute_tab_reorder_shift(1, 0, 2, pitch), -pitch);
+        assert_eq!(compute_tab_reorder_shift(2, 0, 2, pitch), -pitch);
+        assert_eq!(compute_tab_reorder_shift(3, 0, 2, pitch), 0.0);
+    }
+
+    #[test]
+    fn test_compute_tab_reorder_shift_drag_left() {
+        let pitch = 120.0;
+        // Drag tab 3 to slot 1:
+        // Tabs in [1..3), namely 1 and 2, shift right (+pitch)
+        assert_eq!(compute_tab_reorder_shift(0, 3, 1, pitch), 0.0);
+        assert_eq!(compute_tab_reorder_shift(1, 3, 1, pitch), pitch);
+        assert_eq!(compute_tab_reorder_shift(2, 3, 1, pitch), pitch);
+        assert_eq!(compute_tab_reorder_shift(3, 3, 1, pitch), 0.0);
+    }
+
+    #[test]
+    fn test_compute_tab_reorder_shift_no_op_same_slot() {
+        let pitch = 100.0;
+        assert_eq!(compute_tab_reorder_shift(0, 1, 1, pitch), 0.0);
+        assert_eq!(compute_tab_reorder_shift(1, 1, 1, pitch), 0.0);
+        assert_eq!(compute_tab_reorder_shift(2, 1, 1, pitch), 0.0);
+    }
+
+    #[test]
+    fn test_compute_target_slot_midpoints() {
+        // Slot centers at 50, 150, 250, 350 -> midpoints at 100, 200, 300
+        let slot_centers = vec![50.0, 150.0, 250.0, 350.0];
+        assert_eq!(compute_target_slot(40.0, &slot_centers), 0);
+        assert_eq!(compute_target_slot(99.0, &slot_centers), 0);
+        assert_eq!(compute_target_slot(101.0, &slot_centers), 1);
+        assert_eq!(compute_target_slot(199.0, &slot_centers), 1);
+        assert_eq!(compute_target_slot(201.0, &slot_centers), 2);
+        assert_eq!(compute_target_slot(299.0, &slot_centers), 2);
+        assert_eq!(compute_target_slot(301.0, &slot_centers), 3);
+        assert_eq!(compute_target_slot(500.0, &slot_centers), 3);
     }
 }

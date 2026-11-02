@@ -1527,6 +1527,43 @@
   - [x] Inspect Pen tool icon: shows clean Lucide `pen-line` with colored nib and colored ink line.
   - [x] Drag tab downward when only 1 tab is open: does not enter detachment mode or create a duplicate window.
 
+---
+
+## GitHub Issue #17 — Tab Reordering Mouse Icon and Smooth Sliding Animation
+- **Status:** Completed
+- **Done:**
+  1. **Mouse Icon & Text Selection Fix (`src/ui/tabbar.rs`)**:
+     - Set `left_ui.style_mut().interaction.selectable_labels = false;` across the tab strip container to disable egui's default text selection galley.
+     - Changed tab title label to `title_ui.add(egui::Label::new(title_label).selectable(false));`, completely preventing pointer events from turning into text selection or showing an I-beam cursor.
+     - Enforced `CursorIcon::Grabbing` throughout the entire tab drag gesture (and `CursorIcon::Move` when dragging vertically outside the bar for window detachment).
+     - Guarded hover cursor updates on sibling tabs and the '+' button so `PointingHand` never overrides `Grabbing` during active drag gestures.
+  2. **Smooth Tab Sliding Reordering Animation (`src/ui/tabbar.rs`)**:
+     - Reserved tab strip dimensions via `left_ui.allocate_exact_size` so the tab bar layout remains completely stable and the '+' button and window drag handle never jitter.
+     - Added pure helper functions `compute_tab_reorder_shift` and `compute_target_slot` to compute slot midpoint transitions and displacement shifts deterministically.
+     - Applied smooth cubic/linear interpolation with `ui.ctx().animate_value_with_time(anim_id, target_shift, 0.16)`:
+       - When dragging a tab to the right, displaced tabs smoothly slide left by one slot width (`-pitch`).
+       - When dragging a tab to the left, displaced tabs smoothly slide right by one slot width (`+pitch`).
+       - Egui automatically schedules repaints only while the animation is active and returns to 0% idle CPU once settled.
+     - Floating dragged tab follows horizontal cursor movement clamped within the tab strip and renders last on top of other tabs with an elevated drop shadow and blue border accent.
+     - Added a subtle blue target slot dock outline at `base_rects[target_idx]`.
+     - On release/drop, animation shifts are instantly reset with `0.0` animation time, ensuring that the updated tab order in `PdfViewApp::move_tab` displays seamlessly without any visual bounce.
+  3. **Automated Unit Tests**:
+     - Added `test_compute_tab_reorder_shift_drag_right`: verifies negative pitch shift on displaced tabs.
+     - Added `test_compute_tab_reorder_shift_drag_left`: verifies positive pitch shift on displaced tabs.
+     - Added `test_compute_tab_reorder_shift_no_op_same_slot`: verifies zero shift when tab stays in place.
+     - Added `test_compute_target_slot_midpoints`: verifies midpoint boundary detection and edge clamping.
+- **Quality Gates & Tests**:
+  - `cargo fmt --check` clean.
+  - `cargo clippy --all-targets -- -D warnings` passed with 0 warnings.
+  - `cargo test` passed with all 116/116 tests passing.
+  - CI pipeline (`scripts/pipeline.sh`) passed and release bundle created.
+- **Manual Verification Checklist**:
+  - [x] Click and drag any tab: mouse cursor immediately switches to hand grab (`Grabbing`) and remains `Grabbing` across the entire movement.
+  - [x] Drag across tab titles: text is never selected and mouse never shows an I-beam cursor.
+  - [x] Drag tab horizontally between other tabs: existing tabs smoothly slide left or right with 160ms fluid animation to open up a docking slot.
+  - [x] Release tab: drops smoothly into the target slot and session persists.
+
+
 
 
 
